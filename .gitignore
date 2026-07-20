@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+pip-wheel-metadata/
+
+# Virtual environments
+sharp3d-env/
+venv/
+.venv/
+env/
+
+# Torch / model caches
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Outputs & large generated files
+outputs/
+*.ply
+*.mp4
+*.png
+*.jpg
+*.jpeg
+
+# Test artifacts
+test_*.png
+test_*.mp4
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs
+*.log

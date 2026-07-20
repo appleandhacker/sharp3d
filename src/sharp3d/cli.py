@@ -1,0 +1,108 @@
+"""CLI entry point for sharp3d."""
+
+import argparse
+import sys
+import time
+from pathlib import Path
+
+import torch
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="sharp3d - Convert 2D images/videos to stereoscopic 3D (SBS)"
+    )
+    parser.add_argument("input", type=str, help="Input image or video path")
+    parser.add_argument("-o", "--output", type=str, default=None,
+                        help="Output path (default: input_sbs.ext)")
+    parser.add_argument("--ipd", type=float, default=0.063,
+                        help="Inter-pupillary distance (default: 0.063)")
+    parser.add_argument("--codec", type=str, default="h264",
+                        choices=["h264", "h265", "av1"],
+                        help="Video codec (default: h264)")
+    parser.add_argument("--crf", type=int, default=18,
+                        help="Video quality CRF (default: 18, lower=better)")
+    parser.add_argument("--decompose", type=str, default="analytical",
+                        choices=["analytical", "svd"],
+                        help="Decomposition method (default: analytical)")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="Disable torch.compile")
+    parser.add_argument("--fp32", action="store_true",
+                        help="Use FP32 instead of FP16")
+    parser.add_argument("--depth", action="store_true",
+                        help="Also output depth map (images only)")
+
+    args = parser.parse_args()
+
+    input_path = Path(args.input)
+    if not input_path.exists():
+        print(f"Error: Input file not found: {input_path}")
+        sys.exit(1)
+
+    # Determine output path
+    if args.output:
+        output_path = Path(args.output)
+    else:
+        stem = input_path.stem
+        suffix = input_path.suffix
+        output_path = input_path.parent / f"{stem}_sbs{suffix}"
+
+    # Detect input type
+    video_exts = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+    is_video = input_path.suffix.lower() in video_exts
+
+    if is_video and output_path.suffix.lower() not in video_exts:
+        output_path = output_path.with_suffix(".mp4")
+
+    # Import pipeline (deferred to allow --help without loading torch)
+    from .pipeline import Sharp3DPipeline
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+    if device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    pipeline = Sharp3DPipeline(
+        device=device,
+        use_compile=not args.no_compile,
+        use_fp16=not args.fp32,
+        decompose_method=args.decompose,
+        ipd=args.ipd,
+    )
+
+    if is_video:
+        print(f"Processing video: {input_path.name}")
+        print(f"Codec: {args.codec}, CRF: {args.crf}")
+
+        def on_progress(frame_idx, total, fps):
+            if frame_idx % 10 == 0 or frame_idx == total - 1:
+                print(f"  Frame {frame_idx + 1}/{total}: {fps:.2f} fps")
+
+        result = pipeline.process_video(
+            input_path, output_path,
+            codec=args.codec, crf=args.crf,
+            progress_callback=on_progress,
+        )
+        print(f"\nDone! {result['n_frames']} frames in {result['total_elapsed']:.1f}s")
+        print(f"Average: {result['avg_frame_time']:.3f}s/frame ({result['fps']:.2f} fps)")
+        print(f"Output: {result['output_path']}")
+
+    else:
+        print(f"Processing image: {input_path.name}")
+
+        def on_status(msg):
+            print(f"  {msg}")
+
+        result = pipeline.process_image(
+            input_path, output_path,
+            output_depth=args.depth,
+            progress_callback=on_status,
+        )
+        print(f"\nDone! {result['elapsed']:.3f}s ({result['fps']:.2f} fps)")
+        print(f"Output: {result['output_path']} ({result['output_size'][0]}x{result['output_size'][1]})")
+        if "depth_path" in result:
+            print(f"Depth:  {result['depth_path']}")
+
+
+if __name__ == "__main__":
+    main()
