@@ -99,13 +99,11 @@ class Engine(QObject):
             p = Path(path)
 
             if p.suffix.lower() in video_exts:
-                import imageio
-                reader = imageio.get_reader(str(p))
-                frame = reader.get_data(frame_idx)
-                meta = reader.get_meta_data()
-                reader.close()
-                # estimate focal length from width (~60 deg FOV)
-                f_px = frame.shape[1] * 1.2
+                # FrameReader tone-maps HDR sources to SDR for the model
+                from sharp3d.hdr import FrameReader
+                reader = FrameReader(p)
+                frame = reader.read_frame(frame_idx)
+                f_px = frame.shape[1] * 1.2  # estimate (~60 deg FOV)
                 image_np = frame
             else:
                 image_np, _, f_px = sharp_io.load_rgb(p)
@@ -235,23 +233,30 @@ class Engine(QObject):
     def _convert_video(self, path, out, opts, ipd_scene, conv, method,
                        prepare_input, fast_unproject, render_sbs,
                        INTERNAL_SHAPE, torch) -> None:
-        import imageio
-        from sharp3d.video import VideoReader, VideoWriter
+        from sharp3d.hdr import FrameReader, Hdr10Writer
+        from sharp3d.video import VideoWriter
 
-        reader = VideoReader(path)
+        reader = FrameReader(path)  # tone-maps HDR input to SDR for the model
         n = reader.n_frames
         f_px = reader.width * 1.2  # estimate (~60 deg FOV)
 
-        writer = VideoWriter(
-            out, fps=reader.fps, width=reader.width * 2, height=reader.height,
-            codec=opts.get("codec", "h264"), crf=opts.get("crf", 18),
-        )
+        hdr_out = opts.get("hdr_output", False)
+        if hdr_out:
+            writer = Hdr10Writer(
+                out, width=reader.width * 2, height=reader.height,
+                fps=reader.fps, codec=opts.get("codec", "h265"),
+                crf=opts.get("crf", 18),
+            )
+        else:
+            writer = VideoWriter(
+                out, fps=reader.fps, width=reader.width * 2, height=reader.height,
+                codec=opts.get("codec", "h264"), crf=opts.get("crf", 18),
+            )
 
         frame_times = []
-        for i in range(n):
+        for i, frame in enumerate(reader.stream_frames()):
             if self._cancel:
                 break
-            frame = reader.get_data(i)
             img_r, df, ir, (w, h) = prepare_input(frame, f_px, self._device)
             torch.cuda.synchronize()
             t0 = time.time()
@@ -263,20 +268,26 @@ class Engine(QObject):
             torch.cuda.synchronize()
             dt = time.time() - t0
             frame_times.append(dt)
-            writer.append_frame(sbs.cpu().numpy())
+            sbs_np = sbs.cpu().numpy()
+            if hdr_out:
+                writer.write_frame(sbs_np)
+            else:
+                writer.append_frame(sbs_np)
             self.convert_progress.emit(i + 1, n, 1.0 / dt)
             del g, g_ndc, sbs, img_r, frame
             torch.cuda.empty_cache()
 
         source = path if reader.has_audio else None
-        writer.close(source_video=source)
-        reader.close()
+        if hdr_out:
+            writer.close(audio_source=source)
+        else:
+            writer.close(source_video=source)
 
         avg = float(np.mean(frame_times)) if frame_times else 0.0
         self.convert_done.emit({
             "output": str(out), "elapsed": sum(frame_times), "fps": 1.0 / avg if avg else 0.0,
             "n_frames": len(frame_times), "size": (reader.width * 2, reader.height),
-            "cancelled": self._cancel,
+            "cancelled": self._cancel, "hdr": hdr_out,
         })
 
     @Slot()

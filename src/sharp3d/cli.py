@@ -31,6 +31,8 @@ def main():
                         help="Use FP32 instead of FP16")
     parser.add_argument("--depth", action="store_true",
                         help="Also output depth map (images only)")
+    parser.add_argument("--hdr", action="store_true",
+                        help="Force HDR10 (10-bit PQ) output. Auto-enabled for HDR input.")
 
     args = parser.parse_args()
 
@@ -81,11 +83,15 @@ def main():
         result = pipeline.process_video(
             input_path, output_path,
             codec=args.codec, crf=args.crf,
+            hdr_output=True if args.hdr else None,
             progress_callback=on_progress,
         )
         print(f"\nDone! {result['n_frames']} frames in {result['total_elapsed']:.1f}s")
         print(f"Average: {result['avg_frame_time']:.3f}s/frame ({result['fps']:.2f} fps)")
-        print(f"Output: {result['output_path']}")
+        if result.get("hdr"):
+            print("Output: {} (HDR10)".format(result['output_path']))
+        else:
+            print(f"Output: {result['output_path']}")
 
     else:
         print(f"Processing image: {input_path.name}")

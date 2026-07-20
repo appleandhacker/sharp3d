@@ -145,6 +145,7 @@ class Sharp3DPipeline:
         output_path: str | Path,
         codec: str = "h264",
         crf: int = 18,
+        hdr_output: bool | None = None,
         progress_callback: Callable[[int, int, float], None] | None = None,
     ) -> dict:
         """Process video → SBS video with audio.
@@ -154,36 +155,46 @@ class Sharp3DPipeline:
             output_path: Path for SBS output video.
             codec: "h264", "h265", or "av1".
             crf: Quality (lower = better, 18 = visually lossless).
+            hdr_output: True = force HDR10 output, False = force SDR,
+                        None = auto (HDR10 if the input is HDR).
             progress_callback: (frame_idx, total_frames, fps) callback.
 
         Returns:
             dict with timing info and output path.
         """
+        from .hdr import FrameReader, Hdr10Writer, probe_video
+
         input_path = Path(input_path)
         output_path = Path(output_path)
 
-        reader = VideoReader(input_path)
+        info = probe_video(input_path)
+        reader = FrameReader(input_path, info)  # tone-maps HDR input to SDR
         n_frames = reader.n_frames
         vid_fps = reader.fps
+        f_px = reader.width * 1.2  # ~60° FOV estimate
 
-        # Get focal length from first frame
-        first_frame = reader.get_frame(0)
-        _, _, f_px = sharp_io.load_rgb(input_path)  # Get f_px from metadata
-        # For video, estimate f_px from aspect ratio if not available
-        if f_px is None:
-            f_px = reader.width * 1.2  # Default ~60° FOV
+        # HDR output: explicit flag, or auto-match the input's HDR status
+        is_hdr = info["is_hdr"]
+        want_hdr = is_hdr if hdr_output is None else hdr_output
+        if want_hdr and codec == "h264":
+            codec = "h265"  # H.264 cannot carry HDR10
 
-        writer = VideoWriter(
-            output_path, fps=vid_fps,
-            width=reader.width * 2, height=reader.height,
-            codec=codec, crf=crf,
-        )
+        if want_hdr:
+            writer = Hdr10Writer(
+                output_path, fps=vid_fps, width=reader.width * 2,
+                height=reader.height, codec=codec, crf=crf,
+            )
+        else:
+            writer = VideoWriter(
+                output_path, fps=vid_fps,
+                width=reader.width * 2, height=reader.height,
+                codec=codec, crf=crf,
+            )
 
         frame_times = []
         total_start = time.time()
 
-        for i in range(n_frames):
-            frame = reader.get_frame(i)
+        for i, frame in enumerate(reader.stream_frames()):
             img_resized, df, intrinsics_resized, (orig_w, orig_h) = prepare_input(
                 frame, f_px, self.device
             )
@@ -209,7 +220,11 @@ class Sharp3DPipeline:
             dt = time.time() - t0
             frame_times.append(dt)
 
-            writer.append_frame(sbs_img.cpu().numpy())
+            sbs_np = sbs_img.cpu().numpy()
+            if want_hdr:
+                writer.write_frame(sbs_np)
+            else:
+                writer.append_frame(sbs_np)
 
             if progress_callback:
                 progress_callback(i, n_frames, 1.0 / dt)
@@ -219,8 +234,10 @@ class Sharp3DPipeline:
 
         # Close and mux audio
         source = input_path if reader.has_audio else None
-        writer.close(source_video=source)
-        reader.close()
+        if want_hdr:
+            writer.close(audio_source=source)
+        else:
+            writer.close(source_video=source)
 
         total_elapsed = time.time() - total_start
         avg_frame_time = np.mean(frame_times)
@@ -229,7 +246,8 @@ class Sharp3DPipeline:
             "total_elapsed": total_elapsed,
             "avg_frame_time": avg_frame_time,
             "fps": 1.0 / avg_frame_time,
-            "n_frames": n_frames,
+            "n_frames": len(frame_times),
             "output_path": str(output_path),
             "output_size": (reader.width * 2, reader.height),
+            "hdr": want_hdr,
         }

@@ -131,6 +131,14 @@ class SbsTab(QWidget):
         self._chk_audio = QCheckBox("保留原始音轨")
         self._chk_audio.setChecked(True)
         enc_card.add_widget(self._chk_audio)
+
+        self._chk_hdr = QCheckBox("HDR10 输出 (10-bit PQ)")
+        self._chk_hdr.setToolTip(
+            "将立体渲染封装为 HDR10 格式，在 HDR 设备上正确显示。\n"
+            "输入为 HDR 时自动开启。注：模型为 SDR，输出动态范围为 SDR 级。"
+        )
+        self._chk_hdr.toggled.connect(self._on_hdr_toggled)
+        enc_card.add_widget(self._chk_hdr)
         right.addWidget(enc_card)
 
         adv_card = SectionCard(c, "高级")
@@ -198,6 +206,11 @@ class SbsTab(QWidget):
             self._s_strength.value(), PREVIEW_WIDTH,
         )
 
+    def _on_hdr_toggled(self, checked: bool) -> None:
+        # HDR10 requires H.265 or AV1; H.264 cannot carry it.
+        if checked and self._codec.currentText() == "H.264":
+            self._codec.setCurrentText("H.265")
+
     def _on_input(self, path: str) -> None:
         p = Path(path)
         self._is_video = p.suffix.lower() in VIDEO_EXTS
@@ -207,10 +220,15 @@ class SbsTab(QWidget):
         # frame slider for video
         if self._is_video:
             try:
-                import imageio
-                reader = imageio.get_reader(str(p))
-                self._n_frames = reader.count_frames()
-                reader.close()
+                from sharp3d.hdr import probe_video
+                info = probe_video(p)
+                self._n_frames = info["n_frames"] or 1
+                # auto-enable HDR10 output for HDR sources
+                if info["is_hdr"]:
+                    self._chk_hdr.setChecked(True)
+                    if self._codec.currentText() == "H.264":
+                        self._codec.setCurrentText("H.265")
+                    self.status_message.emit("检测到 HDR 输入，已启用 HDR10 输出")
             except Exception:
                 self._n_frames = 1
             self._frame_slider.setEnabled(self._n_frames > 1)
@@ -276,6 +294,7 @@ class SbsTab(QWidget):
             "decompose": "analytical" if self._decompose.currentIndex() == 0 else "svd",
             "depth": self._chk_depth.isChecked(),
             "ply": self._chk_ply.isChecked(),
+            "hdr_output": self._chk_hdr.isChecked(),
         }
         self._engine.convert(opts)
 

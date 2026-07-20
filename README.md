@@ -14,6 +14,7 @@
 - **可选导出**：深度图可视化、PLY 高斯文件
 - **PySide6 图形界面**：红青立体主题，色调跟随系统亮 / 暗模式，GPU 实时监控
 - **响应式调参**：拖动滑块时从缓存高斯快速重渲染预览（预测与渲染分离）
+- **HDR 支持**：自动检测 HDR 输入并色调映射后处理，可输出 HDR10（10-bit PQ BT.2020）
 
 ## 性能（RTX 5070 Ti 12GB，4K 输入）
 
@@ -74,6 +75,7 @@ python -m sharp3d.gui
 python -m sharp3d.cli input.png -o output.png          # 图片 → SBS
 python -m sharp3d.cli input.mp4 -o output.mp4          # 视频 → SBS
 python -m sharp3d.cli input.mp4 --codec h265 --crf 18  # 指定编码
+python -m sharp3d.cli input.mp4 --hdr                  # 强制 HDR10 输出（HDR 输入自动启用）
 python -m sharp3d.cli input.png --decompose svd        # 用 SVD 分解（参考）
 ```
 
@@ -88,6 +90,7 @@ src/sharp3d/
 ├── predict.py         模型加载 + compile + FP16 推理
 ├── pipeline.py        端到端管线
 ├── video.py           视频读写 + 音频混流
+├── hdr.py             HDR 检测 + 色调映射 + HDR10 编码
 ├── cli.py             命令行入口
 └── gui/
     ├── theme.py       系统主题检测 + 红青配色 + QSS
@@ -100,9 +103,11 @@ src/sharp3d/
 
 ## 已知限制
 
-- **HDR 视频**：当前按 8-bit SDR 读取，未做 PQ/HLG 反解与 BT.2020→BT.709
-  色调映射，HDR 片源颜色 / 亮度会失真。后续计划用 ffmpeg `zscale + tonemap`
-  自动转 SDR 后再处理。
+- **HDR 为格式级支持，非真 HDR 还原**：SHARP 是 SDR 模型（sRGB 输入、
+  linearRGB 输出、值域 0–1），3D 重建全程在 SDR 空间进行。因此 HDR 输入会先
+  色调映射成 SDR 再处理，输出的 HDR10 文件动态范围 / 色域仍是 SDR 级别——
+  它能在 HDR 设备上正确显示（10-bit、PQ、BT.2020，不发灰、无色带），但无法
+  还原原片的高光与广色域。这是模型本质限制。
 - 内部分辨率固定 1536×1536（SHARP 架构约束，SPN 三级金字塔要求）。
 - 高斯数量固定约 118 万（模型固定输出）。
 
