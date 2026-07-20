@@ -32,6 +32,8 @@ from .widgets import (
 )
 from .worker import EngineProcess
 
+from ..formats import FORMATS
+
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
 IMG_FILTER = "图片 (*.png *.jpg *.jpeg *.bmp *.webp);;所有文件 (*)"
 VID_FILTER = "视频 (*.mp4 *.mkv *.avi *.mov *.webm);;所有文件 (*)"
@@ -120,7 +122,19 @@ class SbsTab(QWidget):
         stereo_card.add_widget(conv_hint)
         right.addWidget(stereo_card)
 
-        enc_card = SectionCard(c, "视频编码")
+        enc_card = SectionCard(c, "输出设置")
+        fmt_row = QHBoxLayout()
+        fmt_row.addWidget(QLabel("立体格式"))
+        self._format = QComboBox()
+        for _key, label in FORMATS:
+            self._format.addItem(label)
+        self._format.setToolTip(
+            "导出文件的立体打包格式。预览始终显示 Full SBS（调参用）。\n"
+            "Anaglyph 红青 = 用红青 3D 眼镜观看；Cross Eyed = 斗鸡眼观看法。"
+        )
+        fmt_row.addWidget(self._format, 1)
+        enc_card.add_layout(fmt_row)
+
         codec_row = QHBoxLayout()
         codec_row.addWidget(QLabel("编码器"))
         self._codec = QComboBox()
@@ -132,8 +146,8 @@ class SbsTab(QWidget):
         crf_row = QHBoxLayout()
         crf_row.addWidget(QLabel("质量 CRF"))
         self._crf = QComboBox()
-        self._crf.addItems(["16", "18", "20", "23", "28"])
-        self._crf.setCurrentText("18")
+        self._crf.addItems(["16", "18", "20", "23", "26", "28"])
+        self._crf.setCurrentText("26")
         crf_row.addWidget(self._crf, 1)
         enc_card.add_layout(crf_row)
 
@@ -312,6 +326,7 @@ class SbsTab(QWidget):
         opts = {
             "input": inp,
             "output": out,
+            "format": FORMATS[self._format.currentIndex()][0],
             "ipd_mm": self._s_ipd.value(),
             "convergence": self._s_conv.value(),
             "strength": self._s_strength.value(),

@@ -54,19 +54,23 @@ class Sharp3DPipeline:
         input_path: str | Path,
         output_path: str | Path,
         output_depth: bool = False,
+        format: str = "full_sbs",
         progress_callback: Callable[[str], None] | None = None,
     ) -> dict:
-        """Process a single image → SBS output.
+        """Process a single image → stereoscopic output.
 
         Args:
             input_path: Path to input image.
-            output_path: Path for SBS output image.
+            output_path: Path for stereo output image.
             output_depth: Also save depth map visualization.
+            format: Stereo packing format (see sharp3d.formats).
             progress_callback: Optional callback for status updates.
 
         Returns:
             dict with timing info and output paths.
         """
+        from .formats import output_size, pack as pack_stereo
+
         input_path = Path(input_path)
         output_path = Path(output_path)
 
@@ -115,14 +119,15 @@ class Sharp3DPipeline:
         elapsed = time.time() - t0
 
         # Save output
-        sbs_np = sbs_img.cpu().numpy()
+        packed = pack_stereo(format, sbs_img)
+        sbs_np = packed.cpu().numpy()
         Image.fromarray(sbs_np).save(output_path)
 
         result = {
             "elapsed": elapsed,
             "fps": 1.0 / elapsed,
             "output_path": str(output_path),
-            "output_size": (sw * 2, sh),
+            "output_size": output_size(format, sw, sh),
         }
 
         # Optional depth map
@@ -144,17 +149,19 @@ class Sharp3DPipeline:
         input_path: str | Path,
         output_path: str | Path,
         codec: str = "h264",
-        crf: int = 18,
+        crf: int = 26,
+        format: str = "full_sbs",
         hdr_output: bool | None = None,
         progress_callback: Callable[[int, int, float], None] | None = None,
     ) -> dict:
-        """Process video → SBS video with audio.
+        """Process video → stereoscopic video with audio.
 
         Args:
             input_path: Path to input video.
-            output_path: Path for SBS output video.
+            output_path: Path for stereo output video.
             codec: "h264", "h265", or "av1".
-            crf: Quality (lower = better, 18 = visually lossless).
+            crf: Quality (lower = better).
+            format: Stereo packing format (see sharp3d.formats).
             hdr_output: True = force HDR10 output, False = force SDR,
                         None = auto (HDR10 if the input is HDR).
             progress_callback: (frame_idx, total_frames, fps) callback.
@@ -162,6 +169,7 @@ class Sharp3DPipeline:
         Returns:
             dict with timing info and output path.
         """
+        from .formats import output_size, pack as pack_stereo
         from .hdr import FrameReader, Hdr10Writer, probe_video
 
         input_path = Path(input_path)
@@ -173,6 +181,8 @@ class Sharp3DPipeline:
         vid_fps = reader.fps
         f_px = reader.width * 1.2  # ~60° FOV estimate
 
+        out_w, out_h = output_size(format, reader.width, reader.height)
+
         # HDR output: explicit flag, or auto-match the input's HDR status
         is_hdr = info["is_hdr"]
         want_hdr = is_hdr if hdr_output is None else hdr_output
@@ -181,13 +191,13 @@ class Sharp3DPipeline:
 
         if want_hdr:
             writer = Hdr10Writer(
-                output_path, fps=vid_fps, width=reader.width * 2,
-                height=reader.height, codec=codec, crf=crf,
+                output_path, fps=vid_fps, width=out_w,
+                height=out_h, codec=codec, crf=crf,
             )
         else:
             writer = VideoWriter(
                 output_path, fps=vid_fps,
-                width=reader.width * 2, height=reader.height,
+                width=out_w, height=out_h,
                 codec=codec, crf=crf,
             )
 
@@ -240,7 +250,8 @@ class Sharp3DPipeline:
             dt = time.time() - t0
             frame_times.append(dt)
 
-            sbs_np = sbs_img.cpu().numpy()
+            packed = pack_stereo(format, sbs_img)
+            sbs_np = packed.cpu().numpy()
             if want_hdr:
                 writer.write_frame(sbs_np)
             else:
@@ -278,6 +289,6 @@ class Sharp3DPipeline:
             "fps": 1.0 / avg_frame_time,
             "n_frames": len(frame_times),
             "output_path": str(output_path),
-            "output_size": (reader.width * 2, reader.height),
+            "output_size": (out_w, out_h),
             "hdr": want_hdr,
         }

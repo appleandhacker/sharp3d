@@ -20,8 +20,12 @@ def main():
     parser.add_argument("--codec", type=str, default="h264",
                         choices=["h264", "h265", "av1"],
                         help="Video codec (default: h264)")
-    parser.add_argument("--crf", type=int, default=18,
-                        help="Video quality CRF (default: 18, lower=better)")
+    parser.add_argument("--crf", type=int, default=26,
+                        help="Video quality CRF (default: 26, lower=better)")
+    parser.add_argument("--format", type=str, default="full_sbs",
+                        choices=["full_sbs", "half_sbs", "full_tb", "half_tb",
+                                 "cross", "anaglyph"],
+                        help="Stereo output format (default: full_sbs)")
     parser.add_argument("--decompose", type=str, default="analytical",
                         choices=["analytical", "svd"],
                         help="Decomposition method (default: analytical)")
@@ -83,6 +87,7 @@ def main():
         result = pipeline.process_video(
             input_path, output_path,
             codec=args.codec, crf=args.crf,
+            format=args.format,
             hdr_output=True if args.hdr else None,
             progress_callback=on_progress,
         )
@@ -102,6 +107,7 @@ def main():
         result = pipeline.process_image(
             input_path, output_path,
             output_depth=args.depth,
+            format=args.format,
             progress_callback=on_status,
         )
         print(f"\nDone! {result['elapsed']:.3f}s ({result['fps']:.2f} fps)")

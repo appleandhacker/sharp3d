@@ -173,6 +173,9 @@ class _PipelineWorker:
                        prepare_input, fast_unproject, render_sbs,
                        INTERNAL_SHAPE, torch, sharp_io):
         from PIL import Image
+        from sharp3d.formats import output_size, pack as pack_stereo
+
+        fmt = opts.get("format", "full_sbs")
         image_np, _, f_px = sharp_io.load_rgb(path)
         h, w = image_np.shape[:2]
         img_r, df, ir, _ = prepare_input(image_np, f_px, self._device)
@@ -183,10 +186,11 @@ class _PipelineWorker:
         g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
                            INTERNAL_SHAPE, decompose_method=method)
         sbs, (sw, sh) = render_sbs(g, f_px, w, h, ipd=ipd_scene, convergence=conv)
+        packed = pack_stereo(fmt, sbs)
         torch.cuda.synchronize()
         elapsed = time.time() - t0
 
-        Image.fromarray(sbs.cpu().numpy()).save(out)
+        Image.fromarray(packed.cpu().numpy()).save(out)
 
         if opts.get("depth"):
             from sharp3d.render import render_depth_map
@@ -197,14 +201,14 @@ class _PipelineWorker:
             from sharp.utils.gaussians import save_ply
             save_ply(g, f_px, (h, w), out.with_suffix(".ply"))
 
-        del g, g_ndc, sbs
+        del g, g_ndc, sbs, packed
         torch.cuda.empty_cache()
         gc.collect()
 
         self._respond("convert_progress", (1, 1, 1.0 / elapsed))
         self._respond("convert_done", ({
             "output": str(out), "elapsed": elapsed, "fps": 1.0 / elapsed,
-            "n_frames": 1, "size": (sw * 2, sh),
+            "n_frames": 1, "size": output_size(fmt, sw, sh),
         },))
 
     def _convert_video(self, path, out, opts, ipd_scene, conv, method,
@@ -212,28 +216,31 @@ class _PipelineWorker:
                        INTERNAL_SHAPE, torch):
         from sharp3d.hdr import FrameReader, Hdr10Writer
         from sharp3d.video import VideoWriter, resolve_av1
+        from sharp3d.formats import output_size, pack as pack_stereo
 
         reader = FrameReader(path)
         n = reader.n_frames
         f_px = reader.width * 1.2
 
+        fmt = opts.get("format", "full_sbs")
+        out_w, out_h = output_size(fmt, reader.width, reader.height)
+
         # Tell the user when AV1 silently falls back to CPU encoding because
-        # the SBS output is too large for the GPU encoder (NVENC caps at 8192).
+        # the packed output is too large for the GPU encoder (NVENC caps at 8192).
         if opts.get("codec") == "av1" and not opts.get("hdr_output", False):
-            enc = resolve_av1(reader.width * 2, reader.height)
+            enc = resolve_av1(out_w, out_h)
             if enc and enc != "av1_nvenc":
                 self._respond("status", (
-                    f"输出 {reader.width * 2}×{reader.height} 超过GPU编码上限，"
+                    f"输出 {out_w}×{out_h} 超过GPU编码上限，"
                     f"AV1 改用CPU编码 ({enc})",))
 
         hdr_out = opts.get("hdr_output", False)
         if hdr_out:
-            writer = Hdr10Writer(out, width=reader.width * 2, height=reader.height,
+            writer = Hdr10Writer(out, width=out_w, height=out_h,
                                  fps=reader.fps, codec=opts.get("codec", "h265"),
                                  crf=opts.get("crf", 18))
         else:
-            writer = VideoWriter(out, fps=reader.fps, width=reader.width * 2,
-                                 height=reader.height,
+            writer = VideoWriter(out, fps=reader.fps, width=out_w, height=out_h,
                                  codec=opts.get("codec", "h264"),
                                  crf=opts.get("crf", 18))
 
@@ -274,17 +281,18 @@ class _PipelineWorker:
             g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
                                INTERNAL_SHAPE, decompose_method=method)
             sbs, _ = render_sbs(g, f_px, w, h, ipd=ipd_scene, convergence=conv)
+            packed = pack_stereo(fmt, sbs)
             torch.cuda.synchronize()
             dt = time.time() - t0
             frame_times.append(dt)
-            sbs_np = sbs.cpu().numpy()
+            sbs_np = packed.cpu().numpy()
             if hdr_out:
                 writer.write_frame(sbs_np)
             else:
                 writer.append_frame(sbs_np)
             self._respond("convert_progress", (i + 1, n, 1.0 / dt))
             i += 1
-            del g, g_ndc, sbs, img_r, frame
+            del g, g_ndc, sbs, packed, img_r, frame
             # Deliberately NO per-frame torch.cuda.empty_cache(): it forces a
             # device sync plus allocator churn on every frame. Shapes are
             # constant frame-to-frame, so the caching allocator reuses its
@@ -310,7 +318,7 @@ class _PipelineWorker:
         self._respond("convert_done", ({
             "output": str(out), "elapsed": sum(frame_times),
             "fps": 1.0 / avg if avg else 0.0,
-            "n_frames": len(frame_times), "size": (reader.width * 2, reader.height),
+            "n_frames": len(frame_times), "size": (out_w, out_h),
             "cancelled": self._cancel_event.is_set(), "hdr": hdr_out,
         },))
 
