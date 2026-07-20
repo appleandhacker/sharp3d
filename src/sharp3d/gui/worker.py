@@ -211,11 +211,20 @@ class _PipelineWorker:
                        prepare_input, fast_unproject, render_sbs,
                        INTERNAL_SHAPE, torch):
         from sharp3d.hdr import FrameReader, Hdr10Writer
-        from sharp3d.video import VideoWriter
+        from sharp3d.video import VideoWriter, resolve_av1
 
         reader = FrameReader(path)
         n = reader.n_frames
         f_px = reader.width * 1.2
+
+        # Tell the user when AV1 silently falls back to CPU encoding because
+        # the SBS output is too large for the GPU encoder (NVENC caps at 8192).
+        if opts.get("codec") == "av1" and not opts.get("hdr_output", False):
+            enc = resolve_av1(reader.width * 2, reader.height)
+            if enc and enc != "av1_nvenc":
+                self._respond("status", (
+                    f"输出 {reader.width * 2}×{reader.height} 超过GPU编码上限，"
+                    f"AV1 改用CPU编码 ({enc})",))
 
         hdr_out = opts.get("hdr_output", False)
         if hdr_out:
@@ -351,8 +360,9 @@ class _PipelineWorker:
             codec = opts["codec"]
             if codec in ("av1", "libsvtav1"):
                 # Resolve to the best AV1 encoder this machine has (NVENC
-                # first, software fallback).
-                codec = video.resolve_av1()
+                # first, software fallback), honoring the frame size cap.
+                fh, fw = opts["frames"][0].shape[:2] if opts.get("frames") else (0, 0)
+                codec = video.resolve_av1(fw, fh)
                 if codec is None:
                     raise RuntimeError(
                         "当前 ffmpeg 不支持任何 AV1 编码器"

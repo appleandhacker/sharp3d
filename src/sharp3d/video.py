@@ -25,14 +25,27 @@ os.environ.setdefault("IMAGEIO_FFMPEG_EXE", FFMPEG)
 AV1_CHAIN = ("av1_nvenc", "libsvtav1", "libaom-av1")
 
 
-def resolve_av1() -> str | None:
-    """Pick the best available AV1 encoder, or None if ffmpeg has no AV1."""
+# NVENC hardware encoding caps (pixels per side).
+NVENC_LIMITS = {"h264_nvenc": 4096, "hevc_nvenc": 8192, "av1_nvenc": 8192}
+
+
+def resolve_av1(width: int = 0, height: int = 0) -> str | None:
+    """Pick the best available AV1 encoder for the given frame size.
+
+    NVENC entries are skipped when the frame exceeds the hardware cap
+    (e.g. 4320-wide 4K SBS -> 8640 wide is beyond the 8192 limit); software
+    encoders have no such cap and serve as the fallback.
+    """
     from .hdr import available_encoders
 
     avail = available_encoders()
+    max_dim = max(width, height)
     for name in AV1_CHAIN:
-        if name in avail:
-            return name
+        if name not in avail:
+            continue
+        if max_dim > NVENC_LIMITS.get(name, 1 << 30):
+            continue
+        return name
     return None
 
 
@@ -102,10 +115,11 @@ class VideoWriter:
         self.tmp_path = self.path.with_suffix(".tmp.mp4")
 
         if codec == "av1":
-            # Not every ffmpeg build has libsvtav1 — pick the best AV1
-            # encoder actually available. Fail now (before rendering any
-            # frames) instead of at the end of a long conversion.
-            codec_lib = resolve_av1()
+            # Not every ffmpeg build has libsvtav1, and NVENC cannot encode
+            # beyond 8192 px per side — resolve against both availability and
+            # the output size. Fail now (before rendering any frames) instead
+            # of at the end of a long conversion.
+            codec_lib = resolve_av1(width, height)
             if codec_lib is None:
                 raise RuntimeError(
                     "当前 ffmpeg 不支持任何 AV1 编码器"
