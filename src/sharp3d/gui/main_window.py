@@ -95,6 +95,11 @@ class MainWindow(QMainWindow):
 
         self._apply_theme(self._theme.is_dark)
 
+        # Start loading the model immediately: the one-time load/compile cost
+        # (~1 min on first run) overlaps with the user picking a file, instead
+        # of stalling the first conversion.
+        self._engine.preload()
+
     # ------------------------------------------------------------------
     def _apply_theme(self, is_dark: bool) -> None:
         c = self._theme.colors

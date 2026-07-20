@@ -48,11 +48,22 @@ class _PipelineWorker:
         self._orig_h = 0
 
     # ---- lazy model loading --------------------------------------------
+    def preload(self):
+        """Load + compile everything ahead of time (called at app startup).
+
+        Same as the lazy path, but kicked off before the user picks a file so
+        the one-time model/compile cost overlaps with natural UI idle time.
+        """
+        try:
+            self._ensure_pipeline()
+        except Exception as exc:  # noqa: BLE001
+            self._respond("error", (f"预加载失败: {exc}",))
+
     def _ensure_pipeline(self):
         if self._pipeline is not None:
             return
         self._respond("model_loading", ())
-        self._respond("status", ("正在加载 SHARP 模型并编译…",))
+        self._respond("status", ("正在加载 SHARP 模型权重…",))
 
         import torch
         from sharp.models import PredictorParams, create_predictor
@@ -65,17 +76,44 @@ class _PipelineWorker:
         predictor = create_predictor(PredictorParams())
         predictor.load_state_dict(state_dict)
         predictor.eval().to(self._device)
-        self._compiled = torch.compile(predictor, mode="default")
         self._torch = torch
         self._pipeline = predictor
+
+        self._respond("status", ("正在编译预测器 (torch.compile)…",))
+        self._compiled = torch.compile(predictor, mode="default")
 
         from sharp3d.unproject import INTERNAL_SHAPE
         dummy_img = torch.zeros(1, 3, *INTERNAL_SHAPE, device=self._device)
         dummy_df = torch.tensor([1.0], device=self._device, dtype=torch.float32)
+        self._respond("status", ("正在预热推理（首次需编译内核，约1分钟）…",))
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-            _ = self._compiled(dummy_img, dummy_df)
+            g_ndc = self._compiled(dummy_img, dummy_df)
         torch.cuda.synchronize()
-        del dummy_img, dummy_df
+
+        # Trigger gsplat's one-time CUDA JIT here as well (it compiles its
+        # rasterization kernels on first use), so the first real frame
+        # renders at full speed instead of stalling ~15s.
+        self._respond("status", ("正在编译渲染内核 (gsplat)…",))
+        try:
+            from sharp3d.unproject import fast_unproject
+            from sharp3d.render import render_sbs
+            f = INTERNAL_SHAPE[1] * 1.2
+            ir = torch.tensor([
+                [f, 0, (INTERNAL_SHAPE[1] - 1) / 2.0, 0],
+                [0, f, (INTERNAL_SHAPE[0] - 1) / 2.0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1],
+            ], dtype=torch.float32, device=self._device)
+            g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
+                               INTERNAL_SHAPE, decompose_method="analytical")
+            render_sbs(g, f, INTERNAL_SHAPE[1], INTERNAL_SHAPE[0],
+                       ipd=0.063, render_width=320)
+            torch.cuda.synchronize()
+            del g, ir
+        except Exception:  # noqa: BLE001
+            pass  # warmup only; worst case the first real render JITs instead
+        del dummy_img, dummy_df, g_ndc
+        torch.cuda.empty_cache()
 
         self._respond("model_ready", ())
         self._respond("status", ("模型就绪",))
@@ -472,6 +510,11 @@ class EngineProcess(QObject):
             pass
 
     # ---- request methods (non-blocking; enqueue to child) ---------------
+    def preload(self):
+        """Kick off model load + compile in the child right away, so the
+        one-time cost overlaps with app startup instead of the first convert."""
+        self._req_q.put(("preload", {}))
+
     def prepare(self, path, frame_idx):
         self._req_q.put(("prepare", {"path": path, "frame_idx": frame_idx}))
 
