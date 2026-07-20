@@ -9,6 +9,7 @@ BUG#5: disparity_factor must be dtype=float32. Python float creates f64
 tensor → "Input type (double) and bias type (Half)" error under FP16 autocast.
 """
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -25,13 +26,18 @@ from .eigendecompose import decompose_covariance
 INTERNAL_SHAPE = (1536, 1536)
 
 
-def prepare_input(image_np, f_px: float, device: torch.device):
+def prepare_input(image_np, f_px: float, device: torch.device,
+                  async_upload: bool = False):
     """Prepare image for SHARP predictor.
 
     Args:
         image_np: (H, W, 3) uint8 numpy array.
         f_px: Focal length in pixels.
         device: Target device.
+        async_upload: Pin host memory and copy non-blocking, so the upload
+            can overlap GPU work issued on another stream (the caller is
+            responsible for stream synchronization before consuming the
+            result).
 
     Returns:
         img_resized: (1, 3, 1536, 1536) float tensor [0, 1].
@@ -39,7 +45,14 @@ def prepare_input(image_np, f_px: float, device: torch.device):
         intrinsics_resized: (4, 4) intrinsics scaled to 1536x1536.
         orig_size: (W, H) original image size.
     """
-    img = torch.from_numpy(image_np.copy()).float().to(device).permute(2, 0, 1) / 255.0
+    # Upload as uint8 (1 byte/px) and convert on the GPU — converting on the
+    # CPU first would push 4x the bytes over PCIe. ascontiguousarray avoids a
+    # copy for frames that are already owned C-contiguous arrays.
+    t = torch.from_numpy(np.ascontiguousarray(image_np))
+    if async_upload:
+        t = t.pin_memory()
+    img = t.to(device, non_blocking=async_upload).permute(2, 0, 1)
+    img = img.float().div_(255.0)
     _, h, w = img.shape
 
     # BUG#5 FIX: explicit dtype=float32 (Python float → f64 → FP16 autocast error)

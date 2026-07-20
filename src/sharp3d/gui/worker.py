@@ -305,36 +305,69 @@ class _PipelineWorker:
         decoder = threading.Thread(target=_decode, daemon=True)
         decoder.start()
 
+        # Pipeline the host->device transfer too: prepare frame N+1 on a side
+        # stream (pinned non-blocking upload + resize) while frame N is being
+        # predicted/rendered on the main stream. Copy and compute use separate
+        # DMA/compute engines, so the transfer overlaps GPU work instead of
+        # serializing with it.
+        side_stream = torch.cuda.Stream()
+        main_stream = torch.cuda.current_stream()
+
+        def _prepare_async(frm):
+            with torch.cuda.stream(side_stream):
+                prepared = prepare_input(frm, f_px, self._device,
+                                         async_upload=True)
+                upload_done = side_stream.record_event()
+            # Wait for the copy on the CPU: the pinned host buffer is freed
+            # when prepare_input returns, so it must not be reused (by the
+            # next frame's pin_memory) while the async copy still reads it.
+            # This stalls only the CPU ~10ms — the GPU keeps rendering the
+            # previous frame; the side stream provides the real overlap.
+            upload_done.synchronize()
+            return prepared, upload_done
+
         i = 0
-        while True:
-            frame = frame_q.get()
-            if frame is None or self._cancel_event.is_set():
-                break
-            img_r, df, ir, (w, h) = prepare_input(frame, f_px, self._device)
-            # No sync before predict: CUDA stream ordering already guarantees
-            # prepare's upload finished before the kernels consume it.
-            t0 = time.time()
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-                g_ndc = self._compiled(img_r, df)
-            g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
-                               INTERNAL_SHAPE, decompose_method=method)
-            sbs, _ = render_sbs(g, f_px, w, h, ipd=ipd_scene, convergence=conv)
-            packed = pack_stereo(fmt, sbs)
-            torch.cuda.synchronize()
-            dt = time.time() - t0
-            frame_times.append(dt)
-            sbs_np = packed.cpu().numpy()
-            if hdr_out:
-                writer.write_frame(sbs_np)
-            else:
-                writer.append_frame(sbs_np)
-            self._respond("convert_progress", (i + 1, n, 1.0 / dt))
-            i += 1
-            del g, g_ndc, sbs, packed, img_r, frame
-            # Deliberately NO per-frame torch.cuda.empty_cache(): it forces a
-            # device sync plus allocator churn on every frame. Shapes are
-            # constant frame-to-frame, so the caching allocator reuses its
-            # blocks and VRAM stays flat.
+        first = frame_q.get()
+        if first is not None and not self._cancel_event.is_set():
+            prepared, upload_done = _prepare_async(first)
+            del first
+            while True:
+                # Fetch the next frame and kick off its prepare now, so its
+                # upload overlaps this frame's GPU pass.
+                nxt = frame_q.get()
+                nxt_prepared = None
+                if nxt is not None and not self._cancel_event.is_set():
+                    nxt_prepared = _prepare_async(nxt)
+                del nxt
+
+                main_stream.wait_event(upload_done)
+                img_r, df, ir, (w, h) = prepared
+                t0 = time.time()
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+                    g_ndc = self._compiled(img_r, df)
+                g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
+                                   INTERNAL_SHAPE, decompose_method=method)
+                sbs, _ = render_sbs(g, f_px, w, h, ipd=ipd_scene, convergence=conv)
+                packed = pack_stereo(fmt, sbs)
+                torch.cuda.synchronize()
+                dt = time.time() - t0
+                frame_times.append(dt)
+                sbs_np = packed.cpu().numpy()
+                if hdr_out:
+                    writer.write_frame(sbs_np)
+                else:
+                    writer.append_frame(sbs_np)
+                self._respond("convert_progress", (i + 1, n, 1.0 / dt))
+                i += 1
+                del g, g_ndc, sbs, packed, img_r, prepared
+                # Deliberately NO per-frame torch.cuda.empty_cache(): it forces
+                # a device sync plus allocator churn on every frame. Shapes are
+                # constant frame-to-frame, so the caching allocator reuses its
+                # blocks and VRAM stays flat.
+
+                if nxt_prepared is None:
+                    break
+                prepared, upload_done = nxt_prepared
 
         # Unblock the producer if it is parked on a full queue, then join.
         while True:

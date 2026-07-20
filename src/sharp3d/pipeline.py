@@ -221,49 +221,74 @@ class Sharp3DPipeline:
         decoder = threading.Thread(target=_decode, daemon=True)
         decoder.start()
 
+        # Pipeline the host->device transfer: prepare frame N+1 on a side
+        # stream while frame N renders on the main stream (copy and compute
+        # use separate engines, so the upload overlaps GPU work).
+        side_stream = torch.cuda.Stream()
+        main_stream = torch.cuda.current_stream()
+
+        def _prepare_async(frm):
+            with torch.cuda.stream(side_stream):
+                prepared = prepare_input(frm, f_px, self.device,
+                                         async_upload=True)
+                upload_done = side_stream.record_event()
+            # CPU-side wait: the pinned host buffer must not be reused (by the
+            # next frame's pin_memory) while the async copy still reads it.
+            # Only the CPU stalls ~10ms; the GPU keeps rendering in parallel.
+            upload_done.synchronize()
+            return prepared, upload_done
+
         i = 0
-        while True:
-            frame = frame_q.get()
-            if frame is None:
-                break
-            img_resized, df, intrinsics_resized, (orig_w, orig_h) = prepare_input(
-                frame, f_px, self.device
-            )
+        first = frame_q.get()
+        if first is not None:
+            prepared, upload_done = _prepare_async(first)
+            del first
+            while True:
+                nxt = frame_q.get()
+                nxt_prepared = _prepare_async(nxt) if nxt is not None else None
+                del nxt
 
-            self._ensure_warmup(img_resized, df)
+                main_stream.wait_event(upload_done)
+                img_resized, df, intrinsics_resized, (orig_w, orig_h) = prepared
 
-            t0 = time.time()
+                self._ensure_warmup(img_resized, df)
 
-            g_ndc = self.predictor.predict(img_resized, df)
-            g_world = fast_unproject(
-                g_ndc,
-                torch.eye(4, device=self.device),
-                intrinsics_resized,
-                INTERNAL_SHAPE,
-                decompose_method=self.decompose_method,
-            )
-            sbs_img, _ = render_sbs(
-                g_world, f_px, orig_w, orig_h, ipd=self.ipd
-            )
+                t0 = time.time()
 
-            torch.cuda.synchronize()
-            dt = time.time() - t0
-            frame_times.append(dt)
+                g_ndc = self.predictor.predict(img_resized, df)
+                g_world = fast_unproject(
+                    g_ndc,
+                    torch.eye(4, device=self.device),
+                    intrinsics_resized,
+                    INTERNAL_SHAPE,
+                    decompose_method=self.decompose_method,
+                )
+                sbs_img, _ = render_sbs(
+                    g_world, f_px, orig_w, orig_h, ipd=self.ipd
+                )
 
-            packed = pack_stereo(format, sbs_img)
-            sbs_np = packed.cpu().numpy()
-            if want_hdr:
-                writer.write_frame(sbs_np)
-            else:
-                writer.append_frame(sbs_np)
+                torch.cuda.synchronize()
+                dt = time.time() - t0
+                frame_times.append(dt)
 
-            if progress_callback:
-                progress_callback(i, n_frames, 1.0 / dt)
-            i += 1
+                packed = pack_stereo(format, sbs_img)
+                sbs_np = packed.cpu().numpy()
+                if want_hdr:
+                    writer.write_frame(sbs_np)
+                else:
+                    writer.append_frame(sbs_np)
 
-            del g_world, g_ndc, sbs_img, img_resized, frame
-            # No per-frame empty_cache(): constant shapes mean the caching
-            # allocator reuses blocks; empty_cache only adds sync + churn.
+                if progress_callback:
+                    progress_callback(i, n_frames, 1.0 / dt)
+                i += 1
+
+                del g_world, g_ndc, sbs_img, img_resized, prepared
+                # No per-frame empty_cache(): constant shapes mean the caching
+                # allocator reuses blocks; empty_cache only adds sync + churn.
+
+                if nxt_prepared is None:
+                    break
+                prepared, upload_done = nxt_prepared
 
         while True:
             try:
