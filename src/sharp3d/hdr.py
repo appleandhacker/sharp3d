@@ -91,7 +91,10 @@ def probe_video(path: str | Path) -> dict:
         FFPROBE, "-v", "quiet", "-print_format", "json",
         "-show_streams", "-show_format", str(path),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    # ffprobe emits UTF-8 (the JSON embeds the filename); text=True alone
+    # would decode as GBK on Chinese Windows and crash on CJK filenames.
+    result = subprocess.run(cmd, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace")
     data = json.loads(result.stdout) if result.stdout else {}
 
     vstream = None

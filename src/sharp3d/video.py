@@ -105,7 +105,10 @@ class VideoWriter:
             "-shortest",
             str(self.path),
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        # binary capture: only the return code matters; text decoding of
+        # ffmpeg's stderr (which echoes CJK filenames as UTF-8) would crash
+        # under the GBK locale.
+        result = subprocess.run(cmd, capture_output=True)
         if result.returncode == 0:
             self.tmp_path.unlink(missing_ok=True)
         else:
