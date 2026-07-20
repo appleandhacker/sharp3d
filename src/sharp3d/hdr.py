@@ -44,6 +44,41 @@ FFPROBE = _exe("ffprobe")
 HDR_TRANSFERS = {"smpte2084", "arib-std-b67"}  # PQ (HDR10) and HLG
 
 
+# --- Encoder capability probing ----------------------------------------------
+
+_ENCODERS: set[str] | None = None
+
+
+def available_encoders() -> set[str]:
+    """Video-encoder names supported by the ffmpeg in use (cached).
+
+    Queries IMAGEIO_FFMPEG_EXE when set (imageio writers honor it), else the
+    FFMPEG binary resolved above — in practice both are the same executable.
+    """
+    global _ENCODERS
+    if _ENCODERS is None:
+        import os
+
+        exe = os.environ.get("IMAGEIO_FFMPEG_EXE") or FFMPEG
+        names: set[str] = set()
+        try:
+            out = subprocess.run(
+                [exe, "-hide_banner", "-encoders"], capture_output=True
+            ).stdout.decode("utf-8", "replace")
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0].startswith("V"):
+                    names.add(parts[1])
+        except Exception:
+            pass
+        _ENCODERS = names
+    return _ENCODERS
+
+
+def encoder_available(name: str) -> bool:
+    return name in available_encoders()
+
+
 # --- Filter chains ----------------------------------------------------------
 
 def hdr_to_sdr_filter(peak: float = 1000.0) -> str:
@@ -231,11 +266,17 @@ class Hdr10Writer:
         # write to a temp file, mux audio later
         self.tmp_path = self.path.with_suffix(".tmp.mp4")
 
-        if codec == "av1":
+        if codec == "av1" and encoder_available("libsvtav1"):
+            # SVT-AV1 can carry the HDR10 static metadata itself.
             v_codec = "libsvtav1"
-            enc_params = ["-svtav1-params", f"crf={crf}"]
+            enc_params = ["-svtav1-params",
+                          f"crf={crf}:master-display={MASTER_DISPLAY}:"
+                          f"max-cll={MAX_CLL}"]
             color_opts = []
-        else:  # h265 (default for HDR10; h264 doesn't do HDR10 well)
+        else:
+            # No SVT-AV1 (e.g. a stripped ffmpeg build): other AV1 encoders
+            # can't inject the HDR10 metadata reliably, so fall back to the
+            # proven libx265 HDR10 path. (h264 can't do HDR10 at all.)
             v_codec = "libx265"
             xparams = (
                 f"crf={crf}:hdr10=1:repeat-headers=1:"

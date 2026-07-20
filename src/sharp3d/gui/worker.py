@@ -307,12 +307,25 @@ class _PipelineWorker:
 
     def export_anim(self, opts):
         try:
+            from sharp3d import video  # noqa: F401  (pins IMAGEIO_FFMPEG_EXE)
             import imageio
             path = opts["path"]
             codec = opts["codec"]
-            output_params = ["-crf", "18", "-preset", "medium"]
-            if codec == "libx265":
-                output_params += ["-tag:v", "hvc1"]
+            if codec == "libsvtav1":
+                # The GUI requests SVT-AV1; fall back to whatever AV1
+                # encoder this ffmpeg actually has.
+                codec = video.resolve_av1()
+                if codec is None:
+                    raise RuntimeError(
+                        "当前 ffmpeg 不支持任何 AV1 编码器"
+                        "（需要 libsvtav1 / av1_nvenc / libaom-av1 之一）"
+                    )
+            if codec in ("libsvtav1", "av1_nvenc", "libaom-av1"):
+                output_params = video.av1_output_params(codec, 18)
+            else:
+                output_params = ["-crf", "18", "-preset", "medium"]
+                if codec == "libx265":
+                    output_params += ["-tag:v", "hvc1"]
             writer = imageio.get_writer(path, fps=opts["fps"], codec=codec,
                                        quality=8, pixelformat="yuv420p",
                                        output_params=output_params)
