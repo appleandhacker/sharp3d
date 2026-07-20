@@ -192,7 +192,7 @@ class AnimTab(QWidget):
         codec_row = QHBoxLayout()
         codec_row.addWidget(QLabel("编码器"))
         self._codec = QComboBox()
-        self._codec.addItems(["H.264", "H.265", "AV1"])
+        self._codec.addItems(["AV1", "H.264", "H.265"])
         codec_row.addWidget(self._codec, 1)
         export_card.add_layout(codec_row)
         self._btn_export = QPushButton("导出视频…")
@@ -335,7 +335,7 @@ class AnimTab(QWidget):
         )
         if not path:
             return
-        codec_map = {"H.264": "libx264", "H.265": "libx265", "AV1": "libsvtav1"}
+        codec_map = {"H.264": "libx264", "H.265": "libx265", "AV1": "av1"}
         codec = codec_map[self._codec.currentText()]
         fps = int(self._fps.currentText())
         self.status_message.emit(f"正在导出 {path} …")

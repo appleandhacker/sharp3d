@@ -229,11 +229,36 @@ class _PipelineWorker:
                                  crf=opts.get("crf", 18))
 
         frame_times = []
-        for i, frame in enumerate(reader.stream_frames()):
-            if self._cancel_event.is_set():
+
+        # Prefetch: a background thread decodes frames from the ffmpeg pipe
+        # while the GPU renders, so decode time overlaps rendering instead of
+        # serializing with it. (Plain threads are safe here — this runs in
+        # the Qt-free child process.)
+        import queue as _queue
+        import threading
+
+        frame_q: _queue.Queue = _queue.Queue(maxsize=3)
+
+        def _decode():
+            try:
+                for frm in reader.stream_frames():
+                    if self._cancel_event.is_set():
+                        break
+                    frame_q.put(frm)
+            finally:
+                frame_q.put(None)
+
+        decoder = threading.Thread(target=_decode, daemon=True)
+        decoder.start()
+
+        i = 0
+        while True:
+            frame = frame_q.get()
+            if frame is None or self._cancel_event.is_set():
                 break
             img_r, df, ir, (w, h) = prepare_input(frame, f_px, self._device)
-            torch.cuda.synchronize()
+            # No sync before predict: CUDA stream ordering already guarantees
+            # prepare's upload finished before the kernels consume it.
             t0 = time.time()
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
                 g_ndc = self._compiled(img_r, df)
@@ -249,8 +274,21 @@ class _PipelineWorker:
             else:
                 writer.append_frame(sbs_np)
             self._respond("convert_progress", (i + 1, n, 1.0 / dt))
+            i += 1
             del g, g_ndc, sbs, img_r, frame
-            torch.cuda.empty_cache()
+            # Deliberately NO per-frame torch.cuda.empty_cache(): it forces a
+            # device sync plus allocator churn on every frame. Shapes are
+            # constant frame-to-frame, so the caching allocator reuses its
+            # blocks and VRAM stays flat.
+
+        # Unblock the producer if it is parked on a full queue, then join.
+        while True:
+            try:
+                frame_q.get_nowait()
+            except _queue.Empty:
+                break
+        decoder.join(timeout=5)
+        torch.cuda.empty_cache()
 
         keep_audio = opts.get("audio", True) and reader.has_audio
         source = path if keep_audio else None
@@ -311,9 +349,9 @@ class _PipelineWorker:
             import imageio
             path = opts["path"]
             codec = opts["codec"]
-            if codec == "libsvtav1":
-                # The GUI requests SVT-AV1; fall back to whatever AV1
-                # encoder this ffmpeg actually has.
+            if codec in ("av1", "libsvtav1"):
+                # Resolve to the best AV1 encoder this machine has (NVENC
+                # first, software fallback).
                 codec = video.resolve_av1()
                 if codec is None:
                     raise RuntimeError(

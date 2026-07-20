@@ -194,14 +194,34 @@ class Sharp3DPipeline:
         frame_times = []
         total_start = time.time()
 
-        for i, frame in enumerate(reader.stream_frames()):
+        # Prefetch: decode frames in a background thread so the ffmpeg pipe
+        # read overlaps GPU rendering instead of serializing with it.
+        import queue as _queue
+        import threading
+
+        frame_q: _queue.Queue = _queue.Queue(maxsize=3)
+
+        def _decode():
+            try:
+                for frm in reader.stream_frames():
+                    frame_q.put(frm)
+            finally:
+                frame_q.put(None)
+
+        decoder = threading.Thread(target=_decode, daemon=True)
+        decoder.start()
+
+        i = 0
+        while True:
+            frame = frame_q.get()
+            if frame is None:
+                break
             img_resized, df, intrinsics_resized, (orig_w, orig_h) = prepare_input(
                 frame, f_px, self.device
             )
 
             self._ensure_warmup(img_resized, df)
 
-            torch.cuda.synchronize()
             t0 = time.time()
 
             g_ndc = self.predictor.predict(img_resized, df)
@@ -228,9 +248,19 @@ class Sharp3DPipeline:
 
             if progress_callback:
                 progress_callback(i, n_frames, 1.0 / dt)
+            i += 1
 
             del g_world, g_ndc, sbs_img, img_resized, frame
-            torch.cuda.empty_cache()
+            # No per-frame empty_cache(): constant shapes mean the caching
+            # allocator reuses blocks; empty_cache only adds sync + churn.
+
+        while True:
+            try:
+                frame_q.get_nowait()
+            except _queue.Empty:
+                break
+        decoder.join(timeout=5)
+        torch.cuda.empty_cache()
 
         # Close and mux audio
         source = input_path if reader.has_audio else None

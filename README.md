@@ -10,22 +10,25 @@
 
 - **SBS 立体转换**：双固定视角渲染，瞳距 IPD / 收敛深度 / 立体强度可调
 - **2.5D 视差动画**：横扫 / 摇晃 / 环绕 / 前推四种轨迹，可循环播放与导出
-- **视频处理**：逐帧处理，H.264 / H.265 / AV1 编码，自动保留原始音轨
+- **视频处理**：逐帧处理，H.264 / H.265 / AV1 编码（AV1 默认 GPU 硬件编码，不可用自动回退 CPU），自动保留原始音轨
 - **可选导出**：深度图可视化、PLY 高斯文件
 - **PySide6 图形界面**：红青立体主题，色调跟随系统亮 / 暗模式，GPU 实时监控
 - **响应式调参**：拖动滑块时从缓存高斯快速重渲染预览（预测与渲染分离）
 - **HDR 支持**：自动检测 HDR 输入并色调映射后处理，可输出 HDR10（10-bit PQ BT.2020）
 
-## 性能（RTX 5070 Ti 12GB，4K 输入）
+## 性能（RTX 5070 Ti 12GB，4K 输入 → 7680×2160 SBS）
 
 | 指标 | 数值 |
 |------|------|
-| 单帧耗时 | 0.93s（1.07 fps） |
-| 300 帧 4K 视频 | 约 4.7 分钟 |
+| 端到端单帧耗时 | 约 1.0s（1.00 fps，含解码与编码） |
+| 300 帧 4K 视频 | 约 5 分钟 |
+| GPU 计算利用率 | 约 83% |
 | VRAM 占用 | 约 4.3GB |
 
 关键优化：`torch.compile` + FP16 推理、GPU 四元数（Shepperd 法，替代 scipy）、
-解析法 3×3 对称特征分解（替代 GPU SVD，省 0.4s/帧）、gsplat 批量双眼渲染。
+解析法 3×3 对称特征分解（替代 GPU SVD，省 0.4s/帧）、gsplat 批量双眼渲染、
+解码预取线程（与 GPU 渲染重叠）、AV1 默认走 NVENC 硬件编码（独立编码引擎，
+不占 CUDA 核心，CPU 编码器自动回退）。
 
 ## 依赖
 
@@ -35,7 +38,7 @@
 - [ml-sharp](https://github.com/apple/ml-sharp)（SHARP 模型，editable 安装）
 - `triton-windows<3.4`（Windows 下启用 torch.compile）
 - PySide6、pynvml、imageio、Pillow、numpy、plyfile
-- ffmpeg（视频编码与音频混流，需在 PATH）
+- ffmpeg（视频编码与音频混流；不在 PATH 时自动尝试 `C:\Program Files\ffmpeg\bin`）
 - Visual Studio 2022（torch.compile 需要 cl.exe）
 
 ## 安装

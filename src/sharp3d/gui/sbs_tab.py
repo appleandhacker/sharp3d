@@ -124,7 +124,8 @@ class SbsTab(QWidget):
         codec_row = QHBoxLayout()
         codec_row.addWidget(QLabel("编码器"))
         self._codec = QComboBox()
-        self._codec.addItems(["H.264", "H.265", "AV1"])
+        self._codec.addItems(["AV1", "H.264", "H.265"])
+        self._codec.setToolTip("AV1 默认走 GPU 硬件编码 (NVENC)，不可用时自动回退 CPU")
         codec_row.addWidget(self._codec, 1)
         enc_card.add_layout(codec_row)
 
