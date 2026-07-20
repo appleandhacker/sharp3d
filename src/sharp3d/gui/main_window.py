@@ -18,7 +18,7 @@ from .anim_tab import AnimTab
 from .sbs_tab import SbsTab
 from .theme import DISPLAY_FONT, ThemeManager, build_palette, build_qss
 from .widgets import GpuMeter
-from .worker import EngineThread
+from .worker import EngineProcess
 
 
 class MainWindow(QMainWindow):
@@ -28,8 +28,7 @@ class MainWindow(QMainWindow):
         self.resize(1180, 800)
 
         self._theme = ThemeManager()
-        self._engine_thread = EngineThread()
-        self._engine = self._engine_thread.engine
+        self._engine = EngineProcess()
 
         # central
         central = QWidget()
@@ -112,5 +111,5 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def closeEvent(self, event) -> None:
-        self._engine_thread.stop()
+        self._engine.stop()
         super().closeEvent(event)

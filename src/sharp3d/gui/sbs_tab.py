@@ -30,7 +30,7 @@ from .widgets import (
     SectionCard,
     StereoSlider,
 )
-from .worker import Engine
+from .worker import EngineProcess
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
 IMG_FILTER = "图片 (*.png *.jpg *.jpeg *.bmp *.webp);;所有文件 (*)"
@@ -43,11 +43,19 @@ class SbsTab(QWidget):
 
     status_message = Signal(str)
 
-    def __init__(self, theme: ThemeManager, engine: Engine, parent=None) -> None:
+    # Request signals: emitted on the GUI thread. The engine's request
+    # methods are non-blocking (they enqueue to the child pipeline process),
+    # but going through signals keeps the call path uniform and safe.
+    request_prepare = Signal(str, int)
+    request_render_preview = Signal(float, float, float, int)
+    request_convert = Signal(dict)
+
+    def __init__(self, theme: ThemeManager, engine: EngineProcess, parent=None) -> None:
         super().__init__(parent)
         self._theme = theme
         self._engine = engine
         self._prepared = False
+        self._awaiting_prepare = False
         self._is_video = False
         self._n_frames = 1
         self._converting = False
@@ -186,9 +194,22 @@ class SbsTab(QWidget):
         for s in (self._s_ipd, self._s_conv, self._s_strength):
             s.value_changed.connect(lambda _v: self._schedule_preview())
 
+        # Debounce frame-slider prepare: dragging fires many valueChanged
+        # events; each prepare costs ~1s, so only run the last one.
+        self._frame_prepare_timer = QTimer(self)
+        self._frame_prepare_timer.setSingleShot(True)
+        self._frame_prepare_timer.setInterval(250)
+        self._frame_prepare_timer.timeout.connect(self._do_prepare)
+
         self._frame_slider.valueChanged.connect(self._on_frame_slider)
 
         # ---- engine wiring ------------------------------------------------
+        # Request signals -> engine request methods (non-blocking; the heavy
+        # work runs in the child pipeline process so the GUI stays responsive).
+        self.request_prepare.connect(engine.prepare)
+        self.request_render_preview.connect(engine.render_preview)
+        self.request_convert.connect(engine.convert)
+
         engine.preview_ready.connect(self._on_preview_ready)
         engine.prepared.connect(self._on_prepared)
         engine.convert_progress.connect(self._on_convert_progress)
@@ -201,7 +222,7 @@ class SbsTab(QWidget):
             self._preview_timer.start()
 
     def _render_preview_now(self) -> None:
-        self._engine.render_preview(
+        self.request_render_preview.emit(
             self._s_ipd.value(), self._s_conv.value(),
             self._s_strength.value(), PREVIEW_WIDTH,
         )
@@ -248,7 +269,7 @@ class SbsTab(QWidget):
         self._frame_label.setText(f"帧 {idx}/{max(0, self._n_frames - 1)}")
         if self._is_video and not self._converting:
             self._prepared = False
-            self._do_prepare()
+            self._frame_prepare_timer.start()  # debounced prepare
 
     def _do_prepare(self) -> None:
         path = self._input.path()
@@ -256,9 +277,14 @@ class SbsTab(QWidget):
             return
         idx = self._frame_slider.value() if self._is_video else 0
         self._preview.set_message("正在重建 3D 场景…")
-        self._engine.prepare(path, idx)
+        self._awaiting_prepare = True
+        self.request_prepare.emit(path, idx)
 
     def _on_prepared(self, info: dict) -> None:
+        # Both tabs hear engine.prepared; only react to our own request.
+        if not self._awaiting_prepare:
+            return
+        self._awaiting_prepare = False
         self._prepared = True
         self.status_message.emit(
             f"场景重建完成 · {info['n_gaussians']:,} 高斯"
@@ -296,9 +322,12 @@ class SbsTab(QWidget):
             "ply": self._chk_ply.isChecked(),
             "hdr_output": self._chk_hdr.isChecked(),
         }
-        self._engine.convert(opts)
+        self.request_convert.emit(opts)
 
     def _on_cancel(self) -> None:
+        # Direct call is intentional: cancel() only sets a flag that the running
+        # conversion loop polls. A queued signal would sit behind the busy
+        # worker and never arrive in time.
         self._engine.cancel()
         self.status_message.emit("正在取消…")
 
@@ -328,6 +357,7 @@ class SbsTab(QWidget):
 
     def _on_error(self, msg: str) -> None:
         self._converting = False
+        self._awaiting_prepare = False
         self._btn_start.setEnabled(True)
         self._btn_cancel.setEnabled(False)
         self._progress.set_busy(False)

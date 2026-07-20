@@ -90,7 +90,7 @@ class VideoWriter:
         if source_video is not None:
             self._mux_audio(Path(source_video))
         else:
-            self.tmp_path.rename(self.path)
+            self.tmp_path.replace(self.path)
 
     def _mux_audio(self, source: Path):
         """Mux audio from source video into output."""
@@ -110,4 +110,4 @@ class VideoWriter:
             self.tmp_path.unlink(missing_ok=True)
         else:
             # Fallback: keep video without audio
-            self.tmp_path.rename(self.path)
+            self.tmp_path.replace(self.path)

@@ -1,60 +1,58 @@
-"""GPU worker engine for the sharp3d GUI.
+"""GPU pipeline worker for the sharp3d GUI — multiprocess architecture.
 
-A persistent QObject living on a dedicated QThread. The heavy torch/SHARP
-stack is imported lazily on first use (inside the worker thread) so the GUI
-starts instantly. Requests are queued via signals and executed sequentially,
-which keeps GPU operations serialized and thread-safe.
+Why a separate process instead of a QThread:
+  Running the torch.compile + triton + gsplat CUDA stack inside a QThread on
+  Windows corrupts the heap (0xC0000374) and crashes the whole app. The exact
+  same pipeline runs stably in a plain process (proven by the CLI/scripts).
+  So the heavy work lives in a Qt-free child process; the GUI talks to it via
+  multiprocessing queues. This keeps the GUI responsive AND crash-isolated.
 
-Design for responsive stereo tuning:
-  - prepare(): expensive predict + unproject → caches world-space gaussians
-  - render_preview(): cheap re-render from the cache with new IPD/convergence
+Layout:
+  - _PipelineWorker : the real pipeline (model, predict, render, encode).
+                      Runs in the child process. No Qt. Emits results by
+                      calling a respond callback that feeds the response queue.
+  - _child_main     : child-process entry loop (dispatch requests).
+  - EngineProcess   : a QObject living on the GUI thread. Sends requests to
+                      the child and polls the response queue, re-emitting
+                      results as Qt signals. Exposes the same signal/method
+                      surface the tabs already use.
 """
 
 from __future__ import annotations
 
 import gc
+import multiprocessing as mp
 import time
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QObject, QTimer, Signal
 
 
-class Engine(QObject):
-    """Persistent GPU pipeline worker."""
+# ===========================================================================
+# Child-process side (no Qt)
+# ===========================================================================
+class _PipelineWorker:
+    """The heavy pipeline. Lives in the child process."""
 
-    # --- signals back to the GUI ---
-    model_loading = Signal()
-    model_ready = Signal()
-    prepared = Signal(dict)            # {width, height, n_gaussians}
-    preview_ready = Signal(object)     # (H, W, 3) uint8 numpy SBS
-    convert_progress = Signal(int, int, float)  # frame, total, fps
-    convert_done = Signal(dict)
-    anim_frame = Signal(object)        # (H, W, 3) uint8 numpy frame
-    anim_progress = Signal(int, int)
-    anim_done = Signal(dict)
-    error = Signal(str)
-    status = Signal(str)
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._pipeline = None       # lazy-loaded
+    def __init__(self, respond, cancel_event):
+        self._respond = respond          # callable(name, args_tuple)
+        self._cancel_event = cancel_event
+        self._pipeline = None
         self._compiled = None
         self._device = None
-        self._gaussians = None      # cached world-space gaussians
+        self._torch = None
+        self._gaussians = None
         self._f_px = 1.0
         self._orig_w = 0
         self._orig_h = 0
-        self._cancel = False
 
-    # ------------------------------------------------------------------
-    # Lazy pipeline loading (runs inside worker thread)
-    # ------------------------------------------------------------------
-    def _ensure_pipeline(self) -> None:
+    # ---- lazy model loading --------------------------------------------
+    def _ensure_pipeline(self):
         if self._pipeline is not None:
             return
-        self.model_loading.emit()
-        self.status.emit("正在加载 SHARP 模型并编译…")
+        self._respond("model_loading", ())
+        self._respond("status", ("正在加载 SHARP 模型并编译…",))
 
         import torch
         from sharp.models import PredictorParams, create_predictor
@@ -68,11 +66,9 @@ class Engine(QObject):
         predictor.load_state_dict(state_dict)
         predictor.eval().to(self._device)
         self._compiled = torch.compile(predictor, mode="default")
-        self._predictor_params = PredictorParams()
         self._torch = torch
         self._pipeline = predictor
 
-        # warmup to trigger compilation
         from sharp3d.unproject import INTERNAL_SHAPE
         dummy_img = torch.zeros(1, 3, *INTERNAL_SHAPE, device=self._device)
         dummy_df = torch.tensor([1.0], device=self._device, dtype=torch.float32)
@@ -81,14 +77,11 @@ class Engine(QObject):
         torch.cuda.synchronize()
         del dummy_img, dummy_df
 
-        self.model_ready.emit()
-        self.status.emit("模型就绪")
+        self._respond("model_ready", ())
+        self._respond("status", ("模型就绪",))
 
-    # ------------------------------------------------------------------
-    # Prepare: predict + unproject a frame → cache gaussians
-    # ------------------------------------------------------------------
-    @Slot(str, int)
-    def prepare(self, path: str, frame_idx: int) -> None:
+    # ---- prepare: predict + unproject -> cache gaussians ----------------
+    def prepare(self, path, frame_idx):
         try:
             self._ensure_pipeline()
             torch = self._torch
@@ -97,13 +90,11 @@ class Engine(QObject):
 
             video_exts = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
             p = Path(path)
-
             if p.suffix.lower() in video_exts:
-                # FrameReader tone-maps HDR sources to SDR for the model
                 from sharp3d.hdr import FrameReader
                 reader = FrameReader(p)
                 frame = reader.read_frame(frame_idx)
-                f_px = frame.shape[1] * 1.2  # estimate (~60 deg FOV)
+                f_px = frame.shape[1] * 1.2
                 image_np = frame
             else:
                 image_np, _, f_px = sharp_io.load_rgb(p)
@@ -122,43 +113,35 @@ class Engine(QObject):
             torch.cuda.synchronize()
 
             n_g = self._gaussians.mean_vectors.numel() // 3
-            self.prepared.emit({"width": w, "height": h, "n_gaussians": n_g, "f_px": f_px})
-            self.status.emit(f"已重建 3D 场景 · {w}×{h}")
+            self._respond("prepared", ({"width": w, "height": h,
+                                        "n_gaussians": n_g, "f_px": f_px},))
+            self._respond("status", (f"已重建 3D 场景 · {w}×{h}",))
             del g_ndc, img_r
             torch.cuda.empty_cache()
         except Exception as exc:  # noqa: BLE001
-            self.error.emit(f"准备失败: {exc}")
+            self._respond("error", (f"准备失败: {exc}",))
 
-    # ------------------------------------------------------------------
-    # Render preview from cached gaussians (fast, slider-responsive)
-    # ------------------------------------------------------------------
-    @Slot(float, float, float, int)
-    def render_preview(self, ipd_mm: float, convergence: float, strength: float,
-                       preview_width: int) -> None:
+    # ---- preview render from cached gaussians ---------------------------
+    def render_preview(self, ipd_mm, convergence, strength, preview_width):
         if self._gaussians is None:
             return
         try:
             torch = self._torch
             from sharp3d.render import render_sbs
-
             ipd_scene = (ipd_mm / 1000.0) * strength
             conv = None if convergence <= 0 else convergence
-
             with torch.no_grad():
                 sbs, _ = render_sbs(
                     self._gaussians, self._f_px, self._orig_w, self._orig_h,
                     ipd=ipd_scene, convergence=conv, render_width=preview_width,
                 )
             torch.cuda.synchronize()
-            self.preview_ready.emit(sbs.cpu().numpy())
+            self._respond("preview_ready", (sbs.cpu().numpy(),))
         except Exception as exc:  # noqa: BLE001
-            self.error.emit(f"预览渲染失败: {exc}")
+            self._respond("error", (f"预览渲染失败: {exc}",))
 
-    # ------------------------------------------------------------------
-    # Full video / image conversion
-    # ------------------------------------------------------------------
-    @Slot(dict)
-    def convert(self, opts: dict) -> None:
+    # ---- full conversion ------------------------------------------------
+    def convert(self, opts):
         try:
             self._ensure_pipeline()
             torch = self._torch
@@ -166,7 +149,7 @@ class Engine(QObject):
             from sharp3d.unproject import prepare_input, fast_unproject, INTERNAL_SHAPE
             from sharp3d.render import render_sbs
 
-            self._cancel = False
+            self._cancel_event.clear()
             path = Path(opts["input"])
             out = Path(opts["output"])
             ipd_scene = (opts["ipd_mm"] / 1000.0) * opts["strength"]
@@ -175,7 +158,6 @@ class Engine(QObject):
 
             video_exts = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
             is_video = path.suffix.lower() in video_exts
-
             if is_video:
                 self._convert_video(path, out, opts, ipd_scene, conv, method,
                                     prepare_input, fast_unproject, render_sbs,
@@ -185,13 +167,12 @@ class Engine(QObject):
                                     prepare_input, fast_unproject, render_sbs,
                                     INTERNAL_SHAPE, torch, sharp_io)
         except Exception as exc:  # noqa: BLE001
-            self.error.emit(f"转换失败: {exc}")
+            self._respond("error", (f"转换失败: {exc}",))
 
     def _convert_image(self, path, out, opts, ipd_scene, conv, method,
                        prepare_input, fast_unproject, render_sbs,
-                       INTERNAL_SHAPE, torch, sharp_io) -> None:
+                       INTERNAL_SHAPE, torch, sharp_io):
         from PIL import Image
-
         image_np, _, f_px = sharp_io.load_rgb(path)
         h, w = image_np.shape[:2]
         img_r, df, ir, _ = prepare_input(image_np, f_px, self._device)
@@ -207,55 +188,49 @@ class Engine(QObject):
 
         Image.fromarray(sbs.cpu().numpy()).save(out)
 
-        # optional depth map
         if opts.get("depth"):
             from sharp3d.render import render_depth_map
             depth = render_depth_map(g, f_px, w, h)
-            depth_path = out.with_stem(out.stem + "_depth")
-            Image.fromarray(depth.cpu().numpy()).save(depth_path)
-
-        # optional PLY export (world-space gaussians)
+            Image.fromarray(depth.cpu().numpy()).save(
+                out.with_stem(out.stem + "_depth"))
         if opts.get("ply"):
             from sharp.utils.gaussians import save_ply
-            ply_path = out.with_suffix(".ply")
-            save_ply(g, f_px, (h, w), ply_path)
+            save_ply(g, f_px, (h, w), out.with_suffix(".ply"))
 
         del g, g_ndc, sbs
         torch.cuda.empty_cache()
         gc.collect()
 
-        self.convert_progress.emit(1, 1, 1.0 / elapsed)
-        self.convert_done.emit({
+        self._respond("convert_progress", (1, 1, 1.0 / elapsed))
+        self._respond("convert_done", ({
             "output": str(out), "elapsed": elapsed, "fps": 1.0 / elapsed,
             "n_frames": 1, "size": (sw * 2, sh),
-        })
+        },))
 
     def _convert_video(self, path, out, opts, ipd_scene, conv, method,
                        prepare_input, fast_unproject, render_sbs,
-                       INTERNAL_SHAPE, torch) -> None:
+                       INTERNAL_SHAPE, torch):
         from sharp3d.hdr import FrameReader, Hdr10Writer
         from sharp3d.video import VideoWriter
 
-        reader = FrameReader(path)  # tone-maps HDR input to SDR for the model
+        reader = FrameReader(path)
         n = reader.n_frames
-        f_px = reader.width * 1.2  # estimate (~60 deg FOV)
+        f_px = reader.width * 1.2
 
         hdr_out = opts.get("hdr_output", False)
         if hdr_out:
-            writer = Hdr10Writer(
-                out, width=reader.width * 2, height=reader.height,
-                fps=reader.fps, codec=opts.get("codec", "h265"),
-                crf=opts.get("crf", 18),
-            )
+            writer = Hdr10Writer(out, width=reader.width * 2, height=reader.height,
+                                 fps=reader.fps, codec=opts.get("codec", "h265"),
+                                 crf=opts.get("crf", 18))
         else:
-            writer = VideoWriter(
-                out, fps=reader.fps, width=reader.width * 2, height=reader.height,
-                codec=opts.get("codec", "h264"), crf=opts.get("crf", 18),
-            )
+            writer = VideoWriter(out, fps=reader.fps, width=reader.width * 2,
+                                 height=reader.height,
+                                 codec=opts.get("codec", "h264"),
+                                 crf=opts.get("crf", 18))
 
         frame_times = []
         for i, frame in enumerate(reader.stream_frames()):
-            if self._cancel:
+            if self._cancel_event.is_set():
                 break
             img_r, df, ir, (w, h) = prepare_input(frame, f_px, self._device)
             torch.cuda.synchronize()
@@ -273,83 +248,191 @@ class Engine(QObject):
                 writer.write_frame(sbs_np)
             else:
                 writer.append_frame(sbs_np)
-            self.convert_progress.emit(i + 1, n, 1.0 / dt)
+            self._respond("convert_progress", (i + 1, n, 1.0 / dt))
             del g, g_ndc, sbs, img_r, frame
             torch.cuda.empty_cache()
 
-        source = path if reader.has_audio else None
+        keep_audio = opts.get("audio", True) and reader.has_audio
+        source = path if keep_audio else None
         if hdr_out:
             writer.close(audio_source=source)
         else:
             writer.close(source_video=source)
 
         avg = float(np.mean(frame_times)) if frame_times else 0.0
-        self.convert_done.emit({
-            "output": str(out), "elapsed": sum(frame_times), "fps": 1.0 / avg if avg else 0.0,
+        self._respond("convert_done", ({
+            "output": str(out), "elapsed": sum(frame_times),
+            "fps": 1.0 / avg if avg else 0.0,
             "n_frames": len(frame_times), "size": (reader.width * 2, reader.height),
-            "cancelled": self._cancel, "hdr": hdr_out,
-        })
+            "cancelled": self._cancel_event.is_set(), "hdr": hdr_out,
+        },))
 
-    @Slot()
-    def cancel(self) -> None:
-        self._cancel = True
-
-    # ------------------------------------------------------------------
-    # 2.5D parallax animation
-    # ------------------------------------------------------------------
-    @Slot(dict)
-    def render_anim(self, opts: dict) -> None:
+    # ---- 2.5D parallax animation ----------------------------------------
+    def render_anim(self, opts):
         if self._gaussians is None:
-            self.error.emit("请先加载一张图片")
+            self._respond("error", ("请先加载一张图片",))
             return
         try:
             torch = self._torch
             from sharp.utils import camera as sharp_camera
             from sharp3d.render import render_single
 
-            self._cancel = False
+            self._cancel_event.clear()
             params = sharp_camera.TrajectoryParams(
-                type=opts["type"],
-                max_disparity=opts["max_disparity"],
-                max_zoom=opts["max_zoom"],
-                num_steps=opts["num_steps"],
+                type=opts["type"], max_disparity=opts["max_disparity"],
+                max_zoom=opts["max_zoom"], num_steps=opts["num_steps"],
                 num_repeats=opts["num_repeats"],
             )
             trajectory = sharp_camera.create_eye_trajectory(
                 self._gaussians, params,
                 resolution_px=(self._orig_w, self._orig_h), f_px=self._f_px,
             )
-
             preview_w = opts.get("preview_width", 960)
             frames = []
             total = len(trajectory)
             for i, eye_pos in enumerate(trajectory):
-                if self._cancel:
+                if self._cancel_event.is_set():
                     break
-                img = render_single(
-                    self._gaussians, self._f_px, self._orig_w, self._orig_h,
-                    eye_pos, render_width=preview_w,
-                )
+                img = render_single(self._gaussians, self._f_px,
+                                    self._orig_w, self._orig_h,
+                                    eye_pos, render_width=preview_w)
                 torch.cuda.synchronize()
                 arr = img.cpu().numpy()
                 frames.append(arr)
-                self.anim_frame.emit(arr)
-                self.anim_progress.emit(i + 1, total)
-
-            self.anim_done.emit({"n_frames": len(frames), "frames": frames})
+                self._respond("anim_frame", (arr,))
+                self._respond("anim_progress", (i + 1, total))
+            self._respond("anim_done", ({"n_frames": len(frames)},))
         except Exception as exc:  # noqa: BLE001
-            self.error.emit(f"动画渲染失败: {exc}")
+            self._respond("error", (f"动画渲染失败: {exc}",))
+
+    def export_anim(self, opts):
+        try:
+            import imageio
+            path = opts["path"]
+            codec = opts["codec"]
+            output_params = ["-crf", "18", "-preset", "medium"]
+            if codec == "libx265":
+                output_params += ["-tag:v", "hvc1"]
+            writer = imageio.get_writer(path, fps=opts["fps"], codec=codec,
+                                       quality=8, pixelformat="yuv420p",
+                                       output_params=output_params)
+            for f in opts["frames"]:
+                writer.append_data(f)
+            writer.close()
+            self._respond("anim_exported", (path,))
+        except Exception as exc:  # noqa: BLE001
+            self._respond("error", (f"动画导出失败: {exc}",))
 
 
-class EngineThread:
-    """Owns the worker QThread and exposes the engine + its signals."""
+def _child_main(req_q, resp_q, cancel_event):
+    """Child-process entry point. Dispatches requests to the pipeline worker."""
+    worker = _PipelineWorker(
+        respond=lambda name, args: resp_q.put((name, args)),
+        cancel_event=cancel_event,
+    )
+    while True:
+        try:
+            msg = req_q.get()
+        except (EOFError, OSError):
+            break
+        if msg is None:
+            break
+        method, kwargs = msg
+        if method == "quit":
+            break
+        handler = getattr(worker, method, None)
+        if handler is not None:
+            try:
+                handler(**kwargs)
+            except Exception as exc:  # noqa: BLE001
+                resp_q.put(("error", (f"{method} 失败: {exc}",)))
+    resp_q.close()
 
-    def __init__(self) -> None:
-        self.thread = QThread()
-        self.engine = Engine()
-        self.engine.moveToThread(self.thread)
-        self.thread.start()
 
-    def stop(self) -> None:
-        self.thread.quit()
-        self.thread.wait(3000)
+# ===========================================================================
+# GUI-process side
+# ===========================================================================
+class EngineProcess(QObject):
+    """Bridge to the child pipeline process.
+
+    Exposes the same signals and request methods the tabs use. Request methods
+    just enqueue to the child (non-blocking); results come back via the
+    response queue and are re-emitted as Qt signals on the GUI thread.
+    """
+
+    model_loading = Signal()
+    model_ready = Signal()
+    prepared = Signal(dict)
+    preview_ready = Signal(object)
+    convert_progress = Signal(int, int, float)
+    convert_done = Signal(dict)
+    anim_frame = Signal(object)
+    anim_progress = Signal(int, int)
+    anim_done = Signal(dict)
+    anim_exported = Signal(str)
+    error = Signal(str)
+    status = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        ctx = mp.get_context("spawn")
+        self._req_q = ctx.Queue()
+        self._resp_q = ctx.Queue()
+        self._cancel_event = ctx.Event()
+        self._proc = ctx.Process(
+            target=_child_main,
+            args=(self._req_q, self._resp_q, self._cancel_event),
+            daemon=True,
+        )
+        self._proc.start()
+
+        # Poll the response queue and re-emit as Qt signals.
+        self._poll_timer = QTimer(self)
+        self._poll_timer.timeout.connect(self._poll)
+        self._poll_timer.start(20)
+
+    # ---- response polling ----------------------------------------------
+    def _poll(self):
+        try:
+            while True:
+                name, args = self._resp_q.get_nowait()
+                sig = getattr(self, name, None)
+                if sig is not None:
+                    sig.emit(*args)
+        except Exception:  # queue.Empty or shutdown
+            pass
+
+    # ---- request methods (non-blocking; enqueue to child) ---------------
+    def prepare(self, path, frame_idx):
+        self._req_q.put(("prepare", {"path": path, "frame_idx": frame_idx}))
+
+    def render_preview(self, ipd_mm, convergence, strength, preview_width):
+        self._req_q.put(("render_preview", {
+            "ipd_mm": ipd_mm, "convergence": convergence,
+            "strength": strength, "preview_width": preview_width,
+        }))
+
+    def convert(self, opts):
+        self._req_q.put(("convert", {"opts": opts}))
+
+    def render_anim(self, opts):
+        self._req_q.put(("render_anim", {"opts": opts}))
+
+    def export_anim(self, opts):
+        self._req_q.put(("export_anim", {"opts": opts}))
+
+    def cancel(self):
+        # Cross-process cancel: set the shared event the child loop polls.
+        self._cancel_event.set()
+
+    # ---- shutdown -------------------------------------------------------
+    def stop(self):
+        try:
+            self._poll_timer.stop()
+            self._req_q.put(("quit", {}))
+        except Exception:
+            pass
+        self._proc.join(timeout=3)
+        if self._proc.is_alive():
+            self._proc.terminate()
+            self._proc.join(timeout=2)

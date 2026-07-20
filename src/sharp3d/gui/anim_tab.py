@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 
 from .theme import Colors, ThemeManager
 from .widgets import AnimatedProgressBar, FileField, PreviewPane, SectionCard, StereoSlider
-from .worker import Engine
+from .worker import EngineProcess
 
 IMG_FILTER = "图片 (*.png *.jpg *.jpeg *.bmp *.webp);;所有文件 (*)"
 ANIM_PREVIEW_WIDTH = 960
@@ -95,11 +95,19 @@ class AnimTab(QWidget):
 
     status_message = Signal(str)
 
-    def __init__(self, theme: ThemeManager, engine: Engine, parent=None) -> None:
+    # Request signals: the engine's request methods are non-blocking (they
+    # enqueue to the child pipeline process), but going through signals keeps
+    # the call path uniform and safe.
+    request_prepare = Signal(str, int)
+    request_render_anim = Signal(dict)
+    request_export_anim = Signal(dict)
+
+    def __init__(self, theme: ThemeManager, engine: EngineProcess, parent=None) -> None:
         super().__init__(parent)
         self._theme = theme
         self._engine = engine
         self._prepared = False
+        self._awaiting_prepare = False
         self._frames: list = []
         self._play_idx = 0
         self._rendering = False
@@ -210,23 +218,35 @@ class AnimTab(QWidget):
         self._play_timer.timeout.connect(self._play_step)
 
         # ---- engine wiring ------------------------------------------------
+        self.request_prepare.connect(engine.prepare)
+        self.request_render_anim.connect(engine.render_anim)
+        self.request_export_anim.connect(engine.export_anim)
+
         engine.prepared.connect(self._on_prepared)
         engine.anim_frame.connect(self._on_anim_frame)
         engine.anim_progress.connect(self._on_anim_progress)
         engine.anim_done.connect(self._on_anim_done)
+        engine.anim_exported.connect(self._on_exported)
         engine.error.connect(self._on_error)
 
     # ------------------------------------------------------------------
     def _on_input(self, path: str) -> None:
         self._prepared = False
         self._frames = []
+        self._play_timer.stop()
+        self._btn_play.setText("▶ 播放")
         self._btn_play.setEnabled(False)
         self._btn_export.setEnabled(False)
         self._preview.clear_image()
         self._preview.set_message("正在重建 3D 场景…")
-        self._engine.prepare(path, 0)
+        self._awaiting_prepare = True
+        self.request_prepare.emit(path, 0)
 
     def _on_prepared(self, info: dict) -> None:
+        # Both tabs hear engine.prepared; only react to our own request.
+        if not self._awaiting_prepare:
+            return
+        self._awaiting_prepare = False
         self._prepared = True
         self._preview.set_message("场景就绪 · 点击「生成动画」")
         self.status_message.emit(f"场景重建完成 · {info['n_gaussians']:,} 高斯")
@@ -249,7 +269,7 @@ class AnimTab(QWidget):
             "num_repeats": self._repeats.value(),
             "preview_width": ANIM_PREVIEW_WIDTH,
         }
-        self._engine.render_anim(opts)
+        self.request_render_anim.emit(opts)
 
     def _on_anim_frame(self, frame: object) -> None:
         self._frames.append(frame)
@@ -275,7 +295,10 @@ class AnimTab(QWidget):
 
     def _on_error(self, msg: str) -> None:
         self._rendering = False
+        self._awaiting_prepare = False
         self._btn_render.setEnabled(True)
+        if self._frames:
+            self._btn_export.setEnabled(True)
         self._prog_label.setText("出错")
         self.status_message.emit(msg)
 
@@ -317,22 +340,14 @@ class AnimTab(QWidget):
         fps = int(self._fps.currentText())
         self.status_message.emit(f"正在导出 {path} …")
         self._prog_label.setText("正在导出视频…")
-        self._export(path, codec, fps)
+        self._btn_export.setEnabled(False)
+        # Encode on the worker thread (imageio encoding would freeze the GUI).
+        self.request_export_anim.emit({
+            "path": path, "codec": codec, "fps": fps, "frames": self._frames,
+        })
 
-    def _export(self, path: str, codec: str, fps: int) -> None:
-        import imageio
-
-        h, w = self._frames[0].shape[:2]
-        output_params = ["-crf", "18", "-preset", "medium"]
-        if codec == "libx265":
-            output_params += ["-tag:v", "hvc1"]
-        writer = imageio.get_writer(
-            path, fps=fps, codec=codec, quality=8,
-            pixelformat="yuv420p", output_params=output_params,
-        )
-        for f in self._frames:
-            writer.append_data(f)
-        writer.close()
+    def _on_exported(self, path: str) -> None:
+        self._btn_export.setEnabled(True)
         self._prog_label.setText(f"已导出 → {path}"[:80])
         self.status_message.emit(f"动画已导出 → {path}")
 

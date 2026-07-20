@@ -281,6 +281,6 @@ class Hdr10Writer:
             if result.returncode == 0:
                 self.tmp_path.unlink(missing_ok=True)
             else:
-                self.tmp_path.rename(self.path)
+                self.tmp_path.replace(self.path)
         else:
-            self.tmp_path.rename(self.path)
+            self.tmp_path.replace(self.path)
