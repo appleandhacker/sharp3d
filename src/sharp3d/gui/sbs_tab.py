@@ -150,6 +150,18 @@ class SbsTab(QWidget):
         right.addWidget(enc_card)
 
         adv_card = SectionCard(c, "高级")
+        perf_row = QHBoxLayout()
+        perf_row.addWidget(QLabel("性能模式"))
+        self._perf_mode = QComboBox()
+        self._perf_mode.addItems(["画质优先", "速度优先"])
+        self._perf_mode.setToolTip(
+            "画质优先：FP16 TensorRT + 完整 35 patches（几乎无损）\n"
+            "速度优先：FP16 TensorRT + 精简 21 patches（提速 ~35%，边缘细节略降）\n\n"
+            "切换后需重新开始转换生效。"
+        )
+        perf_row.addWidget(self._perf_mode, 1)
+        adv_card.add_layout(perf_row)
+
         dec_row = QHBoxLayout()
         dec_row.addWidget(QLabel("分解方法"))
         self._decompose = QComboBox()
@@ -249,6 +261,7 @@ class SbsTab(QWidget):
             "depth": self._chk_depth.isChecked(),
             "ply": self._chk_ply.isChecked(),
             "hdr_output": self._chk_hdr.isChecked(),
+            "perf_mode": "quality" if self._perf_mode.currentIndex() == 0 else "speed",
         }
         self.request_convert.emit(opts)
 

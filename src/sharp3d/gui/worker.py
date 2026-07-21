@@ -59,7 +59,7 @@ class _PipelineWorker:
         except Exception as exc:  # noqa: BLE001
             self._respond("error", (f"预加载失败: {exc}",))
 
-    def _ensure_pipeline(self):
+    def _ensure_pipeline(self, perf_mode="quality"):
         if self._pipeline is not None:
             return
         self._respond("model_loading", ())
@@ -73,10 +73,26 @@ class _PipelineWorker:
             "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt",
             progress=False, map_location="cpu",
         )
-        predictor = create_predictor(PredictorParams())
+        params = PredictorParams()
+        if perf_mode == "speed":
+            params.monodepth.use_patch_overlap = False
+            self._respond("status", ("速度模式：21 patches（精简金字塔）",))
+        predictor = create_predictor(params)
         predictor.load_state_dict(state_dict)
         predictor.eval().to(self._device)
         self._torch = torch
+
+        # Try ORT TensorRT acceleration for patch_encoder
+        try:
+            from sharp3d.ort_engine import create_ort_patch_encoder
+            ort_enc = create_ort_patch_encoder(predictor, self._device)
+            if ort_enc is not None:
+                spn = predictor.monodepth_model.monodepth_predictor.encoder
+                spn.patch_encoder = ort_enc
+                self._respond("status", ("TensorRT FP16 加速已启用",))
+        except Exception:
+            pass  # Fallback to PyTorch
+
         self._pipeline = predictor
 
         self._respond("status", ("正在编译预测器 (torch.compile)…",))
@@ -182,7 +198,7 @@ class _PipelineWorker:
     # ---- full conversion ------------------------------------------------
     def convert(self, opts):
         try:
-            self._ensure_pipeline()
+            self._ensure_pipeline(opts.get("perf_mode", "quality"))
             torch = self._torch
             from sharp.utils import io as sharp_io
             from sharp3d.unproject import prepare_input, fast_unproject, INTERNAL_SHAPE
