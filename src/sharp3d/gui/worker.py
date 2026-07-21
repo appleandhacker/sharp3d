@@ -679,7 +679,11 @@ class EngineProcess(QObject):
         self._proc = ctx.Process(
             target=_child_main,
             args=(self._req_q, self._resp_q, self._cancel_event),
-            daemon=True,
+            # Must be non-daemon: torch.compile's parallel workers are child
+            # processes, and daemonic processes are not allowed to have
+            # children. Cleanup is still guaranteed — the child exits on
+            # queue EOF when the parent dies, and stop() terminates it.
+            daemon=False,
         )
         self._proc.start()
 
