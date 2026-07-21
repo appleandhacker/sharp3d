@@ -435,13 +435,9 @@ class _PipelineWorker:
             prepared, upload_done = _prepare_async(first)
             del first
 
-            # Pipeline parallelism: render frame N on a separate CUDA stream
-            # while predicting frame N+1 on the main stream.  Render (~100ms)
-            # overlaps predict (~500ms), saving ~100ms per frame.
-            render_stream = torch.cuda.Stream()
-            prev_render_done = None   # Event: previous render finished
-            prev_g = None             # Keep gaussians alive for render
-            prev_packed = None        # Keep packed tensor alive for CPU copy
+            # Timing accumulators for bottleneck diagnosis
+            t_pred_acc = t_rend_acc = t_enc_acc = 0.0
+            n_timed = 0
 
             while True:
                 # Fetch the next frame and kick off its prepare now, so its
@@ -452,46 +448,50 @@ class _PipelineWorker:
                     nxt_prepared = _prepare_async(nxt)
                 del nxt
 
-                # ── Predict + unproject on main stream ──────────────
                 main_stream.wait_event(upload_done)
                 img_r, df, ir, (w, h) = prepared
                 t0 = time.time()
+
+                # ── Predict + unproject ─────────────────────────────
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
                     g_ndc = self._compiled(img_r, df)
                 g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
                                    INTERNAL_SHAPE, decompose_method=method)
-                predict_done = main_stream.record_event()
+                t_pred = time.time() - t0
 
-                # ── Wait for previous render, then write it ─────────
-                if prev_render_done is not None:
-                    prev_render_done.synchronize()
-                    sbs_np = prev_packed.cpu().numpy()
-                    if hdr_out:
-                        writer.write_frame(sbs_np)
-                    else:
-                        writer.append_frame(sbs_np)
-                    dt = time.time() - prev_t0
-                    frame_times.append(dt)
-                    self._respond("convert_progress", (i, n, 1.0 / dt))
-                    del prev_g, prev_packed, sbs_np
+                # ── Render + pack (sequential on main stream) ───────
+                t_r0 = time.time()
+                sbs, _ = render_sbs(g, f_px, w, h,
+                                    ipd=ipd_scene, convergence=conv)
+                packed = pack_stereo(fmt, sbs)
+                torch.cuda.synchronize()
+                t_rend = time.time() - t_r0
 
-                # ── Render current frame on render stream ───────────
-                # (overlaps with next frame's predict on main stream)
-                render_stream.wait_event(predict_done)
-                with torch.cuda.stream(render_stream):
-                    sbs, _ = render_sbs(g, f_px, w, h,
-                                        ipd=ipd_scene, convergence=conv)
-                    packed = pack_stereo(fmt, sbs)
-                    render_done = render_stream.record_event()
+                dt = time.time() - t0
+                frame_times.append(dt)
 
-                # Save state for next iteration's write-back
-                prev_g = g
-                prev_packed = packed
-                prev_render_done = render_done
-                prev_t0 = t0
+                # ── Encode ──────────────────────────────────────────
+                t_e0 = time.time()
+                sbs_np = packed.cpu().numpy()
+                if hdr_out:
+                    writer.write_frame(sbs_np)
+                else:
+                    writer.append_frame(sbs_np)
+                t_enc = time.time() - t_e0
+
+                t_pred_acc += t_pred
+                t_rend_acc += t_rend
+                t_enc_acc += t_enc
+                n_timed += 1
+                if n_timed % 10 == 0:
+                    self._respond("status", (
+                        f"耗时分布: predict {t_pred_acc/n_timed*1000:.0f}ms | "
+                        f"render {t_rend_acc/n_timed*1000:.0f}ms | "
+                        f"encode {t_enc_acc/n_timed*1000:.0f}ms",))
+
+                self._respond("convert_progress", (i + 1, n, 1.0 / dt))
                 i += 1
-
-                del g_ndc, sbs, img_r, prepared
+                del g, g_ndc, sbs, packed, img_r, prepared
                 # Deliberately NO per-frame torch.cuda.empty_cache(): it forces
                 # a device sync plus allocator churn on every frame. Shapes are
                 # constant frame-to-frame, so the caching allocator reuses its
@@ -500,19 +500,6 @@ class _PipelineWorker:
                 if nxt_prepared is None:
                     break
                 prepared, upload_done = nxt_prepared
-
-            # ── Write the last frame ────────────────────────────────
-            if prev_render_done is not None:
-                prev_render_done.synchronize()
-                sbs_np = prev_packed.cpu().numpy()
-                if hdr_out:
-                    writer.write_frame(sbs_np)
-                else:
-                    writer.append_frame(sbs_np)
-                dt = time.time() - prev_t0
-                frame_times.append(dt)
-                self._respond("convert_progress", (i, n, 1.0 / dt))
-                del prev_g, prev_packed, sbs_np
 
         # Unblock the producer if it is parked on a full queue, then join.
         while True:
