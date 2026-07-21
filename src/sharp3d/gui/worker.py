@@ -163,6 +163,14 @@ class _PipelineWorker:
         # ORT encoders are @torch.compiler.disable'd → graph breaks.
         # CUDA Graph capture hangs on these breaks (same issue as FP8 testing).
         torch._inductor.config.triton.cudagraphs = False
+        # max-autotune spawns one worker per CPU core by default; each loads
+        # the model for benchmarking → 20+GB RAM + disk saturation on Windows.
+        # Single-threaded compile keeps memory flat (also avoids the Windows
+        # SubprocPool pass_fds issue).
+        torch._inductor.config.compile_threads = 1
+        # Coordinate-descent kernel tuning is the most memory/time-intensive
+        # autotune phase for only marginal runtime gain — skip it.
+        torch._inductor.config.coordinate_descent_tuning = False
         self._compiled = torch.compile(predictor, mode="max-autotune", dynamic=False)
 
         from sharp3d.unproject import INTERNAL_SHAPE
