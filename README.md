@@ -20,12 +20,14 @@
 
 | 指标 | 数值 |
 |------|------|
-| 端到端单帧耗时 | 约 1.0s（1.00 fps，含解码与编码） |
-| 300 帧 4K 视频 | 约 5 分钟 |
+| 端到端单帧耗时 | 约 0.7s（~1.4 fps，含解码与编码） |
+| SHARP 推理（TensorRT FP16） | 约 512ms（vs 纯 PyTorch 603ms） |
+| 300 帧 4K 视频 | 约 3.5 分钟 |
 | GPU 计算利用率 | 约 83% |
 | VRAM 占用 | 约 4.3GB |
 
-关键优化：`torch.compile` + FP16 推理、GPU 四元数（Shepperd 法，替代 scipy）、
+关键优化：ONNX Runtime TensorRT FP16（DINOv2 ViT 编码器，1.74x）、
+`torch.compile` + FP16 推理、GPU 四元数（Shepperd 法，替代 scipy）、
 解析法 3×3 对称特征分解（替代 GPU SVD，省 0.4s/帧）、gsplat 批量双眼渲染、
 解码预取线程（与 GPU 渲染重叠）、AV1 默认走 NVENC 硬件编码（独立编码引擎，
 不占 CUDA 核心，CPU 编码器自动回退）。
@@ -37,6 +39,7 @@
 - [gsplat](https://github.com/nerfstudio-project/gsplat) 1.5.3（Windows 需 patch MSVC 编译标志）
 - [ml-sharp](https://github.com/apple/ml-sharp)（SHARP 模型，editable 安装）
 - `triton-windows<3.4`（Windows 下启用 torch.compile）
+- `onnxruntime-gpu`（TensorRT FP16 加速，可选但推荐）
 - PySide6、pynvml、imageio、Pillow、numpy、plyfile
 - ffmpeg（视频编码与音频混流；不在 PATH 时自动尝试 `C:\Program Files\ffmpeg\bin`）
 - Visual Studio 2022（torch.compile 需要 cl.exe）
@@ -91,6 +94,7 @@ src/sharp3d/
 ├── unproject.py       NDC → 世界空间反投影
 ├── render.py          批量 SBS 渲染 + 单视角渲染 + 深度图
 ├── predict.py         模型加载 + compile + FP16 推理
+├── ort_engine.py      ONNX Runtime TensorRT 加速引擎
 ├── pipeline.py        端到端管线
 ├── video.py           视频读写 + 音频混流
 ├── hdr.py             HDR 检测 + 色调映射 + HDR10 编码
