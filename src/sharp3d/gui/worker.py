@@ -92,14 +92,42 @@ class _PipelineWorker:
         predictor.eval().to(self._device)
         self._torch = torch
 
-        # Try ORT TensorRT acceleration for patch_encoder
+        # Apply channels_last memory format for Conv2d layers (lossless speedup)
+        # Modern GPUs process NHWC layout more efficiently than NCHW.
         try:
-            from sharp3d.ort_engine import create_ort_patch_encoder
-            ort_enc = create_ort_patch_encoder(predictor, self._device)
+            n_converted = 0
+            for mod in predictor.modules():
+                if isinstance(mod, (torch.nn.Conv2d, torch.nn.ConvTranspose2d)):
+                    mod.weight.data = mod.weight.data.to(
+                        memory_format=torch.channels_last)
+                    n_converted += 1
+            if n_converted:
+                self._respond("status", (
+                    f"channels_last 已启用（{n_converted} 个卷积层）",))
+        except Exception:
+            pass  # Non-critical, silently skip
+
+        # Try ORT TensorRT acceleration for patch_encoder + image_encoder
+        try:
+            from sharp3d.ort_engine import (
+                create_ort_patch_encoder, create_ort_image_encoder)
+            spn = predictor.monodepth_model.monodepth_predictor.encoder
+            use_int8 = (perf_mode == "speed")
+
+            ort_enc = create_ort_patch_encoder(predictor, self._device,
+                                               int8_enable=use_int8)
             if ort_enc is not None:
-                spn = predictor.monodepth_model.monodepth_predictor.encoder
                 spn.patch_encoder = ort_enc
-                self._respond("status", ("TensorRT FP16 加速已启用",))
+                mode = "INT8" if use_int8 else "FP16"
+                self._respond("status", (
+                    f"patch_encoder: TensorRT {mode} + IO Binding",))
+
+            ort_img = create_ort_image_encoder(predictor, self._device,
+                                               int8_enable=use_int8)
+            if ort_img is not None:
+                spn.image_encoder = ort_img
+                self._respond("status", (
+                    f"image_encoder: TensorRT + IO Binding",))
         except Exception:
             pass  # Fallback to PyTorch
 
@@ -362,6 +390,15 @@ class _PipelineWorker:
         if first is not None and not self._cancel_event.is_set():
             prepared, upload_done = _prepare_async(first)
             del first
+
+            # Pipeline parallelism: render frame N on a separate CUDA stream
+            # while predicting frame N+1 on the main stream.  Render (~100ms)
+            # overlaps predict (~500ms), saving ~100ms per frame.
+            render_stream = torch.cuda.Stream()
+            prev_render_done = None   # Event: previous render finished
+            prev_g = None             # Keep gaussians alive for render
+            prev_packed = None        # Keep packed tensor alive for CPU copy
+
             while True:
                 # Fetch the next frame and kick off its prepare now, so its
                 # upload overlaps this frame's GPU pass.
@@ -371,6 +408,7 @@ class _PipelineWorker:
                     nxt_prepared = _prepare_async(nxt)
                 del nxt
 
+                # ── Predict + unproject on main stream ──────────────
                 main_stream.wait_event(upload_done)
                 img_r, df, ir, (w, h) = prepared
                 t0 = time.time()
@@ -378,19 +416,38 @@ class _PipelineWorker:
                     g_ndc = self._compiled(img_r, df)
                 g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
                                    INTERNAL_SHAPE, decompose_method=method)
-                sbs, _ = render_sbs(g, f_px, w, h, ipd=ipd_scene, convergence=conv)
-                packed = pack_stereo(fmt, sbs)
-                torch.cuda.synchronize()
-                dt = time.time() - t0
-                frame_times.append(dt)
-                sbs_np = packed.cpu().numpy()
-                if hdr_out:
-                    writer.write_frame(sbs_np)
-                else:
-                    writer.append_frame(sbs_np)
-                self._respond("convert_progress", (i + 1, n, 1.0 / dt))
+                predict_done = main_stream.record_event()
+
+                # ── Wait for previous render, then write it ─────────
+                if prev_render_done is not None:
+                    prev_render_done.synchronize()
+                    sbs_np = prev_packed.cpu().numpy()
+                    if hdr_out:
+                        writer.write_frame(sbs_np)
+                    else:
+                        writer.append_frame(sbs_np)
+                    dt = time.time() - prev_t0
+                    frame_times.append(dt)
+                    self._respond("convert_progress", (i, n, 1.0 / dt))
+                    del prev_g, prev_packed, sbs_np
+
+                # ── Render current frame on render stream ───────────
+                # (overlaps with next frame's predict on main stream)
+                render_stream.wait_event(predict_done)
+                with torch.cuda.stream(render_stream):
+                    sbs, _ = render_sbs(g, f_px, w, h,
+                                        ipd=ipd_scene, convergence=conv)
+                    packed = pack_stereo(fmt, sbs)
+                    render_done = render_stream.record_event()
+
+                # Save state for next iteration's write-back
+                prev_g = g
+                prev_packed = packed
+                prev_render_done = render_done
+                prev_t0 = t0
                 i += 1
-                del g, g_ndc, sbs, packed, img_r, prepared
+
+                del g_ndc, sbs, img_r, prepared
                 # Deliberately NO per-frame torch.cuda.empty_cache(): it forces
                 # a device sync plus allocator churn on every frame. Shapes are
                 # constant frame-to-frame, so the caching allocator reuses its
@@ -399,6 +456,19 @@ class _PipelineWorker:
                 if nxt_prepared is None:
                     break
                 prepared, upload_done = nxt_prepared
+
+            # ── Write the last frame ────────────────────────────────
+            if prev_render_done is not None:
+                prev_render_done.synchronize()
+                sbs_np = prev_packed.cpu().numpy()
+                if hdr_out:
+                    writer.write_frame(sbs_np)
+                else:
+                    writer.append_frame(sbs_np)
+                dt = time.time() - prev_t0
+                frame_times.append(dt)
+                self._respond("convert_progress", (i, n, 1.0 / dt))
+                del prev_g, prev_packed, sbs_np
 
         # Unblock the producer if it is parked on a full queue, then join.
         while True:
