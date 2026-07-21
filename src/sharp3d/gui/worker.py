@@ -133,6 +133,33 @@ class _PipelineWorker:
 
         self._pipeline = predictor
 
+        # ── Pre-build TensorRT engines (before torch.compile) ─────────
+        # Running the ORT encoders once triggers TRT engine building,
+        # which is cached for subsequent runs. Doing this BEFORE
+        # torch.compile separates the two slow operations and gives
+        # the user visible progress instead of a single long wait.
+        try:
+            spn = predictor.monodepth_model.monodepth_predictor.encoder
+            if hasattr(spn.patch_encoder, '_session'):
+                n_patches = 35 if params.monodepth.use_patch_overlap else 21
+                self._respond("status", (
+                    f"正在构建 TensorRT 引擎（{n_patches} patches，首次约30秒）…",))
+                dummy_patches = torch.zeros(
+                    n_patches, 3, 384, 384, device=self._device)
+                with torch.no_grad():
+                    spn.patch_encoder(dummy_patches)
+                torch.cuda.synchronize()
+                del dummy_patches
+            if hasattr(spn.image_encoder, '_session'):
+                self._respond("status", ("正在构建 image_encoder TensorRT 引擎…",))
+                dummy_img_enc = torch.zeros(1, 3, 384, 384, device=self._device)
+                with torch.no_grad():
+                    spn.image_encoder(dummy_img_enc)
+                torch.cuda.synchronize()
+                del dummy_img_enc
+        except Exception:
+            pass  # Non-critical; engines will build on first real use
+
         self._respond("status", ("正在编译预测器 (torch.compile)…",))
         torch._dynamo.config.capture_scalar_outputs = True
         self._compiled = torch.compile(predictor, mode="max-autotune", dynamic=False)
@@ -140,7 +167,7 @@ class _PipelineWorker:
         from sharp3d.unproject import INTERNAL_SHAPE
         dummy_img = torch.zeros(1, 3, *INTERNAL_SHAPE, device=self._device)
         dummy_df = torch.tensor([1.0], device=self._device, dtype=torch.float32)
-        self._respond("status", ("正在预热推理（首次需编译内核，约1分钟）…",))
+        self._respond("status", ("正在预热推理（编译内核，首次约1分钟）…",))
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
             g_ndc = self._compiled(dummy_img, dummy_df)
         torch.cuda.synchronize()
