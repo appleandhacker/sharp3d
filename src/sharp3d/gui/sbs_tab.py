@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QVBoxLayout,
@@ -187,7 +188,17 @@ class SbsTab(QWidget):
         adv_card.add_widget(self._chk_ply)
         right.addWidget(adv_card)
 
-        middle.addLayout(right, 2)
+        # Wrap right column in scroll area so all cards are accessible
+        # even when the window is shorter than the content (small screens).
+        right_widget = QWidget()
+        right_widget.setLayout(right)
+        right_scroll = QScrollArea()
+        right_scroll.setWidget(right_widget)
+        right_scroll.setWidgetResizable(True)
+        right_scroll.setFrameShape(QScrollArea.NoFrame)
+        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        middle.addWidget(right_scroll, 2)
         root.addLayout(middle, 1)
 
         # ---- progress card ------------------------------------------------
