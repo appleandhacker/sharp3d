@@ -17,7 +17,6 @@ with a single gsplat.rendering.rasterization() call using stacked viewmats [2, 4
 import torch
 import gsplat
 
-from sharp.utils import camera as sharp_camera
 from sharp.utils.gaussians import Gaussians3D
 
 
@@ -33,6 +32,58 @@ def linearRGB2sRGB(linearRGB: torch.Tensor) -> torch.Tensor:
     return torch.where(linearRGB <= THRESHOLD, low, high)
 
 
+def _compute_focus_depth_gpu(means: torch.Tensor, min_depth_focus: float = 2.0,
+                             q_focus: float = 0.1) -> float:
+    """Compute focus depth entirely on GPU (replaces CPU-bound _compute_depth_quantiles).
+
+    Since screen_extrinsics is always identity, depth = z-coordinate.
+    torch.quantile on GPU avoids the 14MB GPU→CPU transfer + CPU sort.
+    """
+    depth_values = means[:, 2]  # z-coordinate = depth (identity extrinsics)
+    depth_values = depth_values[depth_values > 0]
+    if depth_values.numel() == 0:
+        return min_depth_focus
+    focus = float(torch.quantile(depth_values, q_focus))
+    return max(min_depth_focus, focus)
+
+
+def _look_at_extrinsics_gpu(eye_pos: torch.Tensor, look_at: torch.Tensor,
+                            world_up: torch.Tensor) -> torch.Tensor:
+    """Compute world-to-camera extrinsics (inverse look-at) on GPU.
+
+    Equivalent to create_camera_matrix(position, look_at, world_up, inverse=True)
+    but operates entirely on GPU tensors.
+    """
+    front = look_at - eye_pos
+    front = front / front.norm()
+    right = torch.linalg.cross(front, world_up)
+    right = right / right.norm()
+    down = torch.linalg.cross(front, right)
+
+    # rotation_matrix columns = [right, down, front]
+    # inverse: R = rotation.T, t = -R @ position
+    R = torch.stack([right, down, front], dim=-1)  # (3, 3) columns
+    R_inv = R.T  # (3, 3)
+    t_inv = -R_inv @ eye_pos
+
+    extrinsics = torch.eye(4, device=eye_pos.device, dtype=eye_pos.dtype)
+    extrinsics[:3, :3] = R_inv
+    extrinsics[:3, 3] = t_inv
+    return extrinsics
+
+
+def _get_screen_resolution(width: int, height: int) -> tuple[int, int]:
+    """Match SHARP's get_screen_resolution_px_from_input logic."""
+    w, h = width, height
+    if h > 3000:
+        w, h = w // 2, h // 2
+    if w % 2 != 0:
+        w += 1
+    if h % 2 != 0:
+        h += 1
+    return w, h
+
+
 def render_sbs(
     gaussians: Gaussians3D,
     f_px: float,
@@ -43,6 +94,10 @@ def render_sbs(
     render_width: int | None = None,
 ) -> tuple[torch.Tensor, tuple[int, int]]:
     """Render stereoscopic SBS pair using batched gsplat rasterization.
+
+    GPU-native camera setup: bypasses SHARP's CPU-bound create_camera_model
+    (which transfers 1.18M points to CPU + sorts for quantiles = ~240ms).
+    Instead computes focus depth and look-at matrices entirely on GPU (~1ms).
 
     Args:
         gaussians: World-space Gaussians (unprojected).
@@ -71,42 +126,10 @@ def render_sbs(
     else:
         f_px_r, w_r, h_r = f_px, orig_w, orig_h
 
-    # Build intrinsics for output resolution
-    intrinsics = torch.tensor([
-        [f_px_r, 0, (w_r - 1) / 2.0, 0],
-        [0, f_px_r, (h_r - 1) / 2.0, 0],
-        [0, 0, 1, 0],
-        [0, 0, 0, 1],
-    ], dtype=torch.float32, device=device)
-
-    # Use SHARP's camera model for correct extrinsics computation
-    # BUG#2 FIX: camera_model.compute() uses create_camera_matrix(inverse=True)
-    # which correctly transposes rotation (world-to-camera).
-    camera_model = sharp_camera.create_camera_model(
-        gaussians, intrinsics, resolution_px=(w_r, h_r)
-    )
-
-    # Convergence control: override the auto focus distance.
-    # lookat_point makes both eyes converge at z = convergence.
-    if convergence is not None:
-        camera_model.lookat_point = (0.0, 0.0, float(convergence))
-
-    # BUG#6 FIX: eye_pos must be CPU tensor (camera_model.compute uses CPU internally)
-    left_info = camera_model.compute(torch.tensor([-ipd / 2, 0.0, 0.0]))
-    right_info = camera_model.compute(torch.tensor([ipd / 2, 0.0, 0.0]))
-
-    # Stack viewmats for batched rendering: (2, 4, 4)
-    viewmats = torch.stack([
-        left_info.extrinsics.to(device),
-        right_info.extrinsics.to(device),
-    ], dim=0)  # (2, 4, 4)
-
-    # Intrinsics for gsplat: (2, 3, 3)
-    K = left_info.intrinsics[:3, :3].to(device)
-    Ks = K.unsqueeze(0).expand(2, -1, -1)  # (2, 3, 3)
-
-    render_w = left_info.width
-    render_h = left_info.height
+    # Apply SHARP's screen resolution logic (halve if >3000px height, enforce even)
+    screen_w, screen_h = _get_screen_resolution(w_r, h_r)
+    # Rescale intrinsics to match screen resolution
+    f_px_screen = f_px_r * (screen_w / w_r)
 
     # Remove batch dim from gaussians (gsplat expects unbatched)
     means = gaussians.mean_vectors
@@ -122,6 +145,33 @@ def render_sbs(
         opacities = opacities[0]
         colors = colors[0]
 
+    # --- GPU-native camera setup (replaces 241ms CPU-bound create_camera_model) ---
+    if convergence is not None:
+        depth_focus = float(convergence)
+    else:
+        depth_focus = _compute_focus_depth_gpu(means)
+
+    # Look-at target: origin + [0, 0, depth_focus] (matches SHARP's "point" mode)
+    look_at = torch.tensor([0.0, 0.0, depth_focus], device=device)
+    world_up = torch.tensor([0.0, -1.0, 0.0], device=device)
+
+    # Eye positions
+    left_eye = torch.tensor([-ipd / 2, 0.0, 0.0], device=device)
+    right_eye = torch.tensor([ipd / 2, 0.0, 0.0], device=device)
+
+    # Compute extrinsics on GPU (world-to-camera)
+    left_ext = _look_at_extrinsics_gpu(left_eye, look_at, world_up)
+    right_ext = _look_at_extrinsics_gpu(right_eye, look_at, world_up)
+    viewmats = torch.stack([left_ext, right_ext], dim=0)  # (2, 4, 4)
+
+    # Intrinsics for gsplat: (2, 3, 3)
+    K = torch.tensor([
+        [f_px_screen, 0, (screen_w - 1) / 2.0],
+        [0, f_px_screen, (screen_h - 1) / 2.0],
+        [0, 0, 1],
+    ], dtype=torch.float32, device=device)
+    Ks = K.unsqueeze(0).expand(2, -1, -1)  # (2, 3, 3)
+
     # Single batched rasterization call for both eyes
     rendered_colors, rendered_alphas, meta = gsplat.rendering.rasterization(
         means=means,
@@ -131,8 +181,8 @@ def render_sbs(
         colors=colors,
         viewmats=viewmats,
         Ks=Ks,
-        width=render_w,
-        height=render_h,
+        width=screen_w,
+        height=screen_h,
         render_mode="RGB",
         rasterize_mode="classic",
         absgrad=False,
@@ -151,7 +201,7 @@ def render_sbs(
     # Concatenate horizontally for SBS
     sbs = torch.cat([left_img, right_img], dim=1)  # (H, W*2, 3)
 
-    return sbs, (render_w, render_h)
+    return sbs, (screen_w, screen_h)
 
 
 def render_single(
@@ -164,12 +214,14 @@ def render_single(
 ) -> torch.Tensor:
     """Render a single view from an arbitrary eye position (2.5D animation).
 
+    GPU-native camera setup (no CPU-bound create_camera_model).
+
     Args:
         gaussians: World-space Gaussians.
         f_px: Focal length in pixels (original image space).
         orig_w: Original image width.
         orig_h: Original image height.
-        eye_pos: (3,) CPU tensor — camera position in scene units.
+        eye_pos: (3,) tensor — camera position in scene units (any device).
         render_width: If set, render at this width (preview mode).
 
     Returns:
@@ -187,21 +239,8 @@ def render_single(
     else:
         f_px_r, w_r, h_r = f_px, orig_w, orig_h
 
-    intrinsics = torch.tensor([
-        [f_px_r, 0, (w_r - 1) / 2.0, 0],
-        [0, f_px_r, (h_r - 1) / 2.0, 0],
-        [0, 0, 1, 0],
-        [0, 0, 0, 1],
-    ], dtype=torch.float32, device=device)
-
-    camera_model = sharp_camera.create_camera_model(
-        gaussians, intrinsics, resolution_px=(w_r, h_r)
-    )
-    # BUG#6: eye_pos must be a CPU tensor
-    info = camera_model.compute(eye_pos.detach().cpu())
-
-    viewmats = info.extrinsics[None].to(device)  # (1, 4, 4)
-    Ks = info.intrinsics[:3, :3][None].to(device)  # (1, 3, 3)
+    screen_w, screen_h = _get_screen_resolution(w_r, h_r)
+    f_px_screen = f_px_r * (screen_w / w_r)
 
     means = gaussians.mean_vectors
     quats = gaussians.quaternions
@@ -215,6 +254,22 @@ def render_single(
         opacities = opacities[0]
         colors = colors[0]
 
+    # GPU-native camera setup
+    depth_focus = _compute_focus_depth_gpu(means)
+    look_at = torch.tensor([0.0, 0.0, depth_focus], device=device)
+    world_up = torch.tensor([0.0, -1.0, 0.0], device=device)
+    eye = eye_pos.to(device)
+
+    ext = _look_at_extrinsics_gpu(eye, look_at, world_up)
+    viewmats = ext[None]  # (1, 4, 4)
+
+    K = torch.tensor([
+        [f_px_screen, 0, (screen_w - 1) / 2.0],
+        [0, f_px_screen, (screen_h - 1) / 2.0],
+        [0, 0, 1],
+    ], dtype=torch.float32, device=device)
+    Ks = K[None]  # (1, 3, 3)
+
     rendered_colors, rendered_alphas, meta = gsplat.rendering.rasterization(
         means=means,
         quats=quats,
@@ -223,8 +278,8 @@ def render_single(
         colors=colors,
         viewmats=viewmats,
         Ks=Ks,
-        width=info.width,
-        height=info.height,
+        width=screen_w,
+        height=screen_h,
         render_mode="RGB",
         rasterize_mode="classic",
         absgrad=False,
@@ -249,20 +304,8 @@ def render_depth_map(
     """
     device = gaussians.mean_vectors.device
 
-    intrinsics = torch.tensor([
-        [f_px, 0, (orig_w - 1) / 2.0, 0],
-        [0, f_px, (orig_h - 1) / 2.0, 0],
-        [0, 0, 1, 0],
-        [0, 0, 0, 1],
-    ], dtype=torch.float32, device=device)
-
-    camera_model = sharp_camera.create_camera_model(
-        gaussians, intrinsics, resolution_px=(orig_w, orig_h)
-    )
-    center_info = camera_model.compute(torch.tensor([0.0, 0.0, 0.0]))
-
-    viewmats = center_info.extrinsics[None].to(device)  # (1, 4, 4)
-    Ks = center_info.intrinsics[:3, :3][None].to(device)  # (1, 3, 3)
+    screen_w, screen_h = _get_screen_resolution(orig_w, orig_h)
+    f_px_screen = f_px * (screen_w / orig_w)
 
     means = gaussians.mean_vectors
     quats = gaussians.quaternions
@@ -277,6 +320,22 @@ def render_depth_map(
         opacities = opacities[0]
         colors = colors[0]
 
+    # GPU-native camera setup (center viewpoint)
+    depth_focus = _compute_focus_depth_gpu(means)
+    look_at = torch.tensor([0.0, 0.0, depth_focus], device=device)
+    world_up = torch.tensor([0.0, -1.0, 0.0], device=device)
+    eye = torch.tensor([0.0, 0.0, 0.0], device=device)
+
+    ext = _look_at_extrinsics_gpu(eye, look_at, world_up)
+    viewmats = ext[None]  # (1, 4, 4)
+
+    K = torch.tensor([
+        [f_px_screen, 0, (screen_w - 1) / 2.0],
+        [0, f_px_screen, (screen_h - 1) / 2.0],
+        [0, 0, 1],
+    ], dtype=torch.float32, device=device)
+    Ks = K[None]  # (1, 3, 3)
+
     rendered_colors, rendered_alphas, meta = gsplat.rendering.rasterization(
         means=means,
         quats=quats,
@@ -285,8 +344,8 @@ def render_depth_map(
         colors=colors,
         viewmats=viewmats,
         Ks=Ks,
-        width=center_info.width,
-        height=center_info.height,
+        width=screen_w,
+        height=screen_h,
         render_mode="RGB+D",
         rasterize_mode="classic",
         absgrad=False,

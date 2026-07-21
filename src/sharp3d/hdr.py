@@ -79,6 +79,26 @@ def encoder_available(name: str) -> bool:
     return name in available_encoders()
 
 
+# --- Hardware decode (NVDEC) probing -----------------------------------------
+
+_HWACCEL_CUDA: bool | None = None
+
+
+def hwaccel_cuda_available() -> bool:
+    """Check if ffmpeg supports CUDA hardware decoding (NVDEC). Cached."""
+    global _HWACCEL_CUDA
+    if _HWACCEL_CUDA is None:
+        try:
+            out = subprocess.run(
+                [FFMPEG, "-hide_banner", "-hwaccels"],
+                capture_output=True,
+            ).stdout.decode("utf-8", "replace")
+            _HWACCEL_CUDA = "cuda" in out.lower()
+        except Exception:
+            _HWACCEL_CUDA = False
+    return _HWACCEL_CUDA
+
+
 # --- Filter chains ----------------------------------------------------------
 
 def hdr_to_sdr_filter(peak: float = 1000.0) -> str:
@@ -197,6 +217,7 @@ class FrameReader:
 
     If the source is HDR, frames are tone-mapped to SDR during decode so the
     SHARP model receives correct input.
+    Uses NVDEC hardware decoding when available (offloads CPU).
     """
 
     def __init__(self, path: str | Path, info: dict | None = None):
@@ -210,6 +231,12 @@ class FrameReader:
         self.has_audio = self.info["has_audio"]
         self._frame_size = self.width * self.height * 3
 
+    def _hwaccel(self) -> list[str]:
+        """NVDEC hardware decode flags (GPU engine, zero CPU cost)."""
+        if hwaccel_cuda_available():
+            return ["-hwaccel", "cuda"]
+        return []
+
     def _vf(self) -> list[str]:
         if self.is_hdr:
             return ["-vf", hdr_to_sdr_filter()]
@@ -218,7 +245,7 @@ class FrameReader:
     def read_frame(self, idx: int) -> np.ndarray:
         """Read a single frame by index (time-based seek). For previews."""
         t = idx / self.fps if self.fps else 0.0
-        cmd = [FFMPEG, "-ss", f"{t:.4f}", "-i", self.path,
+        cmd = [FFMPEG, *self._hwaccel(), "-ss", f"{t:.4f}", "-i", self.path,
                "-vframes", "1", *self._vf(),
                "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
         result = subprocess.run(cmd, capture_output=True)
@@ -231,7 +258,7 @@ class FrameReader:
 
     def stream_frames(self):
         """Generator yielding all frames in order. For full conversion."""
-        cmd = [FFMPEG, "-i", self.path, *self._vf(),
+        cmd = [FFMPEG, *self._hwaccel(), "-i", self.path, *self._vf(),
                "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL)
