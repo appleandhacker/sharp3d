@@ -1,24 +1,20 @@
-"""SBS conversion tab — the main workspace.
+"""SBS conversion tab — compact two-column layout (no preview pane).
 
-Layout: IO card on top, preview (left, stretching) + parameter column (right),
-progress card at the bottom. Stereo sliders re-render the cached gaussians
-live for responsive IPD/convergence/strength tuning.
+Layout: IO card on top, stereo params (left) + output/advanced (right),
+progress card at the bottom.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QScrollArea,
-    QSlider,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -27,7 +23,6 @@ from .theme import Colors, ThemeManager
 from .widgets import (
     AnimatedProgressBar,
     FileField,
-    PreviewPane,
     SectionCard,
     StereoSlider,
 )
@@ -38,7 +33,6 @@ from ..formats import FORMATS
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
 IMG_FILTER = "图片 (*.png *.jpg *.jpeg *.bmp *.webp);;所有文件 (*)"
 VID_FILTER = "视频 (*.mp4 *.mkv *.avi *.mov *.webm);;所有文件 (*)"
-PREVIEW_WIDTH = 1280
 
 
 def _fmt_hms(seconds: float) -> str:
@@ -55,20 +49,12 @@ class SbsTab(QWidget):
     """Main 2D→3D SBS conversion workspace."""
 
     status_message = Signal(str)
-
-    # Request signals: emitted on the GUI thread. The engine's request
-    # methods are non-blocking (they enqueue to the child pipeline process),
-    # but going through signals keeps the call path uniform and safe.
-    request_prepare = Signal(str, int)
-    request_render_preview = Signal(float, float, float, int)
     request_convert = Signal(dict)
 
     def __init__(self, theme: ThemeManager, engine: EngineProcess, parent=None) -> None:
         super().__init__(parent)
         self._theme = theme
         self._engine = engine
-        self._prepared = False
-        self._awaiting_prepare = False
         self._is_video = False
         self._n_frames = 1
         self._converting = False
@@ -89,34 +75,13 @@ class SbsTab(QWidget):
         io_card.add_widget(self._output)
         root.addWidget(io_card)
 
-        # ---- middle: preview + params ------------------------------------
+        # ---- middle: two-column params ------------------------------------
         middle = QHBoxLayout()
         middle.setSpacing(12)
 
-        # preview card
-        preview_card = SectionCard(c, "立体预览")
-        self._preview = PreviewPane(c)
-        self._preview.file_dropped.connect(self._input.set_path)
-        preview_card.add_widget(self._preview, )
-
-        preview_ctrl = QHBoxLayout()
-        self._btn_preview = QPushButton("单帧预览")
-        self._btn_preview.clicked.connect(self._do_prepare)
-        self._frame_slider = QSlider(Qt.Horizontal)
-        self._frame_slider.setEnabled(False)
-        self._frame_label = QLabel("帧 —")
-        self._frame_label.setProperty("cssClass", "mono")
-        self._frame_label.setMinimumWidth(64)
-        preview_ctrl.addWidget(self._btn_preview)
-        preview_ctrl.addWidget(self._frame_slider, 1)
-        preview_ctrl.addWidget(self._frame_label)
-        preview_card.add_layout(preview_ctrl)
-
-        middle.addWidget(preview_card, 3)
-
-        # right column of parameter cards
-        right = QVBoxLayout()
-        right.setSpacing(12)
+        # Left column: stereo parameters
+        left = QVBoxLayout()
+        left.setSpacing(12)
 
         stereo_card = SectionCard(c, "立体参数")
         self._s_ipd = StereoSlider(c, "瞳距 IPD", 50, 80, 63, fmt="{:.0f}",
@@ -131,7 +96,16 @@ class SbsTab(QWidget):
         stereo_card.add_widget(self._s_conv)
         stereo_card.add_widget(self._s_strength)
         stereo_card.add_widget(conv_hint)
-        right.addWidget(stereo_card)
+        left.addWidget(stereo_card)
+        left.addStretch(1)
+
+        left_w = QWidget()
+        left_w.setLayout(left)
+        middle.addWidget(left_w, 1)
+
+        # Right column: output settings + advanced
+        right = QVBoxLayout()
+        right.setSpacing(12)
 
         enc_card = SectionCard(c, "输出设置")
         fmt_row = QHBoxLayout()
@@ -140,7 +114,7 @@ class SbsTab(QWidget):
         for _key, label in FORMATS:
             self._format.addItem(label)
         self._format.setToolTip(
-            "导出文件的立体打包格式。预览始终显示 Full SBS（调参用）。\n"
+            "导出文件的立体打包格式。\n"
             "Anaglyph 红青 = 用红青 3D 眼镜观看；Cross Eyed = 斗鸡眼观看法。"
         )
         fmt_row.addWidget(self._format, 1)
@@ -187,18 +161,12 @@ class SbsTab(QWidget):
         adv_card.add_widget(self._chk_depth)
         adv_card.add_widget(self._chk_ply)
         right.addWidget(adv_card)
+        right.addStretch(1)
 
-        # Wrap right column in scroll area so all cards are accessible
-        # even when the window is shorter than the content (small screens).
-        right_widget = QWidget()
-        right_widget.setLayout(right)
-        right_scroll = QScrollArea()
-        right_scroll.setWidget(right_widget)
-        right_scroll.setWidgetResizable(True)
-        right_scroll.setFrameShape(QScrollArea.NoFrame)
-        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        right_w = QWidget()
+        right_w.setLayout(right)
+        middle.addWidget(right_w, 1)
 
-        middle.addWidget(right_scroll, 2)
         root.addLayout(middle, 1)
 
         # ---- progress card ------------------------------------------------
@@ -222,65 +190,27 @@ class SbsTab(QWidget):
         prog_card.add_layout(prog_row)
         root.addWidget(prog_card)
 
-        # ---- debounced preview re-render ---------------------------------
-        self._preview_timer = QTimer(self)
-        self._preview_timer.setSingleShot(True)
-        self._preview_timer.setInterval(120)
-        self._preview_timer.timeout.connect(self._render_preview_now)
-        for s in (self._s_ipd, self._s_conv, self._s_strength):
-            s.value_changed.connect(lambda _v: self._schedule_preview())
-
-        # Debounce frame-slider prepare: dragging fires many valueChanged
-        # events; each prepare costs ~1s, so only run the last one.
-        self._frame_prepare_timer = QTimer(self)
-        self._frame_prepare_timer.setSingleShot(True)
-        self._frame_prepare_timer.setInterval(250)
-        self._frame_prepare_timer.timeout.connect(self._do_prepare)
-
-        self._frame_slider.valueChanged.connect(self._on_frame_slider)
-
         # ---- engine wiring ------------------------------------------------
-        # Request signals -> engine request methods (non-blocking; the heavy
-        # work runs in the child pipeline process so the GUI stays responsive).
-        self.request_prepare.connect(engine.prepare)
-        self.request_render_preview.connect(engine.render_preview)
         self.request_convert.connect(engine.convert)
-
-        engine.preview_ready.connect(self._on_preview_ready)
-        engine.prepared.connect(self._on_prepared)
         engine.convert_progress.connect(self._on_convert_progress)
         engine.convert_done.connect(self._on_convert_done)
         engine.error.connect(self._on_error)
 
     # ------------------------------------------------------------------
-    def _schedule_preview(self) -> None:
-        if self._prepared and not self._converting:
-            self._preview_timer.start()
-
-    def _render_preview_now(self) -> None:
-        self.request_render_preview.emit(
-            self._s_ipd.value(), self._s_conv.value(),
-            self._s_strength.value(), PREVIEW_WIDTH,
-        )
-
     def _on_hdr_toggled(self, checked: bool) -> None:
-        # HDR10 requires H.265 or AV1; H.264 cannot carry it.
         if checked and self._codec.currentText() == "H.264":
             self._codec.setCurrentText("H.265")
 
     def _on_input(self, path: str) -> None:
         p = Path(path)
         self._is_video = p.suffix.lower() in VIDEO_EXTS
-        # auto-name output
         out = p.parent / f"{p.stem}_sbs{('.mp4' if self._is_video else p.suffix)}"
         self._output.set_path(str(out))
-        # frame slider for video
         if self._is_video:
             try:
                 from sharp3d.hdr import probe_video
                 info = probe_video(p)
                 self._n_frames = info["n_frames"] or 1
-                # auto-enable HDR10 output for HDR sources
                 if info["is_hdr"]:
                     self._chk_hdr.setChecked(True)
                     if self._codec.currentText() == "H.264":
@@ -288,47 +218,8 @@ class SbsTab(QWidget):
                     self.status_message.emit("检测到 HDR 输入，已启用 HDR10 输出")
             except Exception:
                 self._n_frames = 1
-            self._frame_slider.setEnabled(self._n_frames > 1)
-            self._frame_slider.setRange(0, max(0, self._n_frames - 1))
-            self._frame_slider.setValue(0)
         else:
             self._n_frames = 1
-            self._frame_slider.setEnabled(False)
-            self._frame_slider.setRange(0, 0)
-        self._frame_label.setText(f"帧 0/{max(0, self._n_frames - 1)}")
-        self._prepared = False
-        self._preview.clear_image()
-        self._preview.set_message("正在重建 3D 场景…")
-        self._do_prepare()
-
-    def _on_frame_slider(self, idx: int) -> None:
-        self._frame_label.setText(f"帧 {idx}/{max(0, self._n_frames - 1)}")
-        if self._is_video and not self._converting:
-            self._prepared = False
-            self._frame_prepare_timer.start()  # debounced prepare
-
-    def _do_prepare(self) -> None:
-        path = self._input.path()
-        if not path or self._converting:
-            return
-        idx = self._frame_slider.value() if self._is_video else 0
-        self._preview.set_message("正在重建 3D 场景…")
-        self._awaiting_prepare = True
-        self.request_prepare.emit(path, idx)
-
-    def _on_prepared(self, info: dict) -> None:
-        # Both tabs hear engine.prepared; only react to our own request.
-        if not self._awaiting_prepare:
-            return
-        self._awaiting_prepare = False
-        self._prepared = True
-        self.status_message.emit(
-            f"场景重建完成 · {info['n_gaussians']:,} 高斯"
-        )
-        self._render_preview_now()
-
-    def _on_preview_ready(self, sbs: object) -> None:
-        self._preview.set_image(sbs)
 
     # ------------------------------------------------------------------
     def _on_start(self) -> None:
@@ -362,9 +253,6 @@ class SbsTab(QWidget):
         self.request_convert.emit(opts)
 
     def _on_cancel(self) -> None:
-        # Direct call is intentional: cancel() only sets a flag that the running
-        # conversion loop polls. A queued signal would sit behind the busy
-        # worker and never arrive in time.
         self._engine.cancel()
         self.status_message.emit("正在取消…")
 
@@ -395,7 +283,6 @@ class SbsTab(QWidget):
 
     def _on_error(self, msg: str) -> None:
         self._converting = False
-        self._awaiting_prepare = False
         self._btn_start.setEnabled(True)
         self._btn_cancel.setEnabled(False)
         self._progress.set_busy(False)
@@ -405,7 +292,6 @@ class SbsTab(QWidget):
     # ------------------------------------------------------------------
     def apply_theme(self, c: Colors) -> None:
         """Re-apply colors after an OS theme switch."""
-        self._preview.set_colors(c)
         self._progress._colors = c
         for s in (self._s_ipd, self._s_conv, self._s_strength):
             s.set_colors(c)

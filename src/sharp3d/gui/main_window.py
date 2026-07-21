@@ -34,8 +34,8 @@ class MainWindow(QMainWindow):
         from PySide6.QtWidgets import QApplication
         from PySide6.QtCore import QRect
         geo = QApplication.primaryScreen().availableGeometry()
-        w = max(900, min(int(geo.width() * 0.60), 1600))
-        h = max(700, min(int(geo.height() * 0.88), 1080))
+        w = max(800, min(int(geo.width() * 0.50), 1200))
+        h = max(480, min(int(geo.height() * 0.60), 800))
         x = geo.x() + (geo.width() - w) // 2
         y = geo.y() + (geo.height() - h) // 2
         self.setGeometry(QRect(x, y, w, h))
