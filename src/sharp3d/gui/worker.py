@@ -80,7 +80,8 @@ class _PipelineWorker:
         self._pipeline = predictor
 
         self._respond("status", ("正在编译预测器 (torch.compile)…",))
-        self._compiled = torch.compile(predictor, mode="default")
+        torch._dynamo.config.capture_scalar_outputs = True
+        self._compiled = torch.compile(predictor, mode="max-autotune", dynamic=False)
 
         from sharp3d.unproject import INTERNAL_SHAPE
         dummy_img = torch.zeros(1, 3, *INTERNAL_SHAPE, device=self._device)

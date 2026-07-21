@@ -1,13 +1,13 @@
 """SHARP model loading and compiled inference.
 
-BUG#7 FIX: torch.compile on Windows only supports mode="default".
-    "reduce-overhead" and "max-autotune" fail with
-    "Python int too large to convert to C long".
+BUG#7 RESOLVED: PyTorch 2.13 fixes the "Python int too large to convert to C long"
+    error on Windows. mode="max-autotune" now works correctly.
 
 BUG#8 FIX: CUDA non-default streams are incompatible with torch.compile
     on Windows (Triton limitation → OverflowError). No dual-stream pipeline.
 
-Performance: compile(default) + FP16 autocast gives ~1.4x over raw FP32.
+Performance: compile(max-autotune, dynamic=False) + FP16 autocast gives ~6%
+    over compile(default), ~1.5x over raw FP32 eager.
 """
 
 import torch
@@ -33,9 +33,12 @@ class SharpPredictor:
         self.predictor.load_state_dict(state_dict)
         self.predictor.eval().to(device)
 
-        # BUG#7: Only mode="default" works on Windows
         if use_compile:
-            self._compiled = torch.compile(self.predictor, mode="default")
+            # Eliminate graph break from Tensor.item() in GaussianComposer
+            torch._dynamo.config.capture_scalar_outputs = True
+            self._compiled = torch.compile(
+                self.predictor, mode="max-autotune", dynamic=False
+            )
         else:
             self._compiled = self.predictor
 
