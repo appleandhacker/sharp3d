@@ -1,28 +1,36 @@
 """SHARP model loading and compiled inference.
 
+Performance options (in priority order):
+    1. ORT TensorRT: patch_encoder via ONNX Runtime TensorRT FP16 (1.74x on ViT)
+    2. torch.compile: max-autotune + FP16 autocast (~1.5x over eager)
+    3. Eager fallback: no compilation
+
 BUG#7 RESOLVED: PyTorch 2.13 fixes the "Python int too large to convert to C long"
     error on Windows. mode="max-autotune" now works correctly.
 
 BUG#8 FIX: CUDA non-default streams are incompatible with torch.compile
     on Windows (Triton limitation → OverflowError). No dual-stream pipeline.
-
-Performance: compile(max-autotune, dynamic=False) + FP16 autocast gives ~6%
-    over compile(default), ~1.5x over raw FP32 eager.
 """
+
+import logging
 
 import torch
 from sharp.models import PredictorParams, create_predictor
+
+logger = logging.getLogger(__name__)
 
 MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt"
 
 
 class SharpPredictor:
-    """Wrapper for SHARP predictor with compile + FP16 optimization."""
+    """Wrapper for SHARP predictor with ORT TensorRT + compile + FP16 optimization."""
 
     def __init__(self, device: torch.device = torch.device("cuda"),
-                 use_compile: bool = True, use_fp16: bool = True):
+                 use_compile: bool = True, use_fp16: bool = True,
+                 use_ort: bool = True):
         self.device = device
         self.use_fp16 = use_fp16
+        self.use_ort = False
         self._compiled = None
 
         # Load model
@@ -32,6 +40,10 @@ class SharpPredictor:
         self.predictor = create_predictor(PredictorParams())
         self.predictor.load_state_dict(state_dict)
         self.predictor.eval().to(device)
+
+        # Try ORT TensorRT acceleration for patch_encoder
+        if use_ort:
+            self.use_ort = self._setup_ort()
 
         if use_compile:
             # Eliminate graph break from Tensor.item() in GaussianComposer
@@ -43,6 +55,28 @@ class SharpPredictor:
             self._compiled = self.predictor
 
         self._warmed_up = False
+
+    def _setup_ort(self) -> bool:
+        """Replace patch_encoder with ONNX Runtime TensorRT version.
+
+        Returns True if ORT is active, False if fallback to PyTorch.
+        """
+        try:
+            from .ort_engine import create_ort_patch_encoder
+
+            ort_encoder = create_ort_patch_encoder(self.predictor, self.device)
+            if ort_encoder is None:
+                return False
+
+            # Replace patch_encoder in the model
+            spn = self.predictor.monodepth_model.monodepth_predictor.encoder
+            spn.patch_encoder = ort_encoder
+            logger.info("patch_encoder replaced with ORT TensorRT (FP16)")
+            return True
+
+        except Exception as e:
+            logger.warning("ORT setup failed, using PyTorch: %s", e)
+            return False
 
     def warmup(self, img_resized: torch.Tensor, disparity_factor: torch.Tensor):
         """Run one inference to trigger compilation (first call is slow)."""
