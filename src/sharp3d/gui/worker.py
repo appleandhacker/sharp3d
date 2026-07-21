@@ -466,6 +466,15 @@ class _PipelineWorker:
 
 def _child_main(req_q, resp_q, cancel_event):
     """Child-process entry point. Dispatches requests to the pipeline worker."""
+    # ---- persistent compile cache: compile once, reuse forever ----
+    # Must be set before torch is imported in this process.
+    import os as _os
+    _project_root = Path(__file__).resolve().parents[3]  # sharp3d/src/sharp3d/gui -> sharp3d/
+    _cache_dir = _project_root / ".cache"
+    _os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(_cache_dir / "inductor"))
+    _os.environ.setdefault("TRITON_CACHE_DIR", str(_cache_dir / "triton"))
+    _cache_dir.mkdir(parents=True, exist_ok=True)
+
     worker = _PipelineWorker(
         respond=lambda name, args: resp_q.put((name, args)),
         cancel_event=cancel_event,

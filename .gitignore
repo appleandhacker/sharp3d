@@ -43,3 +43,4 @@ test_*.mp4
 
 # Logs
 *.log
+.cache/
