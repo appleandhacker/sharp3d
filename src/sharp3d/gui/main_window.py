@@ -27,12 +27,16 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("sharp3d — 2D → 3D 立体转换")
 
         # Adaptive initial size: fits any display (2K/4K) without exceeding
-        # screen bounds. 78% width, 82% height, clamped to sane min/max.
+        # screen bounds. Hard-capped to available geometry so it NEVER overflows.
         from PySide6.QtWidgets import QApplication
         screen_geo = QApplication.primaryScreen().availableGeometry()
-        w = max(900, min(int(screen_geo.width() * 0.78), 1920))
-        h = max(620, min(int(screen_geo.height() * 0.82), 1200))
+        # Hard limit: window can never be larger than the screen
+        self.setMaximumSize(screen_geo.width(), screen_geo.height())
+        # Initial size: 70% width, 75% height, clamped to [860x580, 1800x1100]
+        w = max(860, min(int(screen_geo.width() * 0.70), 1800))
+        h = max(580, min(int(screen_geo.height() * 0.75), 1100))
         self.resize(w, h)
+        # Center on screen
         self.move(
             screen_geo.x() + (screen_geo.width() - w) // 2,
             screen_geo.y() + (screen_geo.height() - h) // 2,
