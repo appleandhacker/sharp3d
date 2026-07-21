@@ -26,15 +26,16 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("sharp3d — 2D → 3D 立体转换")
 
-        # Adaptive initial size: fixed default clamped to 90% of screen,
-        # guaranteed to never exceed the available area.
+        # Adaptive initial size: proportional to logical screen (DPI-aware).
+        # Qt6 returns logical pixels from availableGeometry(), so this works
+        # correctly at any Windows scaling (100%/150%/200%).
+        # 4K@200%→logical 1920x1080→1152x756, 4K@100%→3840x2160→1600x1000,
+        # 2K@150%→1707x960→1024x672, 1080p→1920x1080→1152x756.
         from PySide6.QtWidgets import QApplication
         from PySide6.QtCore import QRect
         geo = QApplication.primaryScreen().availableGeometry()
-        # Default size, clamped so it always fits (90% of screen as hard cap)
-        w = min(1100, int(geo.width() * 0.90))
-        h = min(750, int(geo.height() * 0.90))
-        # Center within available area
+        w = max(900, min(int(geo.width() * 0.60), 1600))
+        h = max(600, min(int(geo.height() * 0.70), 1000))
         x = geo.x() + (geo.width() - w) // 2
         y = geo.y() + (geo.height() - h) // 2
         self.setGeometry(QRect(x, y, w, h))
