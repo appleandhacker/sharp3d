@@ -47,7 +47,7 @@ def _ensure_cudnn_path():
 
 # ── ONNX export helpers ──────────────────────────────────────────────
 
-def export_onnx_model(module, onnx_path: Path, device: torch.device,
+def _export_onnx_model(module, onnx_path: Path, device: torch.device,
                       dummy_input: torch.Tensor, input_name: str = "patches",
                       output_names=None, dynamo=True):
     """Export a PyTorch module to ONNX format.
@@ -94,7 +94,7 @@ def export_patch_encoder(predictor, onnx_path: Path, device: torch.device):
     """Export patch_encoder to ONNX format."""
     patch_encoder = predictor.monodepth_model.monodepth_predictor.encoder.patch_encoder
     dummy = torch.randn(35, 3, 384, 384, device=device, dtype=torch.float32)
-    export_onnx_model(
+    _export_onnx_model(
         patch_encoder, onnx_path, device, dummy,
         output_names=["features", "intermediates", "add_1197", "add_1785", "add_2373"],
     )
@@ -112,7 +112,7 @@ def export_image_encoder(predictor, onnx_path: Path, device: torch.device):
     if getattr(image_encoder, 'intermediate_features_ids', None) is None:
         image_encoder.intermediate_features_ids = [5, 11, 17, 23]
     dummy = torch.randn(1, 3, 384, 384, device=device, dtype=torch.float32)
-    export_onnx_model(
+    _export_onnx_model(
         image_encoder, onnx_path, device, dummy,
         output_names=["features", "intermediates", "add_1197", "add_1785", "add_2373"],
     )
@@ -397,8 +397,3 @@ def create_ort_image_encoder(
     except Exception as e:
         logger.warning("Image encoder ORT session creation failed: %s", e)
         return None
-
-
-# ── Backward compatibility alias ─────────────────────────────────────
-
-ORTPatchEncoder = ORTEncoder

@@ -18,8 +18,6 @@ Layout:
                       surface the tabs already use.
 """
 
-from __future__ import annotations
-
 import gc
 import multiprocessing as mp
 import time
