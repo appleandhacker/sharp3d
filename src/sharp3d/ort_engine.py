@@ -318,6 +318,11 @@ class ORTEncoder(nn.Module):
                 intermediates: dict {block_id: [batch, 577, 1024]}
                                (empty if ONNX model has 1 output)
         """
+        # torch.compile launches the patch-producing kernels asynchronously on
+        # PyTorch's stream, but ORT runs inference on its own separate stream.
+        # Without this full sync, ORT can read patches that are not yet fully
+        # produced → corrupted ViT features → intermittent blurry frames.
+        torch.cuda.synchronize()
         try:
             return self._forward_iobinding(x)
         except Exception as e:
