@@ -52,9 +52,9 @@ def resolve_av1(width: int = 0, height: int = 0) -> str | None:
 def av1_output_params(encoder: str, crf: int) -> list[str]:
     """ffmpeg output params for the given AV1 encoder at ~crf quality."""
     if encoder == "av1_nvenc":
-        # NVENC has no CRF; CQ mode is the closest analogue. CQ tracks the
-        # CRF setting 1:1 (default 26 -> CQ 26, the validated default).
-        return ["-rc", "vbr", "-cq", str(min(crf, 51)),
+        # NVENC has no CRF; QP mode is the closest analogue.
+        # ffmpeg 2026+ deprecated -cq (global_quality), use -qp instead.
+        return ["-rc", "vbr", "-qp", str(min(crf, 51)),
                 "-b:v", "0", "-preset", "p4"]
     if encoder == "libaom-av1":
         # libaom is very slow; raise encoding speed for near-realtime use.
@@ -130,14 +130,18 @@ class VideoWriter:
             if codec == "h265":
                 output_params.extend(["-tag:v", "hvc1"])
 
-        self.writer = imageio.get_writer(
-            str(self.tmp_path),
+        # nvenc uses -qp in output_params; passing quality= would add the
+        # deprecated -global_quality flag and trigger ffmpeg warnings/errors.
+        writer_kwargs = dict(
             fps=fps,
             codec=codec_lib,
-            quality=8,
             pixelformat="yuv420p",
             output_params=output_params,
         )
+        if "nvenc" not in codec_lib:
+            writer_kwargs["quality"] = 8
+
+        self.writer = imageio.get_writer(str(self.tmp_path), **writer_kwargs)
 
     def append_frame(self, frame: np.ndarray):
         """Append (H, W, 3) uint8 frame."""
