@@ -160,6 +160,9 @@ class _PipelineWorker:
 
         self._respond("status", ("正在编译预测器 (torch.compile)…",))
         torch._dynamo.config.capture_scalar_outputs = True
+        # ORT encoders are @torch.compiler.disable'd → graph breaks.
+        # CUDA Graph capture hangs on these breaks (same issue as FP8 testing).
+        torch._inductor.config.triton.cudagraphs = False
         self._compiled = torch.compile(predictor, mode="max-autotune", dynamic=False)
 
         from sharp3d.unproject import INTERNAL_SHAPE
