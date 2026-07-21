@@ -26,21 +26,18 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("sharp3d — 2D → 3D 立体转换")
 
-        # Adaptive initial size: fits any display (2K/4K) without exceeding
-        # screen bounds. Hard-capped to available geometry so it NEVER overflows.
+        # Adaptive initial size: fixed default clamped to 90% of screen,
+        # guaranteed to never exceed the available area.
         from PySide6.QtWidgets import QApplication
-        screen_geo = QApplication.primaryScreen().availableGeometry()
-        # Hard limit: window can never be larger than the screen
-        self.setMaximumSize(screen_geo.width(), screen_geo.height())
-        # Initial size: 70% width, 75% height, clamped to [860x580, 1800x1100]
-        w = max(860, min(int(screen_geo.width() * 0.70), 1800))
-        h = max(580, min(int(screen_geo.height() * 0.75), 1100))
-        self.resize(w, h)
-        # Center on screen
-        self.move(
-            screen_geo.x() + (screen_geo.width() - w) // 2,
-            screen_geo.y() + (screen_geo.height() - h) // 2,
-        )
+        from PySide6.QtCore import QRect
+        geo = QApplication.primaryScreen().availableGeometry()
+        # Default size, clamped so it always fits (90% of screen as hard cap)
+        w = min(1100, int(geo.width() * 0.90))
+        h = min(750, int(geo.height() * 0.90))
+        # Center within available area
+        x = geo.x() + (geo.width() - w) // 2
+        y = geo.y() + (geo.height() - h) // 2
+        self.setGeometry(QRect(x, y, w, h))
 
         self._theme = ThemeManager()
         self._engine = EngineProcess()
