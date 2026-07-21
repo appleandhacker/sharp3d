@@ -60,8 +60,18 @@ class _PipelineWorker:
             self._respond("error", (f"预加载失败: {exc}",))
 
     def _ensure_pipeline(self, perf_mode="quality"):
+        # Rebuild if mode changed
+        if self._pipeline is not None and getattr(self, '_perf_mode_active', None) != perf_mode:
+            self._respond("status", ("性能模式已切换，正在重建管线…",))
+            self._pipeline = None
+            self._compiled = None
+            import torch
+            torch._dynamo.reset()
+            torch.cuda.empty_cache()
+
         if self._pipeline is not None:
             return
+        self._perf_mode_active = perf_mode
         self._respond("model_loading", ())
         self._respond("status", ("正在加载 SHARP 模型权重…",))
 
