@@ -254,7 +254,7 @@ class _PipelineWorker:
                        prepare_input, fast_unproject, render_sbs,
                        INTERNAL_SHAPE, torch):
         from sharp3d.hdr import FrameReader, Hdr10Writer
-        from sharp3d.video import VideoWriter, resolve_av1
+        from sharp3d.video import VideoWriter, resolve_encoder
         from sharp3d.formats import output_size, pack as pack_stereo
 
         reader = FrameReader(path)
@@ -264,14 +264,18 @@ class _PipelineWorker:
         fmt = opts.get("format", "full_sbs")
         out_w, out_h = output_size(fmt, reader.width, reader.height)
 
-        # Tell the user when AV1 silently falls back to CPU encoding because
-        # the packed output is too large for the GPU encoder (NVENC caps at 8192).
-        if opts.get("codec") == "av1" and not opts.get("hdr_output", False):
-            enc = resolve_av1(out_w, out_h)
-            if enc and enc != "av1_nvenc":
+        # Show which encoder was selected (GPU vs CPU) for all codecs.
+        codec = opts.get("codec", "h264")
+        if not opts.get("hdr_output", False):
+            enc = resolve_encoder(codec, out_w, out_h)
+            is_gpu = "nvenc" in enc
+            label = "GPU" if is_gpu else "CPU"
+            self._respond("status", (
+                f"编码器: {enc} ({label}) · 输出 {out_w}×{out_h}",))
+            if not is_gpu:
                 self._respond("status", (
-                    f"输出 {out_w}×{out_h} 超过GPU编码上限，"
-                    f"AV1 改用CPU编码 ({enc})",))
+                    f"输出 {out_w}×{out_h} 超过NVENC分辨率上限，"
+                    f"已回退CPU编码 ({enc})，CPU占用会较高",))
 
         hdr_out = opts.get("hdr_output", False)
         if hdr_out:

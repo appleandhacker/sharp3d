@@ -40,6 +40,16 @@ VID_FILTER = "视频 (*.mp4 *.mkv *.avi *.mov *.webm);;所有文件 (*)"
 PREVIEW_WIDTH = 1280
 
 
+def _fmt_hms(seconds: float) -> str:
+    """Format seconds as H:MM:SS or M:SS (omit hours if zero)."""
+    s = int(round(seconds))
+    h, rem = divmod(s, 3600)
+    m, sec = divmod(rem, 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{sec:02d}"
+    return f"{m}:{sec:02d}"
+
+
 class SbsTab(QWidget):
     """Main 2D→3D SBS conversion workspace."""
 
@@ -353,7 +363,8 @@ class SbsTab(QWidget):
         elapsed = frame / fps if fps else 0.0
         remain = (total - frame) / fps if fps else 0.0
         self._prog_label.setText(
-            f"帧 {frame}/{total} · {fps:.2f} fps · 已用 {elapsed:.0f}s · 剩余 {remain:.0f}s"
+            f"帧 {frame}/{total} · {fps:.2f} fps · "
+            f"已用 {_fmt_hms(elapsed)} · 剩余 {_fmt_hms(remain)}"
         )
 
     def _on_convert_done(self, result: dict) -> None:

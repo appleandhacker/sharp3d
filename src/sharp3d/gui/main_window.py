@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QScreen
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -25,7 +25,17 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("sharp3d — 2D → 3D 立体转换")
-        self.resize(1180, 800)
+
+        # Adaptive initial size: fits any display (2K/4K) without exceeding
+        # screen bounds. 78% width, 82% height, clamped to sane min/max.
+        screen = QScreen.availableGeometry(self)
+        w = max(900, min(int(screen.width() * 0.78), 1920))
+        h = max(620, min(int(screen.height() * 0.82), 1200))
+        self.resize(w, h)
+        self.move(
+            screen.x() + (screen.width() - w) // 2,
+            screen.y() + (screen.height() - h) // 2,
+        )
 
         self._theme = ThemeManager()
         self._engine = EngineProcess()
