@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont, QScreen
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -28,13 +28,14 @@ class MainWindow(QMainWindow):
 
         # Adaptive initial size: fits any display (2K/4K) without exceeding
         # screen bounds. 78% width, 82% height, clamped to sane min/max.
-        screen = QScreen.availableGeometry(self)
-        w = max(900, min(int(screen.width() * 0.78), 1920))
-        h = max(620, min(int(screen.height() * 0.82), 1200))
+        from PySide6.QtWidgets import QApplication
+        screen_geo = QApplication.primaryScreen().availableGeometry()
+        w = max(900, min(int(screen_geo.width() * 0.78), 1920))
+        h = max(620, min(int(screen_geo.height() * 0.82), 1200))
         self.resize(w, h)
         self.move(
-            screen.x() + (screen.width() - w) // 2,
-            screen.y() + (screen.height() - h) // 2,
+            screen_geo.x() + (screen_geo.width() - w) // 2,
+            screen_geo.y() + (screen_geo.height() - h) // 2,
         )
 
         self._theme = ThemeManager()
