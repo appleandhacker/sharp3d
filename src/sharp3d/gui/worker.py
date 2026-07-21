@@ -20,6 +20,7 @@ Layout:
 
 import gc
 import multiprocessing as mp
+import os
 import time
 from pathlib import Path
 
@@ -163,11 +164,18 @@ class _PipelineWorker:
         # ORT encoders are @torch.compiler.disable'd → graph breaks.
         # CUDA Graph capture hangs on these breaks (same issue as FP8 testing).
         torch._inductor.config.triton.cudagraphs = False
-        # max-autotune spawns one worker per CPU core by default; each loads
-        # the model for benchmarking → 20+GB RAM + disk saturation on Windows.
-        # Single-threaded compile keeps memory flat (also avoids the Windows
-        # SubprocPool pass_fds issue).
-        torch._inductor.config.compile_threads = 1
+        # max-autotune spawns one worker per CPU core by default (32 on this
+        # machine); each loads the model for benchmarking → memory explosion.
+        # Auto-size the pool from available RAM (~3GB/worker, 4GB OS headroom)
+        # so compilation stays fast AND memory stays flat.
+        try:
+            import psutil
+            avail_gb = psutil.virtual_memory().available / 1e9
+            n_workers = max(1, min(os.cpu_count() or 1, int((avail_gb - 4) // 3)))
+        except Exception:
+            n_workers = 4  # safe fallback
+        torch._inductor.config.compile_threads = n_workers
+        self._respond("status", (f"编译线程: {n_workers}（按可用内存自动分配）",))
         # Coordinate-descent kernel tuning is the most memory/time-intensive
         # autotune phase for only marginal runtime gain — skip it.
         torch._inductor.config.coordinate_descent_tuning = False
@@ -610,6 +618,9 @@ def _child_main(req_q, resp_q, cancel_event):
     _cache_dir = _project_root / ".cache"
     _os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(_cache_dir / "inductor"))
     _os.environ.setdefault("TRITON_CACHE_DIR", str(_cache_dir / "triton"))
+    # Default 'subprocess' worker start uses pass_fds → crashes on Windows.
+    # 'spawn' enables safe multithreaded compilation (see compile_threads).
+    _os.environ.setdefault("TORCHINDUCTOR_WORKER_START", "spawn")
     _cache_dir.mkdir(parents=True, exist_ok=True)
 
     worker = _PipelineWorker(
