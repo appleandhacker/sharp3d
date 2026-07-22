@@ -31,7 +31,7 @@ class MainWindow(QMainWindow):
 
         # Window icon
         from pathlib import Path
-        icon_path = Path(__file__).resolve().parents[2] / "assets" / "sharp3d_icon.ico"
+        icon_path = Path(__file__).resolve().parents[3] / "assets" / "sharp3d_icon.ico"
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
 
