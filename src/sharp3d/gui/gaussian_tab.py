@@ -46,6 +46,7 @@ class OrbitView(QWidget):
 
     # ---- display --------------------------------------------------------
     def set_image(self, rgb: np.ndarray) -> None:
+        rgb = np.ascontiguousarray(rgb)
         h, w, ch = rgb.shape
         qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
         self._pixmap = QPixmap.fromImage(qimg.copy())
@@ -243,3 +244,14 @@ class GaussianViewerWindow(QMainWindow):
     def set_colors(self, c: Colors) -> None:
         self._colors = c
         self._view.set_colors(c)
+
+    # ---- lifecycle ------------------------------------------------------
+    def closeEvent(self, event) -> None:
+        """Disconnect engine signals to prevent crash on deleted Qt object."""
+        self._render_timer.stop()
+        try:
+            self._engine.ply_loaded.disconnect(self._on_ply_loaded)
+            self._engine.orbit_frame.disconnect(self._on_orbit_frame)
+        except RuntimeError:
+            pass  # already disconnected
+        super().closeEvent(event)

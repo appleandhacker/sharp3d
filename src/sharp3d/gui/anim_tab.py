@@ -289,7 +289,7 @@ class AnimTab(QWidget):
         )
         if not path:
             return
-        codec_map = {"H.264": "libx264", "H.265": "libx265", "AV1": "av1"}
+        codec_map = {"H.264": "h264", "H.265": "h265", "AV1": "av1"}
         codec = codec_map[self._codec.currentText()]
         fps = int(self._fps.currentText())
         self.status_message.emit(f"正在导出 {path} …")

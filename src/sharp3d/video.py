@@ -187,7 +187,7 @@ class VideoWriter:
     def _mux_audio(self, source: Path):
         """Mux audio from source video into output."""
         cmd = [
-            "ffmpeg", "-y",
+            FFMPEG, "-y",
             "-i", str(self.tmp_path),
             "-i", str(source),
             "-c:v", "copy",
