@@ -408,31 +408,18 @@ class _PipelineWorker:
         decoder = threading.Thread(target=_decode, daemon=True)
         decoder.start()
 
-        # Pipeline the host->device transfer too: prepare frame N+1 on a side
-        # stream (pinned non-blocking upload + resize) while frame N is being
-        # predicted/rendered on the main stream. Copy and compute use separate
-        # DMA/compute engines, so the transfer overlaps GPU work instead of
-        # serializing with it.
-        side_stream = torch.cuda.Stream()
-        main_stream = torch.cuda.current_stream()
-
-        def _prepare_async(frm):
-            with torch.cuda.stream(side_stream):
-                prepared = prepare_input(frm, f_px, self._device,
-                                         async_upload=True)
-                upload_done = side_stream.record_event()
-            # Wait for the copy on the CPU: the pinned host buffer is freed
-            # when prepare_input returns, so it must not be reused (by the
-            # next frame's pin_memory) while the async copy still reads it.
-            # This stalls only the CPU ~10ms — the GPU keeps rendering the
-            # previous frame; the side stream provides the real overlap.
-            upload_done.synchronize()
-            return prepared, upload_done
+        # Synchronous host->device transfer. The previous async version
+        # (pinned memory + non-blocking copy on a side stream) called
+        # upload_done.synchronize() right after, which already serialized the
+        # transfer — so it added side-stream/event complexity with no real
+        # overlap benefit. Sync upload is simpler and equally fast.
+        def _prepare(frm):
+            return prepare_input(frm, f_px, self._device, async_upload=False)
 
         i = 0
         first = frame_q.get()
         if first is not None and not self._cancel_event.is_set():
-            prepared, upload_done = _prepare_async(first)
+            prepared = _prepare(first)
             del first
 
             # Timing accumulators for bottleneck diagnosis
@@ -440,15 +427,13 @@ class _PipelineWorker:
             n_timed = 0
 
             while True:
-                # Fetch the next frame and kick off its prepare now, so its
-                # upload overlaps this frame's GPU pass.
+                # Fetch the next frame and prepare it (sync upload).
                 nxt = frame_q.get()
                 nxt_prepared = None
                 if nxt is not None and not self._cancel_event.is_set():
-                    nxt_prepared = _prepare_async(nxt)
+                    nxt_prepared = _prepare(nxt)
                 del nxt
 
-                main_stream.wait_event(upload_done)
                 img_r, df, ir, (w, h) = prepared
                 t0 = time.time()
 
@@ -499,7 +484,7 @@ class _PipelineWorker:
 
                 if nxt_prepared is None:
                     break
-                prepared, upload_done = nxt_prepared
+                prepared = nxt_prepared
 
         # Unblock the producer if it is parked on a full queue, then join.
         while True:
