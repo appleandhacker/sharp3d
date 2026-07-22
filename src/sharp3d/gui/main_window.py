@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -28,6 +28,12 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(f"sharp3d v{__version__}")
+
+        # Window icon
+        from pathlib import Path
+        icon_path = Path(__file__).resolve().parents[2] / "assets" / "sharp3d_icon.ico"
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
 
         # Adaptive initial size: proportional to logical screen (DPI-aware).
         from PySide6.QtWidgets import QApplication

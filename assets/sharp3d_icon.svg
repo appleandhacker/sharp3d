@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- Background: dark rounded square -->
+  <rect x="16" y="16" width="480" height="480" rx="96" ry="96" fill="#1a1a2e"/>
+  
+  <!-- Anaglyph 3D cube - cyan layer (offset right) -->
+  <g transform="translate(8, 0)" opacity="0.85">
+    <!-- Top face -->
+    <polygon points="256,100 380,172 256,244 132,172" fill="#00e5cc"/>
+    <!-- Left face -->
+    <polygon points="132,172 256,244 256,388 132,316" fill="#00b3a0"/>
+    <!-- Right face -->
+    <polygon points="380,172 256,244 256,388 380,316" fill="#009985"/>
+  </g>
+  
+  <!-- Anaglyph 3D cube - red layer (offset left) -->
+  <g transform="translate(-8, 0)" opacity="0.85">
+    <!-- Top face -->
+    <polygon points="256,100 380,172 256,244 132,172" fill="#ff3344"/>
+    <!-- Left face -->
+    <polygon points="132,172 256,244 256,388 132,316" fill="#cc2233"/>
+    <!-- Right face -->
+    <polygon points="380,172 256,244 256,388 380,316" fill="#aa1122"/>
+  </g>
+  
+  <!-- Center blend overlay for depth -->
+  <g opacity="0.3">
+    <polygon points="256,100 380,172 256,244 132,172" fill="#ffffff"/>
+  </g>
+  
+  <!-- Subtle edge highlights -->
+  <g stroke="#ffffff" stroke-width="2" fill="none" opacity="0.4">
+    <line x1="256" y1="100" x2="256" y2="244"/>
+    <line x1="256" y1="244" x2="256" y2="388"/>
+    <line x1="132" y1="172" x2="256" y2="244"/>
+    <line x1="380" y1="172" x2="256" y2="244"/>
+  </g>
+</svg>
