@@ -130,10 +130,11 @@ class GaussianViewerWindow(QMainWindow):
         self._colors = colors
         self._loaded = False
 
-        # Orbit state
-        self._azimuth = 0.0
+        # Orbit state (azimuth=180 → camera at -Z looking toward +Z = scene front)
+        self._azimuth = 180.0
         self._elevation = 0.0
         self._distance = 5.0
+        self._render_pending = False
 
         # Central viewport
         self._view = OrbitView(colors)
@@ -153,6 +154,12 @@ class GaussianViewerWindow(QMainWindow):
         self._info = QLabel("  未加载")
         tb.addWidget(self._info)
 
+        # Render throttle: accumulate deltas, render at most ~30fps
+        from PySide6.QtCore import QTimer
+        self._render_timer = QTimer(self)
+        self._render_timer.timeout.connect(self._do_render)
+        self._render_timer.setInterval(33)
+
         # Engine signals
         engine.ply_loaded.connect(self._on_ply_loaded)
         engine.orbit_frame.connect(self._on_orbit_frame)
@@ -166,20 +173,25 @@ class GaussianViewerWindow(QMainWindow):
             self._engine.load_ply(path)
 
     def _on_reset(self) -> None:
-        self._azimuth = 0.0
+        self._azimuth = 180.0
         self._elevation = 0.0
         self._distance = 5.0
-        self._render()
+        self._do_render()
 
     def _on_view_changed(self, d_azimuth: float, d_elevation: float,
                          d_distance: float) -> None:
         self._azimuth += d_azimuth
         self._elevation = max(-80.0, min(80.0, self._elevation + d_elevation))
         self._distance = max(1.0, min(30.0, self._distance + d_distance))
-        self._render()
+        # Throttle: start timer if not already running
+        if not self._render_timer.isActive():
+            self._render_timer.start()
 
-    def _render(self) -> None:
+    def _do_render(self) -> None:
+        """Called by throttle timer. Renders current view and stops timer
+        if no more pending changes (single-shot per drag burst)."""
         if not self._loaded:
+            self._render_timer.stop()
             return
         self._engine.render_orbit({
             "azimuth": self._azimuth,
@@ -187,16 +199,20 @@ class GaussianViewerWindow(QMainWindow):
             "distance": self._distance,
             "render_width": 960,
         })
+        # Keep timer running during active drag; it will be stopped
+        # when no new view_changed signals arrive within one interval.
+        # Use single-shot style: stop and let next view_changed restart it.
+        self._render_timer.stop()
 
     # ---- engine callbacks -----------------------------------------------
     def _on_ply_loaded(self, info: dict) -> None:
         self._loaded = True
         n = info.get("n_gaussians", 0)
         self._info.setText(f"  {n:,} 高斯点 · 拖拽旋转 · 滚轮缩放")
-        self._azimuth = 0.0
+        self._azimuth = 180.0
         self._elevation = 0.0
         self._distance = 5.0
-        self._render()
+        self._do_render()
 
     def _on_orbit_frame(self, frame) -> None:
         self._view.set_image(frame)
