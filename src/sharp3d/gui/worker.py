@@ -488,7 +488,6 @@ class _PipelineWorker:
                 vf_parts.append(f"fps={out_fps}")
             vf = ["-vf", ",".join(vf_parts)] if vf_parts else []
             cmd = [FFMPEG, *reader._hwaccel(),
-                   "-fflags", "+nobuffer",
                    "-i", reader.path, *vf,
                    "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
             proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.DEVNULL)
