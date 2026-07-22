@@ -174,21 +174,12 @@ class _PipelineWorker:
         # ORT encoders are @torch.compiler.disable'd → graph breaks.
         # CUDA Graph capture hangs on these breaks (same issue as FP8 testing).
         torch._inductor.config.triton.cudagraphs = False
-        # max-autotune spawns one worker per CPU core by default (32 on this
-        # machine); each loads the model for benchmarking → memory explosion.
-        # Auto-size the pool from available RAM (~3GB/worker, 4GB OS headroom)
-        # so compilation stays fast AND memory stays flat.
-        try:
-            import psutil
-            avail_gb = psutil.virtual_memory().available / 1e9
-            n_workers = max(1, min(os.cpu_count() or 1, int((avail_gb - 4) // 3)))
-        except Exception:
-            n_workers = 4  # safe fallback
-        torch._inductor.config.compile_threads = n_workers
-        # compile_threads>1 spawns worker subprocesses; the default 'subprocess'
-        # start method uses pass_fds which crashes on Windows. Force 'spawn'.
-        os.environ.setdefault("TORCHINDUCTOR_WORKER_START", "spawn")
-        self._respond("status", (f"编译线程: {n_workers}（按可用内存自动分配）",))
+        # compile_threads=1: multi-threaded compilation spawns worker processes
+        # that DON'T EXIT on Windows (spawn mode), permanently holding ~6.8GB
+        # RAM each. Since compilation is cached (TORCHINDUCTOR_CACHE_DIR), only
+        # the first run is slower; all subsequent runs load from cache instantly.
+        torch._inductor.config.compile_threads = 1
+        self._respond("status", ("编译中（单线程，结果已缓存）…",))
         # Coordinate-descent kernel tuning is the most memory/time-intensive
         # autotune phase for only marginal runtime gain — skip it.
         torch._inductor.config.coordinate_descent_tuning = False
@@ -407,20 +398,18 @@ class _PipelineWorker:
         # ── Output frame rate (None → keep source fps) ──
         out_fps = opts.get("out_fps") or reader.fps
 
-        # ── Frame-rate conversion: map output frames → source frames ──
-        # out_per_src[i] = how many output frames source frame i produces.
-        # out_fps < source → decimation (some source frames skipped → fewer
-        # frames converted → faster). out_fps > source → duplication.
+        # ── Frame-rate conversion ────────────────────────────────────────
+        # Use ffmpeg's fps filter to decimate/duplicate at decode time.
+        # This is critical for VRAM stability: the old approach decoded ALL
+        # source frames (NVDEC full speed) then discarded half in Python,
+        # causing memory pressure from unused frames flowing through the pipe.
+        # With the fps filter, ffmpeg only outputs the frames we actually need.
         src_fps = reader.fps or out_fps
-        if out_fps and src_fps and abs(out_fps - src_fps) > 1e-6:
+        needs_fps_change = (out_fps and src_fps and abs(out_fps - src_fps) > 1e-6)
+        if needs_fps_change:
             out_count = max(1, int(round(n * out_fps / src_fps)))
-            out_per_src = [0] * n
-            for j in range(out_count):
-                si = min(n - 1, int(round(j * src_fps / out_fps)))
-                out_per_src[si] += 1
         else:
             out_count = n
-            out_per_src = [1] * n
 
         # Show which encoder was selected (GPU vs CPU) for all codecs.
         codec = opts.get("codec", "h264")
@@ -446,21 +435,45 @@ class _PipelineWorker:
                                  crf=opts.get("crf", 18))
 
         # ── Decode prefetch thread ──────────────────────────────────────
-        # Queue of 4 frames balances decode prefetch against RAM pressure
-        # (4 × 4K frame ≈ 100MB). Larger queues risk pushing the system
-        # into swap when shared GPU memory already consumes most RAM.
+        # ffmpeg handles fps conversion via its fps filter, so the decode
+        # thread only produces frames that will actually be processed.
+        # Queue of 4 frames balances prefetch against RAM pressure.
         import queue as _queue
         import threading
+        import subprocess as _sp
 
         frame_q: _queue.Queue = _queue.Queue(maxsize=4)
+        frame_size = reader.width * reader.height * 3
 
         def _decode():
+            # Build ffmpeg command with optional fps filter for decimation.
+            # This replaces the old Python-side skip logic that caused VRAM
+            # growth (NVDEC decoded all frames, half were discarded unused).
+            from sharp3d.hdr import FFMPEG, hdr_to_sdr_filter
+            vf_parts = []
+            if reader.is_hdr:
+                vf_parts.append(hdr_to_sdr_filter())
+            if needs_fps_change:
+                vf_parts.append(f"fps={out_fps}")
+            vf = ["-vf", ",".join(vf_parts)] if vf_parts else []
+            cmd = [FFMPEG, *reader._hwaccel(),
+                   "-fflags", "+nobuffer",
+                   "-i", reader.path, *vf,
+                   "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+            proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.DEVNULL)
             try:
-                for frm in reader.stream_frames():
+                while True:
                     if self._cancel_event.is_set():
                         break
-                    frame_q.put(frm)
+                    raw = proc.stdout.read(frame_size)
+                    if len(raw) < frame_size:
+                        break
+                    frame_q.put(
+                        np.frombuffer(raw, dtype=np.uint8).reshape(
+                            reader.height, reader.width, 3).copy())
             finally:
+                proc.stdout.close()
+                proc.wait()
                 frame_q.put(None)
 
         decoder = threading.Thread(target=_decode, daemon=True)
@@ -469,33 +482,17 @@ class _PipelineWorker:
         def _prepare(frm):
             return prepare_input(frm, f_px, self._device, async_upload=False)
 
-        def _used_frames():
-            """Yield (frame_np, n_outputs) for each source frame kept in the
-            output (out_per_src[i] > 0); skipped frames are drained but not
-            yielded, so decimated frames cost nothing beyond decode."""
-            si = 0
-            while True:
-                frm = frame_q.get()
-                if frm is None:
-                    return
-                cnt = out_per_src[si] if si < len(out_per_src) else 0
-                si += 1
-                if cnt > 0:
-                    yield frm, cnt
-
         # ── Main conversion loop ────────────────────────────────────────
-        # Wall-clock timing: elapsed and avg_fps are computed from the real
-        # start time, NOT from instantaneous per-frame dt (which caused the
-        # timer to jump back and forth as frame times varied).
+        # Every frame from the queue is processed (ffmpeg already selected the
+        # correct frames via its fps filter). No Python-side skip logic.
         out_written = 0
         t_start = time.time()
         n_done = 0
-        used = _used_frames()
-        first = next(used, None)
+
+        first = frame_q.get()
         if first is not None and not self._cancel_event.is_set():
-            frm, cnt = first
-            prepared = _prepare(frm)
-            del frm
+            prepared = _prepare(first)
+            del first
 
             while True:
                 img_r, df, ir, (w, h) = prepared
@@ -513,14 +510,13 @@ class _PipelineWorker:
                 packed = pack_stereo(fmt, sbs)
                 torch.cuda.synchronize()
 
-                # ── Encode (write this frame `cnt` times) ───────────
+                # ── Encode ──────────────────────────────────────────
                 sbs_np = packed.cpu().numpy()
-                for _ in range(cnt):
-                    if hdr_out:
-                        writer.write_frame(sbs_np)
-                    else:
-                        writer.append_frame(sbs_np)
-                    out_written += 1
+                if hdr_out:
+                    writer.write_frame(sbs_np)
+                else:
+                    writer.append_frame(sbs_np)
+                out_written += 1
 
                 # Free GPU tensors immediately after encode to keep VRAM flat
                 del g, g_ndc, sbs, packed, img_r, prepared, sbs_np
@@ -532,23 +528,16 @@ class _PipelineWorker:
                               (out_written, out_count, avg_fps, elapsed))
 
                 # Periodic CPU GC every 30 frames prevents RAM accumulation.
-                # NOTE: deliberately NO torch.cuda.empty_cache() here — it forces
-                # a full device sync + allocator pool rebuild, which under tight
-                # VRAM caused progressive slowdown. Frame shapes are constant so
-                # the caching allocator reuses blocks naturally and VRAM stays flat.
                 if n_done % 30 == 0:
                     gc.collect()
 
                 if self._cancel_event.is_set():
                     break
 
-                # ── Fetch + prepare next frame (overlaps with encode I/O
-                #    settling; the GPU is free here so the H2D copy and
-                #    F.interpolate resize run without contention) ─────
-                nxt = next(used, None)
-                if nxt is None:
+                # ── Fetch + prepare next frame ──────────────────────
+                nxt_frm = frame_q.get()
+                if nxt_frm is None:
                     break
-                nxt_frm, cnt = nxt
                 prepared = _prepare(nxt_frm)
                 del nxt_frm
 
@@ -657,9 +646,6 @@ def _child_main(req_q, resp_q, cancel_event):
     _cache_dir = _project_root / ".cache"
     _os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(_cache_dir / "inductor"))
     _os.environ.setdefault("TRITON_CACHE_DIR", str(_cache_dir / "triton"))
-    # Default 'subprocess' worker start uses pass_fds → crashes on Windows.
-    # 'spawn' enables safe multithreaded compilation (see compile_threads).
-    _os.environ.setdefault("TORCHINDUCTOR_WORKER_START", "spawn")
     _cache_dir.mkdir(parents=True, exist_ok=True)
 
     worker = _PipelineWorker(

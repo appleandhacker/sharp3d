@@ -258,7 +258,9 @@ class FrameReader:
 
     def stream_frames(self):
         """Generator yielding all frames in order. For full conversion."""
-        cmd = [FFMPEG, *self._hwaccel(), "-i", self.path, *self._vf(),
+        cmd = [FFMPEG, *self._hwaccel(),
+               "-fflags", "+nobuffer",  # reduce demuxer read-ahead (~1.3GB RAM saved)
+               "-i", self.path, *self._vf(),
                "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL)
