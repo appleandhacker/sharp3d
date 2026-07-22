@@ -513,6 +513,11 @@ class _PipelineWorker:
         def _prepare(frm):
             return prepare_input(frm, f_px, self._device, async_upload=False)
 
+        # ── Temporal depth stabilization ─────────────────────────────────
+        from sharp3d.temporal import TemporalStabilizer
+        stab_mode = opts.get("temporal_stabilize", "off")
+        stab = TemporalStabilizer(mode=stab_mode, device=self._device)
+
         # ── Main conversion loop ────────────────────────────────────────
         # Every frame from the queue is processed (ffmpeg already selected the
         # correct frames via its fps filter). No Python-side skip logic.
@@ -531,6 +536,7 @@ class _PipelineWorker:
                 # ── Predict + unproject (GPU-bound, ~500ms) ─────────
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
                     g_ndc = self._compiled(img_r, df)
+                stab.stabilize(g_ndc)
                 g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
                                    INTERNAL_SHAPE, decompose_method=method)
 

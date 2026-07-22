@@ -216,6 +216,20 @@ class SbsTab(QWidget):
         self._decompose.addItems(["解析法 (快)", "SVD (参考)"])
         dec_row.addWidget(self._decompose, 1)
         adv_card.add_layout(dec_row)
+
+        stab_row = QHBoxLayout()
+        stab_row.addWidget(QLabel("深度稳定"))
+        self._stabilize = QComboBox()
+        self._stabilize.addItems(["关闭", "全局对齐", "自适应"])
+        self._stabilize.setToolTip(
+            "视频转换时消除帧间深度抖动（闪烁）。\n"
+            "关闭：不做处理，每帧独立。\n"
+            "全局对齐：帧间尺度对齐 + EMA 平滑，适合静态/慢速镜头。\n"
+            "自适应：逐像素置信度加权，保护运动物体不被拖影（推荐）。"
+        )
+        stab_row.addWidget(self._stabilize, 1)
+        adv_card.add_layout(stab_row)
+
         self._chk_depth = QCheckBox("同时输出深度图")
         self._chk_ply = QCheckBox("导出 PLY 高斯文件")
         adv_card.add_widget(self._chk_depth)
@@ -393,6 +407,8 @@ class SbsTab(QWidget):
             "out_fps": out_fps,
             "out_scale": out_scale,
             "out_width": out_width,
+            "temporal_stabilize": ["off", "global", "adaptive"][
+                self._stabilize.currentIndex()],
         }
 
     def _start_batch_item(self) -> None:
