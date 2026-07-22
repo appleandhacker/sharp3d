@@ -100,7 +100,7 @@ class SbsTab(QWidget):
                                     unit="m")
         self._s_strength = StereoSlider(c, "立体强度", 0.2, 2.5, 1.0,
                                         fmt="{:.2f}", unit="x")
-        conv_hint = QLabel("0 = 自动(25%前景突出) · 值越大前景突出越多")
+        conv_hint = QLabel("0 = 自动(50%前景突出) · 值越大前景突出越多")
         conv_hint.setProperty("cssClass", "hint")
         stereo_card.add_widget(self._s_ipd)
         stereo_card.add_widget(self._s_conv)

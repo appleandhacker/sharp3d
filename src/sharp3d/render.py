@@ -33,7 +33,7 @@ def linearRGB2sRGB(linearRGB: torch.Tensor) -> torch.Tensor:
 
 
 def _compute_focus_depth_gpu(means: torch.Tensor, min_depth_focus: float = 2.0,
-                             q_focus: float = 0.25) -> float:
+                             q_focus: float = 0.50) -> float:
     """Compute focus depth entirely on GPU (replaces CPU-bound _compute_depth_quantiles).
 
     Since screen_extrinsics is always identity, depth = z-coordinate.
@@ -41,9 +41,9 @@ def _compute_focus_depth_gpu(means: torch.Tensor, min_depth_focus: float = 2.0,
 
     q_focus: quantile of scene depths to place the convergence (screen) plane.
         Larger value → screen plane further back → more foreground pops out.
-        0.25 = 25% of geometry is in front of the screen (pops out),
-        75% is behind. Default 0.25 gives noticeable foreground pop without
-        excessive negative parallax.
+        0.50 = 50% of geometry is in front of the screen (pops out),
+        50% is behind. Default 0.50 gives strong foreground pop with
+        balanced depth distribution.
     """
     depth_values = means[:, 2]  # z-coordinate = depth (identity extrinsics)
     depth_values = depth_values[depth_values > 0]
