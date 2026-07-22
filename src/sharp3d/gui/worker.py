@@ -538,12 +538,20 @@ class _PipelineWorker:
         encode_thread = threading.Thread(target=_encode_loop, daemon=True)
         encode_thread.start()
 
-        # ── Temporal depth stabilization ─────────────────────────────────
-        from sharp3d.temporal import TemporalStabilizer, KalmanScalar
-        from sharp3d.render import _compute_focus_depth_gpu
+        # ── Conversion engine (predict + stabilize + render) ────────────
+        from sharp3d.conversion import VideoConversionEngine
         stab_mode = opts.get("temporal_stabilize", "off")
-        stab = TemporalStabilizer(mode=stab_mode, device=self._device)
-        conv_kf = KalmanScalar(q_pos=0.05, q_vel=0.02, r=0.15)
+        engine = VideoConversionEngine(
+            predict_fn=self._compiled,
+            device=self._device,
+            f_px=f_px,
+            fmt=fmt,
+            ipd=ipd_scene,
+            convergence=conv,
+            decompose_method=method,
+            stabilize_mode=stab_mode,
+            render_width=render_w,
+        )
 
         # ── Main conversion loop ────────────────────────────────────────
         # Every frame from the queue is processed (ffmpeg already selected the
@@ -561,37 +569,14 @@ class _PipelineWorker:
                 while True:
                     img_r, df, ir, (w, h) = prepared
 
-                    # ── Predict + unproject (GPU-bound, ~500ms) ─────────
-                    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-                        g_ndc = self._compiled(img_r, df)
-                    stab.stabilize(g_ndc, img=img_r)
-                    g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
-                                       INTERNAL_SHAPE, decompose_method=method)
-                    del g_ndc  # free NDC gaussians early (~28MB)
-
-                    # ── Convergence smoothing (anti-flicker) ────────────
-                    # Auto-convergence per-frame quantile jumps cause global
-                    # horizontal shift. Kalman filter tracks the true convergence
-                    # with minimal lag while rejecting per-frame jitter.
-                    frame_conv = conv
-                    if conv is None:
-                        focus = _compute_focus_depth_gpu(g.mean_vectors)
-                        frame_conv = conv_kf.update(focus)
-
-                    # ── Render + pack (GPU) ─────────────────────────────
-                    sbs, _ = render_sbs(g, f_px, w, h,
-                                        ipd=ipd_scene, convergence=frame_conv,
-                                        render_width=render_w)
-                    packed = pack_stereo(fmt, sbs)
-                    torch.cuda.synchronize()
+                    # ── GPU pipeline (predict→stabilize→render→pack) ──
+                    sbs_np = engine.process_frame(img_r, df, ir, (w, h))
 
                     # ── Encode (async via encode thread) ────────────
-                    sbs_np = packed.cpu().numpy()
                     encode_q.put((sbs_np, hdr_out))
                     out_written += 1
 
-                    # Free GPU tensors immediately after encode to keep VRAM flat
-                    del g, sbs, packed, img_r, prepared, sbs_np
+                    del img_r, prepared, sbs_np
 
                     n_done += 1
                     elapsed = time.time() - t_start
