@@ -72,186 +72,27 @@ class _PipelineWorker:
             return
         self._perf_mode_active = perf_mode
         self._respond("model_loading", ())
-        self._respond("model_load_progress", ("加载模型权重", 8))
-        self._respond("status", ("正在加载 SHARP 模型权重…",))
 
         import torch
-        from sharp.models import PredictorParams, create_predictor
+        from sharp3d.predict import SharpPredictor
+        from pathlib import Path as _P
 
         self._device = torch.device("cuda")
-
-        # ── Fast model loading with FP16 cache ────────────────────────
-        # First run: download FP32 checkpoint via torch.hub, save FP16 copy.
-        # Subsequent runs: load FP16 directly (half disk I/O, no conversion).
-        # mmap=True memory-maps the file (avoids reading 1.2GB into RAM first).
-        from pathlib import Path as _P
-        _fp16_ckpt = _P(__file__).resolve().parents[3] / ".cache" / "sharp_fp16.pt"
-        if _fp16_ckpt.exists():
-            state_dict = torch.load(str(_fp16_ckpt), map_location="cpu",
-                                    mmap=True, weights_only=True)
-            _already_fp16 = True
-        else:
-            state_dict = torch.hub.load_state_dict_from_url(
-                "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt",
-                progress=False, map_location="cpu",
-            )
-            _already_fp16 = False
-
-        params = PredictorParams()
-        if perf_mode == "speed":
-            params.monodepth.use_patch_overlap = False
-            self._respond("status", ("速度模式：21 patches（精简金字塔）",))
-        predictor = create_predictor(params)
-        predictor.load_state_dict(state_dict)
-        del state_dict
-        predictor.eval().to(self._device)
         self._torch = torch
+        cache_dir = _P(__file__).resolve().parents[3] / ".cache"
 
-        # Save FP16 cache for next startup (one-time, ~600MB file)
-        if not _already_fp16:
-            try:
-                _fp16_ckpt.parent.mkdir(parents=True, exist_ok=True)
-                torch.save({k: v.half() for k, v in predictor.state_dict().items()},
-                           str(_fp16_ckpt))
-            except Exception:
-                pass  # non-critical
+        def _progress(stage, pct):
+            self._respond("model_load_progress", (stage, pct))
+            self._respond("status", (stage + "…",))
 
-        # Apply channels_last memory format for Conv2d layers (lossless speedup)
-        # Modern GPUs process NHWC layout more efficiently than NCHW.
-        try:
-            n_converted = 0
-            for mod in predictor.modules():
-                if isinstance(mod, (torch.nn.Conv2d, torch.nn.ConvTranspose2d)):
-                    mod.weight.data = mod.weight.data.to(
-                        memory_format=torch.channels_last)
-                    n_converted += 1
-            if n_converted:
-                self._respond("status", (
-                    f"channels_last 已启用（{n_converted} 个卷积层）",))
-        except Exception:
-            pass  # Non-critical, silently skip
-
-        # Try ORT TensorRT acceleration for patch_encoder + image_encoder
-        try:
-            from sharp3d.ort_engine import (
-                create_ort_patch_encoder, create_ort_image_encoder)
-            spn = predictor.monodepth_model.monodepth_predictor.encoder
-            use_int8 = (perf_mode == "speed")
-
-            ort_enc = create_ort_patch_encoder(predictor, self._device,
-                                               int8_enable=use_int8)
-            if ort_enc is not None:
-                spn.patch_encoder = ort_enc
-                mode = "INT8" if use_int8 else "FP16"
-                self._respond("status", (
-                    f"patch_encoder: TensorRT {mode} + IO Binding",))
-
-            ort_img = create_ort_image_encoder(predictor, self._device,
-                                               int8_enable=use_int8)
-            if ort_img is not None:
-                spn.image_encoder = ort_img
-                self._respond("status", (
-                    f"image_encoder: TensorRT + IO Binding",))
-        except Exception:
-            pass  # Fallback to PyTorch
-
-        # Convert remaining PyTorch weights to FP16 AFTER ORT export (export
-        # needs FP32 model + FP32 dummy input). ORT encoders have no PyTorch
-        # parameters so .half() is a no-op on them. Saves ~1.5GB VRAM.
-        # Skip if already loaded from FP16 cache.
-        if not _already_fp16:
-            predictor.half()
-        self._respond("status", ("模型权重 FP16（节省 ~1.5GB 显存）",))
-
-        self._pipeline = predictor
-
-        # ── Detect cache state for accurate progress messages ─────────
-        from pathlib import Path as _Path
-        _project_root = _Path(__file__).resolve().parents[3]
-        _cache_dir = _project_root / ".cache"
-        _trt_cached = (_cache_dir / "trt_v3").exists() and any(
-            (_cache_dir / "trt_v3").glob("*.engine"))
-        _inductor_cached = (_cache_dir / "inductor").exists() and any(
-            (_cache_dir / "inductor").rglob("*.py"))
-        _triton_cached = (_cache_dir / "triton").exists() and any(
-            (_cache_dir / "triton").rglob("*.so")) or any(
-            (_cache_dir / "triton").rglob("*.ptx"))
-        is_warm = _trt_cached and _inductor_cached
-
-        # ── Pre-build TensorRT engines (before torch.compile) ─────────
-        try:
-            spn = predictor.monodepth_model.monodepth_predictor.encoder
-            if hasattr(spn.patch_encoder, '_session'):
-                n_patches = 35 if params.monodepth.use_patch_overlap else 21
-                self._respond("model_load_progress", ("TensorRT 引擎", 35))
-                if _trt_cached:
-                    self._respond("status", ("加载 TensorRT 缓存引擎…",))
-                else:
-                    self._respond("status", (
-                        f"首次构建 TensorRT 引擎（{n_patches} patches，约30秒）…",))
-                dummy_patches = torch.zeros(
-                    n_patches, 3, 384, 384, device=self._device)
-                with torch.no_grad():
-                    spn.patch_encoder(dummy_patches)
-                torch.cuda.synchronize()
-                del dummy_patches
-            if hasattr(spn.image_encoder, '_session'):
-                dummy_img_enc = torch.zeros(1, 3, 384, 384, device=self._device)
-                with torch.no_grad():
-                    spn.image_encoder(dummy_img_enc)
-                torch.cuda.synchronize()
-                del dummy_img_enc
-        except Exception:
-            pass
-
-        # ── torch.compile ─────────────────────────────────────────────
-        self._respond("model_load_progress", ("编译预测器", 55))
-        if _inductor_cached:
-            self._respond("status", ("加载编译缓存（约10秒）…",))
-        else:
-            self._respond("status", ("首次编译预测器（约45秒，结果将缓存）…",))
-        torch._dynamo.config.capture_scalar_outputs = True
-        torch._inductor.config.triton.cudagraphs = False
-        torch._inductor.config.compile_threads = 1
-        torch._inductor.config.coordinate_descent_tuning = False
-        self._compiled = torch.compile(predictor, mode="max-autotune", dynamic=False)
-
-        # ── Warmup inference (triggers kernel compilation/load) ───────
-        from sharp3d.unproject import INTERNAL_SHAPE
-        dummy_img = torch.zeros(1, 3, *INTERNAL_SHAPE, device=self._device)
-        dummy_df = torch.tensor([1.0], device=self._device, dtype=torch.float32)
-        self._respond("model_load_progress", ("预热推理", 75))
-        self._respond("status", ("预热推理…",))
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-            g_ndc = self._compiled(dummy_img, dummy_df)
-        torch.cuda.synchronize()
-
-        # ── gsplat render kernel warmup (skip if triton cache exists) ──
-        if not _triton_cached:
-            self._respond("model_load_progress", ("编译渲染内核", 90))
-            self._respond("status", ("首次编译渲染内核（约15秒）…",))
-            try:
-                from sharp3d.unproject import fast_unproject
-                from sharp3d.render import render_sbs
-                f = INTERNAL_SHAPE[1] * 1.2
-                ir = torch.tensor([
-                    [f, 0, (INTERNAL_SHAPE[1] - 1) / 2.0, 0],
-                    [0, f, (INTERNAL_SHAPE[0] - 1) / 2.0, 0],
-                    [0, 0, 1, 0],
-                    [0, 0, 0, 1],
-                ], dtype=torch.float32, device=self._device)
-                g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
-                                   INTERNAL_SHAPE, decompose_method="analytical")
-                render_sbs(g, f, INTERNAL_SHAPE[1], INTERNAL_SHAPE[0],
-                           ipd=0.063, render_width=320)
-                torch.cuda.synchronize()
-                del g, ir
-            except Exception:  # noqa: BLE001
-                pass
-        del dummy_img, dummy_df, g_ndc
-        torch.cuda.empty_cache()
-
-        self._respond("model_load_progress", ("就绪", 100))
+        sp = SharpPredictor(
+            device=self._device,
+            perf_mode=perf_mode,
+            cache_dir=cache_dir,
+            progress_cb=_progress,
+        )
+        self._pipeline = sp.predictor
+        self._compiled = sp  # SharpPredictor is callable (predict_fn)
         self._respond("model_ready", ())
         self._respond("status", ("模型就绪",))
 
