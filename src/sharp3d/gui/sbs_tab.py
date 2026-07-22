@@ -220,12 +220,21 @@ class SbsTab(QWidget):
         stab_row = QHBoxLayout()
         stab_row.addWidget(QLabel("深度稳定"))
         self._stabilize = QComboBox()
-        self._stabilize.addItems(["关闭", "全局对齐", "自适应"])
+        self._stabilize.addItems([
+            "关闭",
+            "全局对齐 (静态镜头)",
+            "自适应 (推荐)",
+            "光流 (最佳质量)",
+        ])
         self._stabilize.setToolTip(
-            "视频转换时消除帧间深度抖动（闪烁）。\n"
-            "关闭：不做处理，每帧独立。\n"
-            "全局对齐：帧间尺度对齐 + EMA 平滑，适合静态/慢速镜头。\n"
-            "自适应：逐像素置信度加权，保护运动物体不被拖影（推荐）。"
+            "视频转换时消除帧间深度抖动（元素左右跳动/闪烁）。\n\n"
+            "关闭：不做处理，每帧独立预测（默认）。\n"
+            "全局对齐：帧间尺度对齐 + EMA 平滑。开销极小(~1ms)，\n"
+            "  适合静态/慢速平移镜头，快速运动物体可能拖影。\n"
+            "自适应：逐像素置信度加权 EMA。开销极小(~2ms)，\n"
+            "  静态区域强平滑，运动物体自动保护，推荐大多数场景。\n"
+            "光流：RAFT 光流 warp + 遮挡检测。开销较大(~50ms)，\n"
+            "  逐像素运动补偿，处理前景/背景独立运动和遮挡，质量最佳。"
         )
         stab_row.addWidget(self._stabilize, 1)
         adv_card.add_layout(stab_row)
@@ -407,7 +416,7 @@ class SbsTab(QWidget):
             "out_fps": out_fps,
             "out_scale": out_scale,
             "out_width": out_width,
-            "temporal_stabilize": ["off", "global", "adaptive"][
+            "temporal_stabilize": ["off", "global", "adaptive", "flow"][
                 self._stabilize.currentIndex()],
         }
 

@@ -536,7 +536,7 @@ class _PipelineWorker:
                 # ── Predict + unproject (GPU-bound, ~500ms) ─────────
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
                     g_ndc = self._compiled(img_r, df)
-                stab.stabilize(g_ndc)
+                stab.stabilize(g_ndc, img=img_r)
                 g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
                                    INTERNAL_SHAPE, decompose_method=method)
 

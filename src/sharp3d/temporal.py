@@ -8,28 +8,31 @@ Modes:
     off      – passthrough, no stabilization.
     global   – global scale-shift alignment + EMA blend.
     adaptive – per-pixel confidence-weighted EMA (protects moving objects).
+    flow     – optical flow warp + occlusion-aware blend (best quality).
 """
 
 import torch
+import torch.nn.functional as F
 
 
 class TemporalStabilizer:
     """Frame-to-frame depth stabilizer for the video conversion loop.
 
     Usage:
-        stab = TemporalStabilizer(mode="adaptive", alpha=0.35, device=device)
+        stab = TemporalStabilizer(mode="adaptive", device=device)
         for each frame:
             g_ndc = predictor(img)
-            stab.stabilize(g_ndc)   # modifies g_ndc.mean_vectors in-place
+            stab.stabilize(g_ndc, img=img_tensor)  # img needed for flow mode
             g = fast_unproject(g_ndc, ...)
     """
 
     def __init__(self, mode: str = "off", alpha: float = 0.35,
                  sigma: float = 0.02, cut_threshold: float = 0.08,
+                 flow_resolution: int = 384,
                  device: torch.device | None = None):
         """
         Args:
-            mode: "off", "global", or "adaptive".
+            mode: "off", "global", "adaptive", or "flow".
             alpha: EMA blend factor for the *aligned current* frame.
                    Lower = more smoothing (more temporal coherence, more ghosting).
                    Higher = less smoothing (less ghosting, more residual flicker).
@@ -38,33 +41,61 @@ class TemporalStabilizer:
                    Smaller = stricter (only very stable pixels get smoothed).
             cut_threshold: Mean absolute residual above which a scene cut is
                            declared and temporal state is reset.
+            flow_resolution: Internal resolution for RAFT flow estimation.
+                             Lower = faster but less accurate. 384 is a good
+                             balance (~15ms on RTX 5070 Ti).
             device: CUDA device for state tensors.
         """
         self.mode = mode
         self.alpha = alpha
         self.sigma = sigma
         self.cut_threshold = cut_threshold
+        self.flow_resolution = flow_resolution
         self._device = device
 
         # State: previous frame's stabilized z (flattened) and spatial shape.
         self._prev_z: torch.Tensor | None = None
-        self._shape: tuple[int, ...] | None = None  # (H, W, L)
+        self._shape: tuple[int, ...] | None = None  # (L, H, W)
+
+        # Flow mode state.
+        self._prev_img: torch.Tensor | None = None  # (1, 3, flow_res, flow_res)
+        self._flow_model = None
 
     def reset(self) -> None:
         """Clear temporal state (call at video start or after scene cut)."""
         self._prev_z = None
         self._shape = None
+        self._prev_img = None
+
+    def _ensure_flow_model(self) -> None:
+        """Lazy-load RAFT model on first use."""
+        if self._flow_model is not None:
+            return
+        from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
+        weights = Raft_Large_Weights.DEFAULT
+        self._flow_model = raft_large(weights=weights).to(self._device).eval()
+        self._flow_transforms = weights.transforms()
 
     @torch.no_grad()
-    def stabilize(self, g_ndc) -> None:
+    def stabilize(self, g_ndc, img: torch.Tensor | None = None) -> None:
         """Stabilize the z-component of g_ndc.mean_vectors in-place.
 
         Args:
             g_ndc: Gaussians3D with mean_vectors (N, 3) in NDC space.
+            img: (1, 3, H, W) float tensor [0,1] — required for flow mode.
         """
         if self.mode == "off":
             return
 
+        if self.mode == "flow":
+            self._stabilize_flow(g_ndc, img)
+        else:
+            self._stabilize_ema(g_ndc)
+
+    # ─── EMA-based methods (global / adaptive) ────────────────────────────
+
+    def _stabilize_ema(self, g_ndc) -> None:
+        """Global or adaptive EMA stabilization."""
         z = g_ndc.mean_vectors[:, 2]  # (N,) depth in NDC
         N = z.numel()
 
@@ -75,7 +106,6 @@ class TemporalStabilizer:
             return
 
         # ── Scale-shift alignment ────────────────────────────────────────
-        # Solve: s * z_curr + t ≈ z_prev  (least squares, 2x2 normal eq.)
         prev = self._prev_z
         x = z
         y = prev
@@ -86,16 +116,13 @@ class TemporalStabilizer:
         sy = y.sum()
         n = torch.tensor(float(N), device=z.device, dtype=z.dtype)
 
-        # Normal equations: [[sxx, sx], [sx, n]] @ [s, t] = [sxy, sy]
         det = sxx * n - sx * sx
         if det.abs() < 1e-12:
-            # Degenerate (constant depth) — skip alignment.
             self._prev_z = z.clone()
             return
 
         s = (sxy * n - sx * sy) / det
         t = (sxx * sy - sx * sxy) / det
-
         z_aligned = s * z + t
 
         # ── Scene cut detection ──────────────────────────────────────────
@@ -103,7 +130,6 @@ class TemporalStabilizer:
         mean_residual = residual.mean()
 
         if mean_residual > self.cut_threshold:
-            # Scene cut: reset state, use raw prediction.
             self._prev_z = z.clone()
             return
 
@@ -112,25 +138,180 @@ class TemporalStabilizer:
             z_out = self.alpha * z_aligned + (1.0 - self.alpha) * prev
         else:
             # Adaptive: per-pixel confidence weighting.
-            # Pixels with low residual (static background) → strong smoothing.
-            # Pixels with high residual (moving objects) → weak smoothing.
             confidence = torch.exp(-residual / max(self.sigma, 1e-6))
-            # Blend: confidence gates between smoothed and raw.
             z_smooth = self.alpha * z_aligned + (1.0 - self.alpha) * prev
             z_out = confidence * z_smooth + (1.0 - confidence) * z
 
-        # Write back in-place.
         g_ndc.mean_vectors[:, 2] = z_out
         self._prev_z = z_out.clone()
 
-    def _infer_shape(self, N: int) -> None:
-        """Infer spatial shape (H, W, L) from total element count."""
-        # SHARP: 1536x1536 with num_layers (typically 2).
-        # N = H * W * L
-        if N == 1536 * 1536 * 2:
-            self._shape = (1536, 1536, 2)
-        elif N == 1536 * 1536:
-            self._shape = (1536, 1536, 1)
+    # ─── Optical flow warp method ─────────────────────────────────────────
+
+    def _stabilize_flow(self, g_ndc, img: torch.Tensor | None) -> None:
+        """Flow-based stabilization with occlusion-aware blending."""
+        if img is None:
+            # Fallback to global EMA if no image provided.
+            self._stabilize_ema(g_ndc)
+            return
+
+        z = g_ndc.mean_vectors[:, 2]  # (N,)
+        N = z.numel()
+
+        # Prepare current frame at flow resolution.
+        curr_img = F.interpolate(img, size=(self.flow_resolution,
+                                            self.flow_resolution),
+                                 mode="bilinear", align_corners=False)
+
+        # First frame: store and return.
+        if self._prev_z is None or self._prev_img is None:
+            self._prev_z = z.clone()
+            self._prev_img = curr_img
+            self._infer_shape(N)
+            return
+
+        self._ensure_flow_model()
+
+        # ── Compute bidirectional flow ───────────────────────────────────
+        # RAFT expects [0, 255] range.
+        prev_255 = self._prev_img * 255.0
+        curr_255 = curr_img * 255.0
+
+        flow_fwd = self._flow_model(prev_255, curr_255)[-1]   # (1, 2, Hf, Wf)
+        flow_bwd = self._flow_model(curr_255, prev_255)[-1]   # (1, 2, Hf, Wf)
+
+        # ── Occlusion detection (forward-backward consistency) ───────────
+        # Warp backward flow to forward frame's coordinate system.
+        flow_bwd_warped = self._warp_flow(flow_bwd, flow_fwd)
+        cycle_err = (flow_fwd + flow_bwd_warped).norm(dim=1, keepdim=True)
+        # Also check if warped coordinates fall outside the image.
+        occ_mask = cycle_err > 2.0  # (1, 1, Hf, Wf) — True = occluded
+
+        # ── Upsample flow + occlusion to full z resolution ───────────────
+        L, H, W = self._shape  # e.g. (2, 1536, 1536)
+        scale_h = H / self.flow_resolution
+        scale_w = W / self.flow_resolution
+
+        # Scale flow values to full resolution.
+        flow_full = F.interpolate(flow_fwd, size=(H, W), mode="bilinear",
+                                  align_corners=False)
+        flow_full[:, 0] *= scale_w  # x displacement
+        flow_full[:, 1] *= scale_h  # y displacement
+
+        occ_full = F.interpolate(occ_mask.float(), size=(H, W),
+                                 mode="nearest").bool()  # (1, 1, H, W)
+
+        # ── Warp previous z using flow ───────────────────────────────────
+        prev_z_spatial = self._prev_z.reshape(L, H, W)  # (L, H, W)
+        z_spatial = z.reshape(L, H, W)
+
+        # Build sampling grid.
+        gy, gx = torch.meshgrid(
+            torch.arange(H, device=z.device, dtype=torch.float32),
+            torch.arange(W, device=z.device, dtype=torch.float32),
+            indexing="ij",
+        )
+        # flow_full is (1, 2, H, W): channel 0 = dx, channel 1 = dy.
+        sample_x = gx[None] + flow_full[:, 0]  # (1, H, W)
+        sample_y = gy[None] + flow_full[:, 1]  # (1, H, W)
+
+        # Normalize to [-1, 1] for grid_sample.
+        sample_x = 2.0 * sample_x / (W - 1) - 1.0
+        sample_y = 2.0 * sample_y / (H - 1) - 1.0
+        grid = torch.stack([sample_x, sample_y], dim=-1)  # (1, H, W, 2)
+
+        # Warp each layer.
+        warped_z = torch.empty_like(z_spatial)
+        for layer in range(L):
+            src = prev_z_spatial[layer].unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+            warped = F.grid_sample(src, grid, mode="bilinear",
+                                   padding_mode="border", align_corners=True)
+            warped_z[layer] = warped.squeeze(0).squeeze(0)
+
+        # ── Scale-shift alignment on warped result ───────────────────────
+        # Align current z to warped prev (removes residual global drift).
+        # valid mask is per-pixel (H, W), expand to (L*H*W) for layer-major z.
+        valid = ~occ_full.squeeze(0).squeeze(0)  # (H, W)
+        valid_flat = valid.reshape(-1).repeat(L)  # (L*H*W,)
+
+        z_flat = z_spatial.reshape(-1)
+        warped_flat = warped_z.reshape(-1)
+
+        if valid_flat.sum() > 100:
+            xv = z_flat[valid_flat]
+            yv = warped_flat[valid_flat]
+            sx = xv.sum()
+            sxx = (xv * xv).sum()
+            sxy = (xv * yv).sum()
+            sy = yv.sum()
+            nv = torch.tensor(float(xv.numel()), device=z.device, dtype=z.dtype)
+            det = sxx * nv - sx * sx
+            if det.abs() > 1e-12:
+                s = (sxy * nv - sx * sy) / det
+                t = (sxx * sy - sx * sxy) / det
+                z_aligned = s * z_flat + t
+            else:
+                z_aligned = z_flat
         else:
-            # Fallback: treat as flat.
-            self._shape = (N,)
+            z_aligned = z_flat
+
+        # ── Scene cut detection ──────────────────────────────────────────
+        if valid_flat.sum() > 100:
+            res = (z_aligned[valid_flat] - warped_flat[valid_flat]).abs().mean()
+            if res > self.cut_threshold:
+                self._prev_z = z.clone()
+                self._prev_img = curr_img
+                return
+
+        # ── Occlusion-aware blend ────────────────────────────────────────
+        # Non-occluded: blend aligned current with warped prev.
+        # Occluded: use raw current (no valid correspondence).
+        # occ_full is (1,1,H,W) → flatten to (H*W,), then expand to (L*H*W,)
+        # since z layout is layer-major: [layer0_all_pixels, layer1_all_pixels].
+        occ_pixel = occ_full.squeeze().reshape(-1)  # (H*W,)
+        occ_flat = occ_pixel.repeat(L)  # (L*H*W,)
+
+        z_out = torch.empty_like(z_flat)
+        # Where occluded: raw prediction.
+        z_out[occ_flat] = z_flat[occ_flat]
+        # Where visible: EMA blend.
+        vis = ~occ_flat
+        z_out[vis] = (self.alpha * z_aligned[vis]
+                      + (1.0 - self.alpha) * warped_flat[vis])
+
+        g_ndc.mean_vectors[:, 2] = z_out
+        self._prev_z = z_out.clone()
+        self._prev_img = curr_img
+
+    @staticmethod
+    def _warp_flow(flow: torch.Tensor, flow_ref: torch.Tensor) -> torch.Tensor:
+        """Warp flow field using another flow field (for fb-consistency).
+
+        Args:
+            flow: (1, 2, H, W) flow to warp.
+            flow_ref: (1, 2, H, W) reference flow defining sampling locations.
+        Returns:
+            Warped flow (1, 2, H, W).
+        """
+        _, _, H, W = flow.shape
+        gy, gx = torch.meshgrid(
+            torch.arange(H, device=flow.device, dtype=torch.float32),
+            torch.arange(W, device=flow.device, dtype=torch.float32),
+            indexing="ij",
+        )
+        sample_x = gx[None] + flow_ref[:, 0]
+        sample_y = gy[None] + flow_ref[:, 1]
+        sample_x = 2.0 * sample_x / (W - 1) - 1.0
+        sample_y = 2.0 * sample_y / (H - 1) - 1.0
+        grid = torch.stack([sample_x, sample_y], dim=-1)  # (1, H, W, 2)
+        warped = F.grid_sample(flow, grid, mode="bilinear",
+                               padding_mode="border", align_corners=True)
+        return warped
+
+    def _infer_shape(self, N: int) -> None:
+        """Infer spatial shape (L, H, W) from total element count."""
+        if N == 1536 * 1536 * 2:
+            self._shape = (2, 1536, 1536)
+        elif N == 1536 * 1536:
+            self._shape = (1, 1536, 1536)
+        else:
+            self._shape = (1, 1, N)
