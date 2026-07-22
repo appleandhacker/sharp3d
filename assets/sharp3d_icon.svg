@@ -2,8 +2,8 @@
   <!-- Background: dark rounded square -->
   <rect x="16" y="16" width="480" height="480" rx="96" ry="96" fill="#1a1a2e"/>
   
-  <!-- Anaglyph 3D cube - cyan layer (offset right) -->
-  <g transform="translate(8, 0)" opacity="0.85">
+  <!-- Anaglyph 3D cube - cyan layer (offset right, wider separation) -->
+  <g transform="translate(18, 0)" opacity="0.82">
     <!-- Top face -->
     <polygon points="256,100 380,172 256,244 132,172" fill="#00e5cc"/>
     <!-- Left face -->
@@ -12,8 +12,8 @@
     <polygon points="380,172 256,244 256,388 380,316" fill="#009985"/>
   </g>
   
-  <!-- Anaglyph 3D cube - red layer (offset left) -->
-  <g transform="translate(-8, 0)" opacity="0.85">
+  <!-- Anaglyph 3D cube - red layer (offset left, wider separation) -->
+  <g transform="translate(-18, 0)" opacity="0.75">
     <!-- Top face -->
     <polygon points="256,100 380,172 256,244 132,172" fill="#ff3344"/>
     <!-- Left face -->
@@ -22,13 +22,8 @@
     <polygon points="380,172 256,244 256,388 380,316" fill="#aa1122"/>
   </g>
   
-  <!-- Center blend overlay for depth -->
-  <g opacity="0.3">
-    <polygon points="256,100 380,172 256,244 132,172" fill="#ffffff"/>
-  </g>
-  
-  <!-- Subtle edge highlights -->
-  <g stroke="#ffffff" stroke-width="2" fill="none" opacity="0.4">
+  <!-- Subtle edge highlights (center, no offset) -->
+  <g stroke="#ffffff" stroke-width="2" fill="none" opacity="0.35">
     <line x1="256" y1="100" x2="256" y2="244"/>
     <line x1="256" y1="244" x2="256" y2="388"/>
     <line x1="132" y1="172" x2="256" y2="244"/>
