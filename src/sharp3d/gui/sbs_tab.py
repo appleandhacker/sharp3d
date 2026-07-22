@@ -91,7 +91,7 @@ class SbsTab(QWidget):
                                     unit="m")
         self._s_strength = StereoSlider(c, "立体强度", 0.2, 2.5, 1.0,
                                         fmt="{:.2f}", unit="x")
-        conv_hint = QLabel("收敛深度 0 = 自动对焦")
+        conv_hint = QLabel("0 = 自动(25%前景突出) · 值越大前景突出越多")
         conv_hint.setProperty("cssClass", "hint")
         stereo_card.add_widget(self._s_ipd)
         stereo_card.add_widget(self._s_conv)
@@ -140,10 +140,11 @@ class SbsTab(QWidget):
         fps_row = QHBoxLayout()
         fps_row.addWidget(QLabel("输出帧率"))
         self._fps = QComboBox()
-        self._fps.addItems(["跟随源", "24", "30", "60"])
+        self._fps.addItems(["跟随源", "24", "29.97", "30", "59.94", "60"])
         self._fps.setToolTip(
-            "输出视频的帧率。\n"
-            "“跟随源”保持输入视频原帧率；选择固定值会改变播放速度/时长。"
+            '输出视频的帧率。\n'
+            '[跟随源] 保持输入视频原帧率；选择固定值会抽帧/补帧。\n'
+            '29.97/59.94 为 NTSC 标准帧率。'
         )
         fps_row.addWidget(self._fps, 1)
         enc_card.add_layout(fps_row)
@@ -316,7 +317,7 @@ class SbsTab(QWidget):
         codec_map = {"H.264": "h264", "H.265": "h265", "AV1": "av1"}
         # Output frame rate: None = keep source fps.
         fps_text = self._fps.currentText()
-        out_fps = None if fps_text == "跟随源" else int(fps_text)
+        out_fps = None if fps_text == "跟随源" else float(fps_text)
         # Output resolution: custom width (px) or scale fraction of source.
         scale_map = {"源尺寸 (100%)": 1.0, "75%": 0.75, "50%": 0.5, "25%": 0.25}
         res_text = self._res_scale.currentText()
