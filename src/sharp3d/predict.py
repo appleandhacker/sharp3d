@@ -18,6 +18,7 @@ BUG#8 FIX: CUDA non-default streams are incompatible with torch.compile
 from __future__ import annotations
 
 import logging
+import shutil
 from pathlib import Path
 from typing import Callable
 
@@ -152,13 +153,20 @@ class SharpPredictor:
         except Exception:
             pass
 
-        # ── torch.compile ────────────────────────────────────────────────
-        self._progress("编译预测器", 55)
-        torch._dynamo.config.capture_scalar_outputs = True
-        torch._inductor.config.triton.cudagraphs = False
-        torch._inductor.config.compile_threads = 1
-        torch._inductor.config.coordinate_descent_tuning = False
-        self._compiled = torch.compile(predictor, mode="max-autotune", dynamic=False)
+        # ── torch.compile (需要 MSVC cl.exe，无则回退 eager) ─────────────
+        if shutil.which("cl"):
+            self._progress("编译预测器", 55)
+            torch._dynamo.config.capture_scalar_outputs = True
+            torch._inductor.config.triton.cudagraphs = False
+            torch._inductor.config.compile_threads = 1
+            torch._inductor.config.coordinate_descent_tuning = False
+            self._compiled = torch.compile(predictor, mode="max-autotune", dynamic=False)
+        else:
+            self._progress("跳过编译（未检测到 MSVC）", 55)
+            logger.warning("未检测到 cl.exe (MSVC)，跳过 torch.compile，"
+                           "推理速度降低约 16%。安装 Visual Studio 并配置 "
+                           "vcvarsall 环境可获得最佳性能。")
+            self._compiled = predictor
 
         # ── Warmup inference ─────────────────────────────────────────────
         from .unproject import INTERNAL_SHAPE

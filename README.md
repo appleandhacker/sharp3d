@@ -128,7 +128,7 @@
 | GPU | NVIDIA RTX 30/40/50 系列（SM 8.0+），≥8GB VRAM |
 | Python | 3.13 |
 | CUDA | 13.0 |
-| 编译器 | Visual Studio 2022（torch.compile 需要 cl.exe） |
+| 编译器 | Visual Studio 2022（可选，torch.compile 加速约 16%；无则自动回退） |
 | 磁盘 | ~15GB（模型权重 + 编译缓存） |
 
 ---
@@ -166,13 +166,18 @@ pip install PySide6 onnxruntime-gpu pynvml imageio imageio-ffmpeg \
 
 ### 图形界面
 
-需先配置 MSVC 环境（torch.compile 需要 cl.exe）：
-
 ```bat
-call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
 set PYTHONPATH=<path-to>\sharp3d\src
 python -m sharp3d.gui
 ```
+
+如需 torch.compile 加速（约 16%），可先配置 MSVC 环境：
+
+```bat
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
+```
+
+未配置时自动回退 eager 模式，功能不受影响。
 
 首次启动约 90 秒（模型下载 + TensorRT 引擎构建 + torch.compile），后续启动约 15 秒（持久缓存）。
 
