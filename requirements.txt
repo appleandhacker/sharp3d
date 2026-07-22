@@ -1,0 +1,30 @@
+# sharp3d 运行依赖
+# Python 3.13 + CUDA 13.0 + Windows
+
+# ---- PyTorch (需从 PyTorch 官方源安装) ----
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+torch==2.13.0+cu130
+torchvision==0.28.0+cu130
+
+# ---- 推理加速 ----
+onnxruntime-gpu==1.27.0
+tensorrt==10.16.1.11
+triton-windows==3.7.1.post27
+
+# ---- 高斯渲染 (需从 GitHub Releases 安装预编译 whl) ----
+# pip install gsplat-*.whl  (见 https://github.com/appleandhacker/sharp3d/releases)
+gsplat==1.5.3
+
+# ---- SHARP 模型 (本地 editable 安装) ----
+# pip install -e <ml-sharp路径>
+# sharp==0.1
+
+# ---- GUI ----
+PySide6==6.11.1
+
+# ---- 核心依赖 ----
+numpy==2.4.4
+Pillow==12.2.0
+imageio==2.37.4
+imageio-ffmpeg==0.6.0
+pynvml==13.0.1
