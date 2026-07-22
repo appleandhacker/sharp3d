@@ -546,7 +546,7 @@ class _PipelineWorker:
                 # horizontal shift. Kalman filter tracks the true convergence
                 # with minimal lag while rejecting per-frame jitter.
                 frame_conv = conv
-                if conv is None and stab_mode != "off":
+                if conv is None:
                     focus = _compute_focus_depth_gpu(g.mean_vectors)
                     frame_conv = conv_kf.update(focus)
 
