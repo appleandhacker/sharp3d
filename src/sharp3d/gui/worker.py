@@ -647,8 +647,13 @@ def _child_main(req_q, resp_q, cancel_event):
     # ---- persistent compile cache: compile once, reuse forever ----
     # Must be set before torch is imported in this process.
     import os as _os
-    _project_root = Path(__file__).resolve().parents[3]  # sharp3d/src/sharp3d/gui -> sharp3d/
-    _cache_dir = _project_root / ".cache"
+    import sys as _sys
+    if getattr(_sys, "frozen", False):
+        # PyInstaller: use persistent AppData cache
+        _cache_dir = Path(_os.environ.get("LOCALAPPDATA", "~")) / "sharp3d" / ".cache"
+    else:
+        _project_root = Path(__file__).resolve().parents[3]
+        _cache_dir = _project_root / ".cache"
     _os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(_cache_dir / "inductor"))
     _os.environ.setdefault("TRITON_CACHE_DIR", str(_cache_dir / "triton"))
     _cache_dir.mkdir(parents=True, exist_ok=True)
