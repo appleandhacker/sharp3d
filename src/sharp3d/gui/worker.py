@@ -644,6 +644,31 @@ class _PipelineWorker:
 
 def _child_main(req_q, resp_q, cancel_event):
     """Child-process entry point. Dispatches requests to the pipeline worker."""
+    try:
+        _child_main_inner(req_q, resp_q, cancel_event)
+    except Exception as exc:
+        # Write error to log file (visible even without console)
+        import traceback, sys as _sys, os as _os
+        err_msg = traceback.format_exc()
+        if getattr(_sys, "frozen", False):
+            log_path = Path(_os.environ.get("LOCALAPPDATA", ".")) / "sharp3d" / "error.log"
+        else:
+            log_path = Path(__file__).resolve().parents[3] / "error.log"
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(err_msg, encoding="utf-8")
+        except Exception:
+            pass
+        # Tell GUI so it doesn't hang forever
+        try:
+            resp_q.put(("error", (f"子进程启动失败: {exc}",)))
+            resp_q.put(("status", (f"错误: {exc}",)))
+        except Exception:
+            pass
+
+
+def _child_main_inner(req_q, resp_q, cancel_event):
+    """Actual child-process logic (wrapped by _child_main for error handling)."""
     # ---- persistent compile cache: compile once, reuse forever ----
     # Must be set before torch is imported in this process.
     import os as _os
