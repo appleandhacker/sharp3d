@@ -73,11 +73,6 @@ class MainWindow(QMainWindow):
         header_layout.addLayout(title_block)
         header_layout.addStretch(1)
 
-        # Gaussian viewer button in header
-        btn_viewer = QPushButton("高斯查看器")
-        btn_viewer.clicked.connect(self._open_viewer)
-        header_layout.addWidget(btn_viewer)
-
         self._gpu = GpuMeter(self._theme.colors)
         header_layout.addWidget(self._gpu)
 
@@ -90,6 +85,12 @@ class MainWindow(QMainWindow):
         self._anim = AnimTab(self._theme, self._engine)
         self._tabs.addTab(self._sbs, "SBS 立体转换")
         self._tabs.addTab(self._anim, "2.5D 视差动画")
+
+        # Gaussian viewer button in tab bar corner
+        btn_viewer = QPushButton("高斯查看器")
+        btn_viewer.clicked.connect(self._open_viewer)
+        self._tabs.setCornerWidget(btn_viewer)
+
         root.addWidget(self._tabs, 1)
 
         # status bar

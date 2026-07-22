@@ -75,13 +75,9 @@ class SbsTab(QWidget):
         self._output = FileField(c, "输出", save=True)
         self._input.path_selected.connect(self._on_input)
         io_card.add_widget(self._input)
-        # Folder browse for batch mode
-        folder_row = QHBoxLayout()
         btn_folder = QPushButton("选择文件夹（批量）")
         btn_folder.clicked.connect(self._on_browse_folder)
-        folder_row.addWidget(btn_folder)
-        folder_row.addStretch(1)
-        io_card.add_layout(folder_row)
+        io_card.add_widget(btn_folder)
         io_card.add_widget(self._output)
         root.addWidget(io_card)
 
@@ -107,13 +103,8 @@ class SbsTab(QWidget):
         stereo_card.add_widget(conv_hint)
         stereo_card.add_widget(self._s_strength)
         left.addWidget(stereo_card)
-        left.addStretch(1)
 
-        left_w = QWidget()
-        left_w.setLayout(left)
-        middle.addWidget(left_w, 1)
-
-        # Right column: output settings + advanced
+        # Right column: output settings
         right = QVBoxLayout()
         right.setSpacing(12)
 
@@ -249,9 +240,13 @@ class SbsTab(QWidget):
         adv_card.add_widget(self._chk_depth)
         adv_card.add_widget(self._chk_ply)
         adv_card.add_widget(self._chk_edge)
-        right.addWidget(adv_card)
-        right.addStretch(1)
+        left.addWidget(adv_card)
 
+        left_w = QWidget()
+        left_w.setLayout(left)
+        middle.addWidget(left_w, 1)
+
+        right.addStretch(1)
         right_w = QWidget()
         right_w.setLayout(right)
         middle.addWidget(right_w, 1)
