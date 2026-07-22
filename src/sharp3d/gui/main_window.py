@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QPushButton,
     QStatusBar,
     QTabWidget,
     QVBoxLayout,
@@ -15,7 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from .anim_tab import AnimTab
-from .gaussian_tab import GaussianTab
+from .gaussian_tab import GaussianViewerWindow
 from .sbs_tab import SbsTab
 from .theme import DISPLAY_FONT, ThemeManager, build_palette, build_qss
 from .widgets import GpuMeter
@@ -28,10 +29,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("sharp3d — 2D → 3D 立体转换")
 
         # Adaptive initial size: proportional to logical screen (DPI-aware).
-        # Qt6 returns logical pixels from availableGeometry(), so this works
-        # correctly at any Windows scaling (100%/150%/200%).
-        # 4K@200%→logical 1920x1080→1152x756, 4K@100%→3840x2160→1600x1000,
-        # 2K@150%→1707x960→1024x672, 1080p→1920x1080→1152x756.
         from PySide6.QtWidgets import QApplication
         from PySide6.QtCore import QRect
         geo = QApplication.primaryScreen().availableGeometry()
@@ -43,6 +40,7 @@ class MainWindow(QMainWindow):
 
         self._theme = ThemeManager()
         self._engine = EngineProcess()
+        self._viewer: GaussianViewerWindow | None = None
 
         # central
         central = QWidget()
@@ -57,12 +55,9 @@ class MainWindow(QMainWindow):
         header_layout.setContentsMargins(20, 14, 20, 10)
         header_layout.setSpacing(12)
 
-        # stereo logotype: offset red/cyan "3D"
         logo = QLabel("◐◑")
         logo.setFont(QFont(DISPLAY_FONT, 20, QFont.Weight.Bold))
-        logo.setStyleSheet(
-            f"color:{self._theme.colors.red};"
-        )
+        logo.setStyleSheet(f"color:{self._theme.colors.red};")
         title = QLabel("sharp3d")
         title.setFont(QFont(DISPLAY_FONT, 22, QFont.Weight.Bold))
         subtitle = QLabel("平面照片 / 视频 → 立体 3D · 首次启动约90秒，后续约15秒")
@@ -78,6 +73,11 @@ class MainWindow(QMainWindow):
         header_layout.addLayout(title_block)
         header_layout.addStretch(1)
 
+        # Gaussian viewer button in header
+        btn_viewer = QPushButton("高斯查看器")
+        btn_viewer.clicked.connect(self._open_viewer)
+        header_layout.addWidget(btn_viewer)
+
         self._gpu = GpuMeter(self._theme.colors)
         header_layout.addWidget(self._gpu)
 
@@ -87,10 +87,8 @@ class MainWindow(QMainWindow):
         self._tabs = QTabWidget()
         self._tabs.setDocumentMode(True)
         self._sbs = SbsTab(self._theme, self._engine)
-        self._gaussian = GaussianTab(self._theme, self._engine)
         self._anim = AnimTab(self._theme, self._engine)
         self._tabs.addTab(self._sbs, "SBS 立体转换")
-        self._tabs.addTab(self._gaussian, "高斯查看器")
         self._tabs.addTab(self._anim, "2.5D 视差动画")
         root.addWidget(self._tabs, 1)
 
@@ -107,20 +105,26 @@ class MainWindow(QMainWindow):
         self._engine.status.connect(self._status_label.setText)
         self._engine.error.connect(self._status_label.setText)
         self._sbs.status_message.connect(self._status_label.setText)
-        self._gaussian.status_message.connect(self._status_label.setText)
         self._anim.status_message.connect(self._status_label.setText)
 
         self._apply_theme(self._theme.is_dark)
 
-        # Start loading the model immediately: the one-time load/compile cost
-        # (~1 min on first run) overlaps with the user picking a file, instead
-        # of stalling the first conversion.
+        # Start loading the model immediately
         self._engine.preload()
+
+    # ------------------------------------------------------------------
+    def _open_viewer(self) -> None:
+        """Open (or bring to front) the standalone Gaussian viewer window."""
+        if self._viewer is None or not self._viewer.isVisible():
+            self._viewer = GaussianViewerWindow(
+                self._engine, self._theme.colors, parent=self)
+        self._viewer.show()
+        self._viewer.raise_()
+        self._viewer.activateWindow()
 
     # ------------------------------------------------------------------
     def _apply_theme(self, is_dark: bool) -> None:
         c = self._theme.colors
-        app = self.window().parent()
         from PySide6.QtWidgets import QApplication
 
         qapp = QApplication.instance()
@@ -128,11 +132,14 @@ class MainWindow(QMainWindow):
         qapp.setStyleSheet(build_qss(c))
         self._gpu.set_colors(c)
         self._sbs.apply_theme(c)
-        self._gaussian.apply_theme(c)
         self._anim.apply_theme(c)
+        if self._viewer is not None:
+            self._viewer.set_colors(c)
         self._theme_label.setText("暗色模式" if is_dark else "亮色模式")
 
     # ------------------------------------------------------------------
     def closeEvent(self, event) -> None:
+        if self._viewer is not None:
+            self._viewer.close()
         self._engine.stop()
         super().closeEvent(event)

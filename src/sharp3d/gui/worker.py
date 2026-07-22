@@ -669,7 +669,7 @@ class _PipelineWorker:
 
     # ---- Gaussian viewer: load PLY + orbit render ----------------------
     def load_ply(self, path):
-        """Load a .ply gaussian file for the viewer tab."""
+        """Load a .ply gaussian file for the viewer."""
         try:
             import torch
             from sharp.utils.gaussians import load_ply
@@ -678,6 +678,8 @@ class _PipelineWorker:
             self._torch = torch
             self._device = torch.device("cuda")
             gaussians, metadata = load_ply(_P(path))
+            # Move all gaussian tensors to CUDA (gsplat requires CUDA)
+            gaussians = gaussians.to(self._device)
             self._gaussians = gaussians
             # Derive focal length and original size from metadata if available
             self._f_px = getattr(metadata, 'focal_length', None) or 1000.0

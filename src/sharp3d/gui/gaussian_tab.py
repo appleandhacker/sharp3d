@@ -1,190 +1,207 @@
-"""Gaussian viewer tab — load a .ply and orbit around the 3D scene."""
+"""Standalone Gaussian splat viewer window with mouse-drag orbit controls.
+
+Opens as a separate window (not a tab). Drag to rotate, scroll to zoom.
+Renders via the engine's render_orbit method (gsplat on GPU).
+"""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
+import numpy as np
+from PySide6.QtCore import Qt, QPoint, Signal
+from PySide6.QtGui import QImage, QPixmap, QWheelEvent, QMouseEvent
 from PySide6.QtWidgets import (
-    QCheckBox,
-    QHBoxLayout,
+    QFileDialog,
     QLabel,
+    QMainWindow,
     QPushButton,
-    QVBoxLayout,
+    QToolBar,
     QWidget,
 )
 
-from .theme import Colors, ThemeManager
-from .widgets import FileField, PreviewPane, SectionCard, StereoSlider
+from .theme import Colors
 from .worker import EngineProcess
 
 PLY_FILTER = "Gaussian PLY (*.ply);;所有文件 (*)"
 
 
-class GaussianTab(QWidget):
-    """Interactive 3D Gaussian splat viewer with orbit controls."""
+class OrbitView(QWidget):
+    """Interactive orbit viewport: drag to rotate, scroll to zoom."""
 
-    status_message = Signal(str)
-    request_load_ply = Signal(str)
-    request_render_orbit = Signal(dict)
+    view_changed = Signal(float, float, float)  # d_azimuth, d_elevation, d_distance
 
-    def __init__(self, theme: ThemeManager, engine: EngineProcess, parent=None) -> None:
+    def __init__(self, colors: Colors, parent=None) -> None:
         super().__init__(parent)
-        self._theme = theme
+        self._colors = colors
+        self._pixmap: QPixmap | None = None
+        self._message = "打开 PLY 文件\n拖拽旋转 · 滚轮缩放"
+        self._dragging = False
+        self._last_pos = QPoint()
+        self.setMinimumSize(640, 480)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.OpenHandCursor)
+
+    # ---- display --------------------------------------------------------
+    def set_image(self, rgb: np.ndarray) -> None:
+        h, w, ch = rgb.shape
+        qimg = QImage(rgb.data, w, h, ch * w, QImage.Format_RGB888)
+        self._pixmap = QPixmap.fromImage(qimg.copy())
+        self.update()
+
+    def clear_image(self) -> None:
+        self._pixmap = None
+        self.update()
+
+    def set_message(self, msg: str) -> None:
+        self._message = msg
+        self._pixmap = None
+        self.update()
+
+    def set_colors(self, colors: Colors) -> None:
+        self._colors = colors
+        self.update()
+
+    # ---- mouse interaction ----------------------------------------------
+    def mousePressEvent(self, e: QMouseEvent) -> None:
+        if e.button() == Qt.LeftButton:
+            self._dragging = True
+            self._last_pos = e.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+
+    def mouseMoveEvent(self, e: QMouseEvent) -> None:
+        if not self._dragging:
+            return
+        delta = e.pos() - self._last_pos
+        self._last_pos = e.pos()
+        self.view_changed.emit(delta.x() * 0.3, -delta.y() * 0.3, 0.0)
+
+    def mouseReleaseEvent(self, e: QMouseEvent) -> None:
+        if e.button() == Qt.LeftButton:
+            self._dragging = False
+            self.setCursor(Qt.OpenHandCursor)
+
+    def wheelEvent(self, e: QWheelEvent) -> None:
+        delta = -e.angleDelta().y() / 120.0 * 0.5
+        self.view_changed.emit(0.0, 0.0, delta)
+
+    # ---- painting -------------------------------------------------------
+    def paintEvent(self, event) -> None:
+        from PySide6.QtGui import QPainter, QColor, QFont
+        from .theme import DISPLAY_FONT
+
+        c = self._colors
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        w, h = self.width(), self.height()
+
+        p.fillRect(0, 0, w, h, QColor(c.bg_alt))
+
+        if self._pixmap is None:
+            p.setPen(QColor(c.text_faint))
+            p.setFont(QFont(DISPLAY_FONT, 14))
+            lines = self._message.split("\n")
+            cy = h // 2 - len(lines) * 12
+            for line in lines:
+                p.drawText(0, cy, w, 28, Qt.AlignHCenter, line)
+                cy += 28
+            p.end()
+            return
+
+        margin = 8
+        scaled = self._pixmap.scaled(
+            w - margin * 2, h - margin * 2,
+            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        x = (w - scaled.width()) // 2
+        y = (h - scaled.height()) // 2
+        p.drawPixmap(x, y, scaled)
+        p.end()
+
+
+class GaussianViewerWindow(QMainWindow):
+    """Standalone Gaussian splat viewer with orbit controls."""
+
+    def __init__(self, engine: EngineProcess, colors: Colors, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("高斯查看器 — sharp3d")
+        self.resize(900, 680)
         self._engine = engine
+        self._colors = colors
         self._loaded = False
-        self._auto_rotate = False
+
+        # Orbit state
         self._azimuth = 0.0
+        self._elevation = 0.0
+        self._distance = 5.0
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(14, 12, 14, 14)
-        root.setSpacing(12)
-        c = theme.colors
+        # Central viewport
+        self._view = OrbitView(colors)
+        self._view.view_changed.connect(self._on_view_changed)
+        self.setCentralWidget(self._view)
 
-        # ---- IO card ------------------------------------------------------
-        io_card = SectionCard(c, "高斯文件")
-        self._input = FileField(c, "PLY", file_filter=PLY_FILTER)
-        self._input.path_selected.connect(self._on_load)
-        io_card.add_widget(self._input)
-        self._info_label = QLabel("未加载")
-        self._info_label.setProperty("cssClass", "hint")
-        io_card.add_widget(self._info_label)
-        root.addWidget(io_card)
+        # Toolbar
+        tb = QToolBar("工具")
+        tb.setMovable(False)
+        self.addToolBar(tb)
+        btn_open = QPushButton("打开 PLY…")
+        btn_open.clicked.connect(self._on_open)
+        tb.addWidget(btn_open)
+        btn_reset = QPushButton("重置视角")
+        btn_reset.clicked.connect(self._on_reset)
+        tb.addWidget(btn_reset)
+        self._info = QLabel("  未加载")
+        tb.addWidget(self._info)
 
-        # ---- middle: preview + controls -----------------------------------
-        middle = QHBoxLayout()
-        middle.setSpacing(12)
-
-        preview_card = SectionCard(c, "3D 预览")
-        self._preview = PreviewPane(c, stereo=False)
-        self._preview.set_message("加载 PLY 文件\n拖入或点击浏览")
-        self._preview.file_dropped.connect(self._input.set_path)
-        preview_card.add_widget(self._preview)
-
-        ctrl = QHBoxLayout()
-        self._btn_render = QPushButton("渲染当前视角")
-        self._btn_render.setEnabled(False)
-        self._btn_render.clicked.connect(self._render)
-        self._chk_auto = QCheckBox("自动旋转")
-        self._chk_auto.toggled.connect(self._on_auto_toggled)
-        self._btn_export = QPushButton("导出 PNG…")
-        self._btn_export.setEnabled(False)
-        self._btn_export.clicked.connect(self._on_export)
-        ctrl.addWidget(self._btn_render)
-        ctrl.addWidget(self._chk_auto)
-        ctrl.addStretch(1)
-        ctrl.addWidget(self._btn_export)
-        preview_card.add_layout(ctrl)
-        middle.addWidget(preview_card, 3)
-
-        # right column — orbit controls
-        right = QVBoxLayout()
-        right.setSpacing(12)
-
-        orbit_card = SectionCard(c, "视角控制")
-        self._s_azimuth = StereoSlider(c, "方位角", -180.0, 180.0, 0.0,
-                                       fmt="{:.0f}", unit="°")
-        self._s_azimuth.value_changed.connect(self._on_slider)
-        self._s_elevation = StereoSlider(c, "仰角", -60.0, 60.0, 0.0,
-                                         fmt="{:.0f}", unit="°")
-        self._s_elevation.value_changed.connect(self._on_slider)
-        self._s_distance = StereoSlider(c, "距离", 1.0, 20.0, 5.0,
-                                        fmt="{:.1f}", unit="")
-        self._s_distance.value_changed.connect(self._on_slider)
-        orbit_card.add_widget(self._s_azimuth)
-        orbit_card.add_widget(self._s_elevation)
-        orbit_card.add_widget(self._s_distance)
-        right.addWidget(orbit_card)
-
-        middle.addLayout(right, 2)
-        root.addLayout(middle, 1)
-
-        # ---- auto-rotate timer -------------------------------------------
-        self._rotate_timer = QTimer(self)
-        self._rotate_timer.timeout.connect(self._auto_step)
-
-        # ---- engine wiring ------------------------------------------------
-        self.request_load_ply.connect(engine.load_ply)
-        self.request_render_orbit.connect(engine.render_orbit)
+        # Engine signals
         engine.ply_loaded.connect(self._on_ply_loaded)
         engine.orbit_frame.connect(self._on_orbit_frame)
-        engine.error.connect(self._on_error)
 
-    # ------------------------------------------------------------------
-    def _on_load(self, path: str) -> None:
-        self._loaded = False
-        self._preview.clear_image()
-        self._preview.set_message("正在加载 PLY…")
-        self._info_label.setText("加载中…")
-        self.request_load_ply.emit(path)
+    # ---- actions --------------------------------------------------------
+    def _on_open(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "打开高斯 PLY 文件", str(Path.home()), PLY_FILTER)
+        if path:
+            self._view.set_message("加载中…")
+            self._engine.load_ply(path)
 
-    def _on_ply_loaded(self, info: dict) -> None:
-        self._loaded = True
-        self._btn_render.setEnabled(True)
-        n = info.get("n_gaussians", 0)
-        w = info.get("width", 0)
-        h = info.get("height", 0)
-        self._info_label.setText(f"{n:,} 高斯点 · 原始 {w}×{h}")
-        self._preview.set_message("已加载 · 点击「渲染当前视角」")
-        self.status_message.emit(f"PLY 已加载 · {n:,} 高斯点")
-        # Auto-render the default view
+    def _on_reset(self) -> None:
+        self._azimuth = 0.0
+        self._elevation = 0.0
+        self._distance = 5.0
         self._render()
 
-    def _on_slider(self, _v: float) -> None:
-        if self._loaded and not self._auto_rotate:
-            self._render()
+    def _on_view_changed(self, d_azimuth: float, d_elevation: float,
+                         d_distance: float) -> None:
+        self._azimuth += d_azimuth
+        self._elevation = max(-80.0, min(80.0, self._elevation + d_elevation))
+        self._distance = max(1.0, min(30.0, self._distance + d_distance))
+        self._render()
 
     def _render(self) -> None:
         if not self._loaded:
             return
-        self._azimuth = self._s_azimuth.value()
-        self.request_render_orbit.emit({
-            "azimuth": self._s_azimuth.value(),
-            "elevation": self._s_elevation.value(),
-            "distance": self._s_distance.value(),
+        self._engine.render_orbit({
+            "azimuth": self._azimuth,
+            "elevation": self._elevation,
+            "distance": self._distance,
             "render_width": 960,
         })
 
-    def _on_orbit_frame(self, frame) -> None:
-        self._preview.set_image(frame)
-        self._btn_export.setEnabled(True)
-        self._last_frame = frame
-
-    def _on_auto_toggled(self, checked: bool) -> None:
-        self._auto_rotate = checked
-        if checked:
-            self._rotate_timer.start(80)  # ~12 fps rotation
-        else:
-            self._rotate_timer.stop()
-
-    def _auto_step(self) -> None:
-        self._azimuth = (self._azimuth + 3.0) % 360.0
-        # Map 0-360 to slider range -180..180
-        slider_val = self._azimuth if self._azimuth <= 180 else self._azimuth - 360
-        self._s_azimuth.set_value(slider_val)
+    # ---- engine callbacks -----------------------------------------------
+    def _on_ply_loaded(self, info: dict) -> None:
+        self._loaded = True
+        n = info.get("n_gaussians", 0)
+        self._info.setText(f"  {n:,} 高斯点 · 拖拽旋转 · 滚轮缩放")
+        self._azimuth = 0.0
+        self._elevation = 0.0
+        self._distance = 5.0
         self._render()
 
-    def _on_export(self) -> None:
-        if not hasattr(self, '_last_frame') or self._last_frame is None:
-            return
-        from PySide6.QtWidgets import QFileDialog
-        from PIL import Image
+    def _on_orbit_frame(self, frame) -> None:
+        self._view.set_image(frame)
 
-        path, _ = QFileDialog.getSaveFileName(
-            self, "导出截图", str(Path.home() / "gaussian_view.png"),
-            "PNG (*.png)",
-        )
-        if not path:
-            return
-        Image.fromarray(self._last_frame).save(path)
-        self.status_message.emit(f"已导出 → {path}")
-
-    def _on_error(self, msg: str) -> None:
-        self._preview.set_message("加载/渲染出错")
-        self.status_message.emit(msg)
-
-    # ------------------------------------------------------------------
-    def apply_theme(self, c: Colors) -> None:
-        self._preview.set_colors(c)
-        for s in (self._s_azimuth, self._s_elevation, self._s_distance):
-            s.set_colors(c)
+    # ---- theme ----------------------------------------------------------
+    def set_colors(self, c: Colors) -> None:
+        self._colors = c
+        self._view.set_colors(c)
