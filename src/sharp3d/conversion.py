@@ -41,6 +41,7 @@ class VideoConversionEngine:
         decompose_method: str = "analytical",
         stabilize_mode: str = "adaptive",
         render_width: int | None = None,
+        edge_soften: bool = False,
     ):
         """
         Args:
@@ -63,6 +64,7 @@ class VideoConversionEngine:
         self._convergence_q = convergence_q if convergence_q else 0.50
         self._decompose = decompose_method
         self._render_width = render_width
+        self._edge_soften = edge_soften
 
         self._stab = TemporalStabilizer(mode=stabilize_mode, device=device)
         self._conv_kf = KalmanScalar(q_pos=0.05, q_vel=0.02, r=0.15)
@@ -92,6 +94,10 @@ class VideoConversionEngine:
         with torch.autocast("cuda", dtype=torch.float16):
             g_ndc = self._predict(img_r, df)
         self._stab.stabilize(g_ndc, img=img_r)
+
+        # Optional: soften depth edges to reduce disocclusion stretching
+        if self._edge_soften:
+            self._soften_depth_edges(g_ndc)
 
         # Unproject NDC → world
         g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
@@ -126,6 +132,55 @@ class VideoConversionEngine:
         if return_depth:
             return result, depth_np
         return result
+
+    def _soften_depth_edges(self, g_ndc) -> None:
+        """Edge-aware depth smoothing to reduce disocclusion artifacts.
+
+        Applies Gaussian blur to z only at depth discontinuities (high gradient),
+        preserving flat regions unchanged. This softens the hard depth jump at
+        object boundaries, reducing stretching/fringing in stereo rendering.
+        """
+        import torch.nn.functional as F
+
+        z = g_ndc.mean_vectors[:, 2].float()
+        N = z.numel()
+
+        # Infer spatial layout (L, H, W)
+        if N == 1536 * 1536 * 2:
+            L, H, W = 2, 1536, 1536
+        elif N == 1536 * 1536:
+            L, H, W = 1, 1536, 1536
+        else:
+            return  # unknown layout, skip
+
+        z_map = z.reshape(L, H, W)
+
+        # Compute gradient magnitude (Sobel-like)
+        # Pad for same-size output
+        z_pad = z_map.unsqueeze(1)  # (L, 1, H, W)
+        z_pad = F.pad(z_pad, [1, 1, 1, 1], mode="replicate")
+        gx = z_pad[:, :, 1:-1, 2:] - z_pad[:, :, 1:-1, :-2]  # horizontal
+        gy = z_pad[:, :, 2:, 1:-1] - z_pad[:, :, :-2, 1:-1]  # vertical
+        grad_mag = (gx.pow(2) + gy.pow(2)).sqrt().squeeze(1)  # (L, H, W)
+
+        # Edge weight: sigmoid ramp around gradient threshold
+        edge_weight = torch.sigmoid((grad_mag - 0.02) * 200.0)  # soft mask
+
+        # Gaussian blur (5x5, sigma=2)
+        kernel_size = 5
+        sigma = 2.0
+        coords = torch.arange(kernel_size, device=z.device, dtype=torch.float32) - kernel_size // 2
+        kernel_1d = torch.exp(-coords.pow(2) / (2 * sigma * sigma))
+        kernel_1d = kernel_1d / kernel_1d.sum()
+        kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]  # (5, 5)
+        kernel_2d = kernel_2d.expand(L, 1, -1, -1)  # (L, 1, 5, 5)
+
+        z_blur = F.conv2d(z_map.unsqueeze(1), kernel_2d, padding=2,
+                          groups=L).squeeze(1)  # (L, H, W)
+
+        # Blend: at edges use blurred, elsewhere keep original
+        z_out = edge_weight * z_blur + (1.0 - edge_weight) * z_map
+        g_ndc.mean_vectors[:, 2] = z_out.reshape(-1).to(g_ndc.mean_vectors.dtype)
 
     def reset(self) -> None:
         """Reset temporal state (call between videos in batch mode)."""

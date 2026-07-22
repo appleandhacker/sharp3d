@@ -396,6 +396,7 @@ class _PipelineWorker:
             decompose_method=method,
             stabilize_mode=stab_mode,
             render_width=render_w,
+            edge_soften=opts.get("edge_soften", False),
         )
 
         # ── Optional depth/PLY export ────────────────────────────────────

@@ -241,8 +241,14 @@ class SbsTab(QWidget):
 
         self._chk_depth = QCheckBox("同时输出深度图")
         self._chk_ply = QCheckBox("导出 PLY 高斯文件")
+        self._chk_edge = QCheckBox("深度边缘柔化 (减少边缘拉丝)")
+        self._chk_edge.setToolTip(
+            "对深度图边缘做保边平滑，减少立体渲染时\n"
+            "物体边界处的拉伸/彩色条纹伪影。开销约3ms/帧。"
+        )
         adv_card.add_widget(self._chk_depth)
         adv_card.add_widget(self._chk_ply)
+        adv_card.add_widget(self._chk_edge)
         right.addWidget(adv_card)
         right.addStretch(1)
 
@@ -417,6 +423,7 @@ class SbsTab(QWidget):
             decompose="analytical" if self._decompose.currentIndex() == 0 else "svd",
             depth=self._chk_depth.isChecked(),
             ply=self._chk_ply.isChecked(),
+            edge_soften=self._chk_edge.isChecked(),
             hdr_output=self._chk_hdr.isChecked(),
             perf_mode="quality" if self._perf_mode.currentIndex() == 0 else "speed",
             out_fps=out_fps,

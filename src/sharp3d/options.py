@@ -42,6 +42,7 @@ class ConvertOptions:
     # Extra outputs
     depth: bool = False
     ply: bool = False
+    edge_soften: bool = False
 
     def to_dict(self) -> dict:
         """Convert to legacy dict for backward compatibility."""
