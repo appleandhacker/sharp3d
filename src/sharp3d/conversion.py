@@ -156,17 +156,16 @@ class VideoConversionEngine:
         z_map = z.reshape(L, H, W)
 
         # Compute gradient magnitude (Sobel-like)
-        # Pad for same-size output
-        z_pad = z_map.unsqueeze(1)  # (L, 1, H, W)
-        z_pad = F.pad(z_pad, [1, 1, 1, 1], mode="replicate")
+        z_4d = z_map.unsqueeze(0)  # (1, L, H, W)
+        z_pad = F.pad(z_4d, [1, 1, 1, 1], mode="replicate")
         gx = z_pad[:, :, 1:-1, 2:] - z_pad[:, :, 1:-1, :-2]  # horizontal
         gy = z_pad[:, :, 2:, 1:-1] - z_pad[:, :, :-2, 1:-1]  # vertical
-        grad_mag = (gx.pow(2) + gy.pow(2)).sqrt().squeeze(1)  # (L, H, W)
+        grad_mag = (gx.pow(2) + gy.pow(2)).sqrt().squeeze(0)  # (L, H, W)
 
         # Edge weight: sigmoid ramp around gradient threshold
         edge_weight = torch.sigmoid((grad_mag - 0.02) * 200.0)  # soft mask
 
-        # Gaussian blur (5x5, sigma=2)
+        # Gaussian blur (5x5, sigma=2) — depthwise conv (groups=L)
         kernel_size = 5
         sigma = 2.0
         coords = torch.arange(kernel_size, device=z.device, dtype=torch.float32) - kernel_size // 2
@@ -175,8 +174,8 @@ class VideoConversionEngine:
         kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]  # (5, 5)
         kernel_2d = kernel_2d.expand(L, 1, -1, -1)  # (L, 1, 5, 5)
 
-        z_blur = F.conv2d(z_map.unsqueeze(1), kernel_2d, padding=2,
-                          groups=L).squeeze(1)  # (L, H, W)
+        z_blur = F.conv2d(z_4d, kernel_2d, padding=2,
+                          groups=L).squeeze(0)  # (L, H, W)
 
         # Blend: at edges use blurred, elsewhere keep original
         z_out = edge_weight * z_blur + (1.0 - edge_weight) * z_map
