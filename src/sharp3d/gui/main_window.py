@@ -61,7 +61,7 @@ class MainWindow(QMainWindow):
         logo.setStyleSheet(f"color:{self._theme.colors.red};")
         title = QLabel("sharp3d")
         title.setFont(QFont(DISPLAY_FONT, 22, QFont.Weight.Bold))
-        subtitle = QLabel(f"v{__version__} · 平面照片 / 视频 → 立体 3D · 首次启动约90秒，后续约15秒")
+        subtitle = QLabel(f"v{__version__}")
         subtitle.setProperty("cssClass", "hint")
         subtitle.setStyleSheet("font-size:12px;")
 
