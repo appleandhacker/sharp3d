@@ -67,7 +67,9 @@ class VideoConversionEngine:
         self._conv_kf = KalmanScalar(q_pos=0.05, q_vel=0.02, r=0.15)
 
     @torch.no_grad()
-    def process_frame(self, img_r, df, ir, orig_size: tuple[int, int]) -> "np.ndarray":
+    def process_frame(self, img_r, df, ir, orig_size: tuple[int, int],
+                      return_depth: bool = False,
+                      return_gaussians: bool = False):
         """Process one prepared frame → stereo-packed numpy array.
 
         Args:
@@ -75,12 +77,14 @@ class VideoConversionEngine:
             df: (1,) disparity factor tensor.
             ir: (4, 4) intrinsics scaled to internal resolution.
             orig_size: (W, H) of original frame.
+            return_depth: Also return a depth map (H, W, 3) uint8 numpy array.
+            return_gaussians: Also return the world-space Gaussians3D object.
 
         Returns:
-            (H_out, W_out, 3) uint8 numpy array ready for encoding.
+            packed_np: (H_out, W_out, 3) uint8 numpy array.
+            depth_np: (H, W, 3) uint8 depth map (only if return_depth=True).
+            gaussians: Gaussians3D (only if return_gaussians=True).
         """
-        import numpy as np
-
         w, h = orig_size
 
         # Predict + temporal stabilize (z + opacity + scale)
@@ -104,10 +108,23 @@ class VideoConversionEngine:
                             ipd=self._ipd, convergence=frame_conv,
                             render_width=self._render_width)
         packed = pack_stereo(self._fmt, sbs)
-        torch.cuda.synchronize()
 
+        # Optional depth map
+        depth_np = None
+        if return_depth:
+            from .render import render_depth_map
+            depth = render_depth_map(g, self._f_px, w, h)
+            depth_np = depth.cpu().numpy()
+
+        torch.cuda.synchronize()
         result = packed.cpu().numpy()
-        del g, sbs, packed
+        del sbs, packed
+
+        if return_gaussians:
+            return result, depth_np, g
+        del g
+        if return_depth:
+            return result, depth_np
         return result
 
     def reset(self) -> None:

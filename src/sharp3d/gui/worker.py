@@ -394,6 +394,16 @@ class _PipelineWorker:
             render_width=render_w,
         )
 
+        # ── Optional depth/PLY export ────────────────────────────────────
+        want_depth = opts.get("depth", False)
+        want_ply = opts.get("ply", False)
+        depth_writer = None
+        if want_depth:
+            depth_path = out.with_stem(out.stem + "_depth")
+            depth_writer = VideoWriter(str(depth_path), fps=out_fps,
+                                       width=render_w, height=render_h,
+                                       codec="h264", crf=18)
+
         # ── Main conversion loop ────────────────────────────────────────
         # Every frame from the queue is processed (ffmpeg already selected the
         # correct frames via its fps filter). No Python-side skip logic.
@@ -411,13 +421,36 @@ class _PipelineWorker:
                     img_r, df, ir, (w, h) = prepared
 
                     # ── GPU pipeline (predict→stabilize→render→pack) ──
-                    sbs_np = engine.process_frame(img_r, df, ir, (w, h))
+                    need_gaussians = (want_ply and n_done == 0)
+                    result = engine.process_frame(
+                        img_r, df, ir, (w, h),
+                        return_depth=want_depth,
+                        return_gaussians=need_gaussians,
+                    )
+
+                    # Unpack results
+                    if need_gaussians:
+                        sbs_np, depth_np, g_world = result
+                        from sharp.utils.gaussians import save_ply
+                        ply_path = out.with_suffix(".ply")
+                        save_ply(g_world, f_px, (h, w), ply_path)
+                        self._respond("status", (f"PLY 已导出: {ply_path.name}",))
+                        del g_world
+                    elif want_depth:
+                        sbs_np, depth_np = result
+                    else:
+                        sbs_np = result
+                        depth_np = None
 
                     # ── Encode (async via encode thread) ────────────
                     encode_q.put((sbs_np, hdr_out))
                     out_written += 1
 
-                    del img_r, prepared, sbs_np
+                    # Depth video (synchronous, lightweight)
+                    if depth_writer is not None and depth_np is not None:
+                        depth_writer.append_frame(depth_np)
+
+                    del img_r, prepared, sbs_np, depth_np
 
                     n_done += 1
                     elapsed = time.time() - t_start
@@ -457,6 +490,8 @@ class _PipelineWorker:
             writer.close(audio_source=source)
         else:
             writer.close(source_video=source)
+        if depth_writer is not None:
+            depth_writer.close()
 
         total_elapsed = time.time() - t_start
         avg = n_done / total_elapsed if total_elapsed > 0 else 0.0
