@@ -171,37 +171,45 @@ class TemporalStabilizer:
             return
 
         if self.mode == "flow":
-            self._stabilize_flow(g_ndc, img)
+            scene_cut = self._stabilize_flow(g_ndc, img)
         else:
-            self._stabilize_ema(g_ndc)
+            scene_cut = self._stabilize_ema(g_ndc)
 
         # ── Attribute smoothing (opacity + scale) ────────────────────────
         # Gaussians have fixed grid correspondence between frames (same pixel
         # × layer index), so per-index EMA directly reduces edge flickering.
+        if scene_cut:
+            # Reset attribute state on scene cut to avoid 1-frame ghosting.
+            self._prev_opacities = None
+            self._prev_scales = None
         self._smooth_attributes(g_ndc)
 
     def _smooth_attributes(self, g_ndc) -> None:
-        """EMA-smooth opacities and singular_values to reduce edge flicker."""
+        """Recursive EMA-smooth opacities and singular_values."""
         a = self._attr_alpha
 
         # Opacities: (N, 1) or (N,)
         opac = g_ndc.opacities.float()
         if self._prev_opacities is not None:
-            g_ndc.opacities = (a * opac + (1 - a) * self._prev_opacities).to(
-                g_ndc.opacities.dtype)
-        self._prev_opacities = opac
+            smoothed = a * opac + (1 - a) * self._prev_opacities
+            g_ndc.opacities = smoothed.to(g_ndc.opacities.dtype)
+            self._prev_opacities = smoothed  # store smoothed (recursive EMA)
+        else:
+            self._prev_opacities = opac
 
         # Scale (singular_values): (N, 3)
         scales = g_ndc.singular_values.float()
         if self._prev_scales is not None:
-            g_ndc.singular_values = (a * scales + (1 - a) * self._prev_scales).to(
-                g_ndc.singular_values.dtype)
-        self._prev_scales = scales
+            smoothed = a * scales + (1 - a) * self._prev_scales
+            g_ndc.singular_values = smoothed.to(g_ndc.singular_values.dtype)
+            self._prev_scales = smoothed  # store smoothed (recursive EMA)
+        else:
+            self._prev_scales = scales
 
     # ─── EMA-based methods (global / adaptive) ────────────────────────────
 
-    def _stabilize_ema(self, g_ndc) -> None:
-        """Global or adaptive EMA stabilization."""
+    def _stabilize_ema(self, g_ndc) -> bool:
+        """Global or adaptive EMA stabilization. Returns True on scene cut."""
         # Force float32 — N can exceed FP16 max (65504), causing inf/nan.
         z = g_ndc.mean_vectors[:, 2].float()  # (N,) depth in NDC
         N = z.numel()
@@ -210,7 +218,7 @@ class TemporalStabilizer:
         if self._prev_z is None:
             self._prev_z = z.clone()
             self._infer_shape(N)
-            return
+            return True  # treat first frame as cut (reset attributes)
 
         # ── Scale-shift alignment ────────────────────────────────────────
         prev = self._prev_z
@@ -224,9 +232,9 @@ class TemporalStabilizer:
         n = torch.tensor(float(N), device=z.device, dtype=torch.float32)
 
         det = sxx * n - sx * sx
-        if det.abs() < 1e-12:
+        if not torch.isfinite(det) or det.abs() < 1e-12:
             self._prev_z = z.clone()
-            return
+            return True
 
         s = (sxy * n - sx * sy) / det
         t = (sxx * sy - sx * sxy) / det
@@ -236,9 +244,9 @@ class TemporalStabilizer:
         residual = (z_aligned - prev).abs()
         mean_residual = residual.mean()
 
-        if mean_residual > self.cut_threshold:
+        if not torch.isfinite(mean_residual) or mean_residual > self.cut_threshold:
             self._prev_z = z.clone()
-            return
+            return True
 
         # ── Blend ────────────────────────────────────────────────────────
         if self.mode == "global":
@@ -252,15 +260,15 @@ class TemporalStabilizer:
         # Write back in original dtype; keep prev in float32.
         g_ndc.mean_vectors[:, 2] = z_out.to(g_ndc.mean_vectors.dtype)
         self._prev_z = z_out
+        return False
 
     # ─── Optical flow warp method ─────────────────────────────────────────
 
-    def _stabilize_flow(self, g_ndc, img: torch.Tensor | None) -> None:
-        """Flow-based stabilization with occlusion-aware blending."""
+    def _stabilize_flow(self, g_ndc, img: torch.Tensor | None) -> bool:
+        """Flow-based stabilization with occlusion-aware blending. Returns True on scene cut."""
         if img is None:
             # Fallback to global EMA if no image provided.
-            self._stabilize_ema(g_ndc)
-            return
+            return self._stabilize_ema(g_ndc)
 
         z = g_ndc.mean_vectors[:, 2].float()  # (N,) — float32 to avoid FP16 overflow
         N = z.numel()
@@ -275,7 +283,7 @@ class TemporalStabilizer:
             self._prev_z = z.clone()
             self._prev_img = curr_img
             self._infer_shape(N)
-            return
+            return True
 
         self._ensure_flow_model()
 
@@ -368,7 +376,7 @@ class TemporalStabilizer:
             if res > self.cut_threshold:
                 self._prev_z = z.clone()
                 self._prev_img = curr_img
-                return
+                return True
 
         # ── Occlusion-aware blend ────────────────────────────────────────
         # Non-occluded: blend aligned current with warped prev.
@@ -389,6 +397,7 @@ class TemporalStabilizer:
         g_ndc.mean_vectors[:, 2] = z_out.to(g_ndc.mean_vectors.dtype)
         self._prev_z = z_out
         self._prev_img = curr_img
+        return False
 
     @staticmethod
     def _warp_flow(flow: torch.Tensor, flow_ref: torch.Tensor) -> torch.Tensor:

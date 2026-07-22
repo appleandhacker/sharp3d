@@ -527,75 +527,76 @@ class _PipelineWorker:
         n_done = 0
 
         first = frame_q.get()
-        if first is not None and not self._cancel_event.is_set():
-            prepared = _prepare(first)
-            del first
+        try:
+            if first is not None and not self._cancel_event.is_set():
+                prepared = _prepare(first)
+                del first
 
+                while True:
+                    img_r, df, ir, (w, h) = prepared
+
+                    # ── Predict + unproject (GPU-bound, ~500ms) ─────────
+                    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+                        g_ndc = self._compiled(img_r, df)
+                    stab.stabilize(g_ndc, img=img_r)
+                    g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
+                                       INTERNAL_SHAPE, decompose_method=method)
+
+                    # ── Convergence smoothing (anti-flicker) ────────────
+                    # Auto-convergence per-frame quantile jumps cause global
+                    # horizontal shift. Kalman filter tracks the true convergence
+                    # with minimal lag while rejecting per-frame jitter.
+                    frame_conv = conv
+                    if conv is None:
+                        focus = _compute_focus_depth_gpu(g.mean_vectors)
+                        frame_conv = conv_kf.update(focus)
+
+                    # ── Render + pack (GPU) ─────────────────────────────
+                    sbs, _ = render_sbs(g, f_px, w, h,
+                                        ipd=ipd_scene, convergence=frame_conv,
+                                        render_width=render_w)
+                    packed = pack_stereo(fmt, sbs)
+                    torch.cuda.synchronize()
+
+                    # ── Encode ──────────────────────────────────────────
+                    sbs_np = packed.cpu().numpy()
+                    if hdr_out:
+                        writer.write_frame(sbs_np)
+                    else:
+                        writer.append_frame(sbs_np)
+                    out_written += 1
+
+                    # Free GPU tensors immediately after encode to keep VRAM flat
+                    del g, g_ndc, sbs, packed, img_r, prepared, sbs_np
+
+                    n_done += 1
+                    elapsed = time.time() - t_start
+                    avg_fps = n_done / elapsed if elapsed > 0 else 0.0
+                    self._respond("convert_progress",
+                                  (out_written, out_count, avg_fps, elapsed))
+
+                    # Periodic CPU GC every 30 frames prevents RAM accumulation.
+                    if n_done % 30 == 0:
+                        gc.collect()
+
+                    if self._cancel_event.is_set():
+                        break
+
+                    # ── Fetch + prepare next frame ──────────────────────
+                    nxt_frm = frame_q.get()
+                    if nxt_frm is None:
+                        break
+                    prepared = _prepare(nxt_frm)
+                    del nxt_frm
+        finally:
+            # Always clean up decoder thread (prevents leaked ffmpeg process).
             while True:
-                img_r, df, ir, (w, h) = prepared
-
-                # ── Predict + unproject (GPU-bound, ~500ms) ─────────
-                with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-                    g_ndc = self._compiled(img_r, df)
-                stab.stabilize(g_ndc, img=img_r)
-                g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
-                                   INTERNAL_SHAPE, decompose_method=method)
-
-                # ── Convergence smoothing (anti-flicker) ────────────
-                # Auto-convergence per-frame quantile jumps cause global
-                # horizontal shift. Kalman filter tracks the true convergence
-                # with minimal lag while rejecting per-frame jitter.
-                frame_conv = conv
-                if conv is None:
-                    focus = _compute_focus_depth_gpu(g.mean_vectors)
-                    frame_conv = conv_kf.update(focus)
-
-                # ── Render + pack (GPU) ─────────────────────────────
-                sbs, _ = render_sbs(g, f_px, w, h,
-                                    ipd=ipd_scene, convergence=frame_conv,
-                                    render_width=render_w)
-                packed = pack_stereo(fmt, sbs)
-                torch.cuda.synchronize()
-
-                # ── Encode ──────────────────────────────────────────
-                sbs_np = packed.cpu().numpy()
-                if hdr_out:
-                    writer.write_frame(sbs_np)
-                else:
-                    writer.append_frame(sbs_np)
-                out_written += 1
-
-                # Free GPU tensors immediately after encode to keep VRAM flat
-                del g, g_ndc, sbs, packed, img_r, prepared, sbs_np
-
-                n_done += 1
-                elapsed = time.time() - t_start
-                avg_fps = n_done / elapsed if elapsed > 0 else 0.0
-                self._respond("convert_progress",
-                              (out_written, out_count, avg_fps, elapsed))
-
-                # Periodic CPU GC every 30 frames prevents RAM accumulation.
-                if n_done % 30 == 0:
-                    gc.collect()
-
-                if self._cancel_event.is_set():
+                try:
+                    frame_q.get_nowait()
+                except _queue.Empty:
                     break
-
-                # ── Fetch + prepare next frame ──────────────────────
-                nxt_frm = frame_q.get()
-                if nxt_frm is None:
-                    break
-                prepared = _prepare(nxt_frm)
-                del nxt_frm
-
-        # Unblock the producer if it is parked on a full queue, then join.
-        while True:
-            try:
-                frame_q.get_nowait()
-            except _queue.Empty:
-                break
-        decoder.join(timeout=5)
-        torch.cuda.empty_cache()
+            decoder.join(timeout=5)
+            torch.cuda.empty_cache()
 
         keep_audio = opts.get("audio", True) and reader.has_audio
         source = path if keep_audio else None
