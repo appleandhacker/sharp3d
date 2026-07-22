@@ -27,20 +27,22 @@ PLY_FILTER = "Gaussian PLY (*.ply);;所有文件 (*)"
 
 
 class OrbitView(QWidget):
-    """Interactive orbit viewport: drag to rotate, scroll to zoom."""
+    """Interactive orbit viewport: drag to rotate, scroll to zoom, drop PLY to load."""
 
     view_changed = Signal(float, float, float)  # d_azimuth, d_elevation, d_distance
+    file_dropped = Signal(str)  # path to dropped .ply file
 
     def __init__(self, colors: Colors, parent=None) -> None:
         super().__init__(parent)
         self._colors = colors
         self._pixmap: QPixmap | None = None
-        self._message = "打开 PLY 文件\n拖拽旋转 · 滚轮缩放"
+        self._message = "拖入 PLY 文件打开\n左键旋转 · 滚轮缩放"
         self._dragging = False
         self._last_pos = QPoint()
         self.setMinimumSize(640, 480)
         self.setMouseTracking(True)
         self.setCursor(Qt.OpenHandCursor)
+        self.setAcceptDrops(True)
 
     # ---- display --------------------------------------------------------
     def set_image(self, rgb: np.ndarray) -> None:
@@ -84,6 +86,21 @@ class OrbitView(QWidget):
     def wheelEvent(self, e: QWheelEvent) -> None:
         delta = -e.angleDelta().y() / 120.0 * 0.5
         self.view_changed.emit(0.0, 0.0, delta)
+
+    # ---- drag & drop ----------------------------------------------------
+    def dragEnterEvent(self, e) -> None:
+        if e.mimeData().hasUrls():
+            for url in e.mimeData().urls():
+                if url.toLocalFile().lower().endswith(".ply"):
+                    e.acceptProposedAction()
+                    return
+
+    def dropEvent(self, e) -> None:
+        for url in e.mimeData().urls():
+            path = url.toLocalFile()
+            if path.lower().endswith(".ply"):
+                self.file_dropped.emit(path)
+                return
 
     # ---- painting -------------------------------------------------------
     def paintEvent(self, event) -> None:
@@ -139,6 +156,7 @@ class GaussianViewerWindow(QMainWindow):
         # Central viewport
         self._view = OrbitView(colors)
         self._view.view_changed.connect(self._on_view_changed)
+        self._view.file_dropped.connect(self._on_file_dropped)
         self.setCentralWidget(self._view)
 
         # Toolbar
@@ -171,6 +189,10 @@ class GaussianViewerWindow(QMainWindow):
         if path:
             self._view.set_message("加载中…")
             self._engine.load_ply(path)
+
+    def _on_file_dropped(self, path: str) -> None:
+        self._view.set_message("加载中…")
+        self._engine.load_ply(path)
 
     def _on_reset(self) -> None:
         self._azimuth = 180.0
