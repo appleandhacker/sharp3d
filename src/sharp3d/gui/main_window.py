@@ -21,12 +21,13 @@ from .sbs_tab import SbsTab
 from .theme import DISPLAY_FONT, ThemeManager, build_palette, build_qss
 from .widgets import GpuMeter
 from .worker import EngineProcess
+from .. import __version__
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("sharp3d — 2D → 3D 立体转换")
+        self.setWindowTitle(f"sharp3d v{__version__}")
 
         # Adaptive initial size: proportional to logical screen (DPI-aware).
         from PySide6.QtWidgets import QApplication
@@ -60,7 +61,7 @@ class MainWindow(QMainWindow):
         logo.setStyleSheet(f"color:{self._theme.colors.red};")
         title = QLabel("sharp3d")
         title.setFont(QFont(DISPLAY_FONT, 22, QFont.Weight.Bold))
-        subtitle = QLabel("平面照片 / 视频 → 立体 3D · 首次启动约90秒，后续约15秒")
+        subtitle = QLabel(f"v{__version__} · 平面照片 / 视频 → 立体 3D · 首次启动约90秒，后续约15秒")
         subtitle.setProperty("cssClass", "hint")
         subtitle.setStyleSheet("font-size:12px;")
 
