@@ -191,20 +191,20 @@ class TemporalStabilizer:
         # Opacities: (N, 1) or (N,)
         opac = g_ndc.opacities.float()
         if self._prev_opacities is not None:
-            smoothed = a * opac + (1 - a) * self._prev_opacities
+            smoothed = a * opac + (1 - a) * self._prev_opacities.float()
             g_ndc.opacities = smoothed.to(g_ndc.opacities.dtype)
-            self._prev_opacities = smoothed  # store smoothed (recursive EMA)
+            self._prev_opacities = smoothed.half()  # FP16 storage saves VRAM
         else:
-            self._prev_opacities = opac
+            self._prev_opacities = opac.half()
 
         # Scale (singular_values): (N, 3)
         scales = g_ndc.singular_values.float()
         if self._prev_scales is not None:
-            smoothed = a * scales + (1 - a) * self._prev_scales
+            smoothed = a * scales + (1 - a) * self._prev_scales.float()
             g_ndc.singular_values = smoothed.to(g_ndc.singular_values.dtype)
-            self._prev_scales = smoothed  # store smoothed (recursive EMA)
+            self._prev_scales = smoothed.half()  # FP16 storage saves VRAM
         else:
-            self._prev_scales = scales
+            self._prev_scales = scales.half()
 
     # ─── EMA-based methods (global / adaptive) ────────────────────────────
 
@@ -292,8 +292,12 @@ class TemporalStabilizer:
         prev_255 = self._prev_img * 255.0
         curr_255 = curr_img * 255.0
 
-        flow_fwd = self._flow_model(prev_255, curr_255)[-1]   # (1, 2, Hf, Wf)
-        flow_bwd = self._flow_model(curr_255, prev_255)[-1]   # (1, 2, Hf, Wf)
+        # Batched bidirectional flow (single forward pass, batch=2).
+        img1_batch = torch.cat([prev_255, curr_255], dim=0)  # (2, 3, Hf, Wf)
+        img2_batch = torch.cat([curr_255, prev_255], dim=0)
+        flow_batch = self._flow_model(img1_batch, img2_batch)[-1]  # (2, 2, Hf, Wf)
+        flow_fwd = flow_batch[0:1]  # (1, 2, Hf, Wf)
+        flow_bwd = flow_batch[1:2]
 
         # ── Occlusion detection (forward-backward consistency) ───────────
         # Warp backward flow to forward frame's coordinate system.

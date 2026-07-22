@@ -509,8 +509,34 @@ class _PipelineWorker:
         decoder = threading.Thread(target=_decode, daemon=True)
         decoder.start()
 
+        # ── Async H2D upload on side stream (overlaps with encode) ──────
+        _side_stream = torch.cuda.Stream()
+
         def _prepare(frm):
-            return prepare_input(frm, f_px, self._device, async_upload=False)
+            with torch.cuda.stream(_side_stream):
+                prepared = prepare_input(frm, f_px, self._device,
+                                         async_upload=True)
+                upload_done = _side_stream.record_event()
+            upload_done.synchronize()
+            return prepared
+
+        # ── Encode thread (overlaps CPU encoding with GPU compute) ──────
+        import queue as _queue
+        encode_q: _queue.Queue = _queue.Queue(maxsize=3)
+
+        def _encode_loop():
+            while True:
+                item = encode_q.get()
+                if item is None:
+                    break
+                frame_np, is_hdr = item
+                if is_hdr:
+                    writer.write_frame(frame_np)
+                else:
+                    writer.append_frame(frame_np)
+
+        encode_thread = threading.Thread(target=_encode_loop, daemon=True)
+        encode_thread.start()
 
         # ── Temporal depth stabilization ─────────────────────────────────
         from sharp3d.temporal import TemporalStabilizer, KalmanScalar
@@ -541,6 +567,7 @@ class _PipelineWorker:
                     stab.stabilize(g_ndc, img=img_r)
                     g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
                                        INTERNAL_SHAPE, decompose_method=method)
+                    del g_ndc  # free NDC gaussians early (~28MB)
 
                     # ── Convergence smoothing (anti-flicker) ────────────
                     # Auto-convergence per-frame quantile jumps cause global
@@ -558,16 +585,13 @@ class _PipelineWorker:
                     packed = pack_stereo(fmt, sbs)
                     torch.cuda.synchronize()
 
-                    # ── Encode ──────────────────────────────────────────
+                    # ── Encode (async via encode thread) ────────────
                     sbs_np = packed.cpu().numpy()
-                    if hdr_out:
-                        writer.write_frame(sbs_np)
-                    else:
-                        writer.append_frame(sbs_np)
+                    encode_q.put((sbs_np, hdr_out))
                     out_written += 1
 
                     # Free GPU tensors immediately after encode to keep VRAM flat
-                    del g, g_ndc, sbs, packed, img_r, prepared, sbs_np
+                    del g, sbs, packed, img_r, prepared, sbs_np
 
                     n_done += 1
                     elapsed = time.time() - t_start
@@ -589,6 +613,9 @@ class _PipelineWorker:
                     prepared = _prepare(nxt_frm)
                     del nxt_frm
         finally:
+            # Stop encode thread (flush remaining frames).
+            encode_q.put(None)
+            encode_thread.join(timeout=30)
             # Always clean up decoder thread (prevents leaked ffmpeg process).
             while True:
                 try:

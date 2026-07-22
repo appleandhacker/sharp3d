@@ -222,9 +222,9 @@ class SbsTab(QWidget):
         self._stabilize = QComboBox()
         self._stabilize.addItems([
             "关闭",
-            "全局对齐 (静态镜头)",
-            "自适应 (推荐)",
-            "光流 (最佳质量)",
+            "全局平滑 (最快, +1ms/帧)",
+            "自适应平滑 (推荐, +2ms/帧)",
+            "光流稳定 (最佳, +50ms/帧)",
         ])
         self._stabilize.setToolTip(
             "视频转换时消除帧间抖动（元素左右跳动/闪烁）。\n\n"
@@ -389,7 +389,9 @@ class SbsTab(QWidget):
         self.request_convert.emit(self._build_opts(inp, out))
 
     def _build_opts(self, inp: str, out: str) -> dict:
-        """Build conversion options dict for a single file."""
+        """Build conversion options for a single file (typed via ConvertOptions)."""
+        from sharp3d.options import ConvertOptions
+
         codec_map = {"H.264": "h264", "H.265": "h265", "AV1": "av1"}
         fps_text = self._fps.currentText()
         out_fps = None if fps_text == "跟随源" else float(fps_text)
@@ -401,27 +403,29 @@ class SbsTab(QWidget):
         else:
             out_width = None
             out_scale = scale_map.get(res_text, 1.0)
-        return {
-            "input": inp,
-            "output": out,
-            "format": FORMATS[self._format.currentIndex()][0],
-            "ipd_mm": self._s_ipd.value(),
-            "convergence": self._s_conv.value(),
-            "strength": self._s_strength.value(),
-            "codec": codec_map[self._codec.currentText()],
-            "crf": int(self._crf.currentText()),
-            "audio": self._chk_audio.isChecked(),
-            "decompose": "analytical" if self._decompose.currentIndex() == 0 else "svd",
-            "depth": self._chk_depth.isChecked(),
-            "ply": self._chk_ply.isChecked(),
-            "hdr_output": self._chk_hdr.isChecked(),
-            "perf_mode": "quality" if self._perf_mode.currentIndex() == 0 else "speed",
-            "out_fps": out_fps,
-            "out_scale": out_scale,
-            "out_width": out_width,
-            "temporal_stabilize": ["off", "global", "adaptive", "flow"][
+
+        opts = ConvertOptions(
+            input=inp,
+            output=out,
+            format=FORMATS[self._format.currentIndex()][0],
+            ipd_mm=self._s_ipd.value(),
+            convergence=self._s_conv.value(),
+            strength=self._s_strength.value(),
+            codec=codec_map[self._codec.currentText()],
+            crf=int(self._crf.currentText()),
+            audio=self._chk_audio.isChecked(),
+            decompose="analytical" if self._decompose.currentIndex() == 0 else "svd",
+            depth=self._chk_depth.isChecked(),
+            ply=self._chk_ply.isChecked(),
+            hdr_output=self._chk_hdr.isChecked(),
+            perf_mode="quality" if self._perf_mode.currentIndex() == 0 else "speed",
+            out_fps=out_fps,
+            out_scale=out_scale,
+            out_width=out_width,
+            temporal_stabilize=["off", "global", "adaptive", "flow"][
                 self._stabilize.currentIndex()],
-        }
+        )
+        return opts.to_dict()
 
     def _start_batch_item(self) -> None:
         """Start converting the current item in the batch queue."""
@@ -458,15 +462,25 @@ class SbsTab(QWidget):
     def _on_convert_progress(self, frame: int, total: int, fps: float,
                              elapsed: float) -> None:
         self._last_fps = fps
-        self._progress.set_value(frame / total if total else 0.0)
+        file_frac = frame / total if total else 0.0
+        self._progress.set_value(file_frac)
         remain = (total - frame) / fps if fps > 0 else 0.0
-        batch_prefix = ""
+
         if self._batch_files:
-            batch_prefix = (f"[{self._batch_idx + 1}/{len(self._batch_files)}] ")
-        self._prog_label.setText(
-            f"{batch_prefix}帧 {frame}/{total} · {fps:.2f} fps · "
-            f"已用 {_fmt_hms(elapsed)} · 剩余 {_fmt_hms(remain)}"
-        )
+            n_files = len(self._batch_files)
+            # Batch-level ETA: current file remaining + remaining files estimate.
+            avg_file_time = elapsed / max(file_frac, 0.01)
+            batch_remain = remain + (n_files - self._batch_idx - 1) * avg_file_time
+            self._prog_label.setText(
+                f"[{self._batch_idx + 1}/{n_files}] "
+                f"帧 {frame}/{total} · {fps:.2f} fps · "
+                f"本文件剩余 {_fmt_hms(remain)} · 批量剩余 ~{_fmt_hms(batch_remain)}"
+            )
+        else:
+            self._prog_label.setText(
+                f"帧 {frame}/{total} · {fps:.2f} fps · "
+                f"已用 {_fmt_hms(elapsed)} · 剩余 {_fmt_hms(remain)}"
+            )
 
     def _on_convert_done(self, result: dict) -> None:
         if result.get("cancelled"):
