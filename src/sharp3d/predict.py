@@ -117,7 +117,11 @@ class SharpPredictor:
         self._progress = progress_cb or (lambda s, p: None)
 
         if cache_dir is None:
-            cache_dir = Path(__file__).resolve().parents[2] / ".cache"
+            import sys as _sys, os as _os
+            if getattr(_sys, "frozen", False):
+                cache_dir = Path(_os.environ.get("LOCALAPPDATA", "~")) / "sharp3d" / ".cache"
+            else:
+                cache_dir = Path(__file__).resolve().parents[2] / ".cache"
         self._cache_dir = cache_dir
 
         # ── Load weights ─────────────────────────────────────────────────
@@ -210,20 +214,31 @@ class SharpPredictor:
             pass
 
         # ── torch.compile (需要 MSVC cl.exe，自动探测或回退 eager) ────────
-        if not shutil.which("cl"):
+        import os as _os
+        if _os.environ.get("SHARP3D_NO_COMPILE"):
+            self._progress("跳过编译（打包模式）", 55)
+            self._compiled = predictor
+        elif not shutil.which("cl"):
             _inject_msvc_env()
-        if shutil.which("cl"):
+            if shutil.which("cl"):
+                self._progress("编译预测器", 55)
+                torch._dynamo.config.capture_scalar_outputs = True
+                torch._inductor.config.triton.cudagraphs = False
+                torch._inductor.config.compile_threads = 1
+                torch._inductor.config.coordinate_descent_tuning = False
+                self._compiled = torch.compile(predictor, mode="max-autotune", dynamic=False)
+            else:
+                self._progress("跳过编译（未检测到 MSVC）", 55)
+                logger.warning("未检测到 cl.exe (MSVC)，跳过 torch.compile，"
+                               "推理速度降低约 16%。安装 Visual Studio 可获得最佳性能。")
+                self._compiled = predictor
+        else:
             self._progress("编译预测器", 55)
             torch._dynamo.config.capture_scalar_outputs = True
             torch._inductor.config.triton.cudagraphs = False
             torch._inductor.config.compile_threads = 1
             torch._inductor.config.coordinate_descent_tuning = False
             self._compiled = torch.compile(predictor, mode="max-autotune", dynamic=False)
-        else:
-            self._progress("跳过编译（未检测到 MSVC）", 55)
-            logger.warning("未检测到 cl.exe (MSVC)，跳过 torch.compile，"
-                           "推理速度降低约 16%。安装 Visual Studio 可获得最佳性能。")
-            self._compiled = predictor
 
         # ── Warmup inference ─────────────────────────────────────────────
         from .unproject import INTERNAL_SHAPE
