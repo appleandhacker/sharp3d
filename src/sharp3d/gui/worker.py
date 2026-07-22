@@ -89,7 +89,12 @@ class _PipelineWorker:
             self._respond("status", ("速度模式：21 patches（精简金字塔）",))
         predictor = create_predictor(params)
         predictor.load_state_dict(state_dict)
+        del state_dict  # free CPU copy immediately (~1.5GB RAM)
         predictor.eval().to(self._device)
+        # Convert stored weights to FP16: autocast already computes in FP16,
+        # so keeping FP32 weights just wastes ~1.5GB VRAM for no benefit.
+        predictor.half()
+        self._respond("status", ("模型权重 FP16（节省 ~1.5GB 显存）",))
         self._torch = torch
 
         # Apply channels_last memory format for Conv2d layers (lossless speedup)
@@ -359,7 +364,7 @@ class _PipelineWorker:
         torch.cuda.empty_cache()
         gc.collect()
 
-        self._respond("convert_progress", (1, 1, 1.0 / elapsed))
+        self._respond("convert_progress", (1, 1, 1.0 / elapsed, elapsed))
         self._respond("convert_done", ({
             "output": str(out), "elapsed": elapsed, "fps": 1.0 / elapsed,
             "n_frames": 1, "size": output_size(fmt, sw, sh),
@@ -400,6 +405,21 @@ class _PipelineWorker:
         # ── Output frame rate (None → keep source fps) ──
         out_fps = opts.get("out_fps") or reader.fps
 
+        # ── Frame-rate conversion: map output frames → source frames ──
+        # out_per_src[i] = how many output frames source frame i produces.
+        # out_fps < source → decimation (some source frames skipped → fewer
+        # frames converted → faster). out_fps > source → duplication.
+        src_fps = reader.fps or out_fps
+        if out_fps and src_fps and abs(out_fps - src_fps) > 1e-6:
+            out_count = max(1, int(round(n * out_fps / src_fps)))
+            out_per_src = [0] * n
+            for j in range(out_count):
+                si = min(n - 1, int(round(j * src_fps / out_fps)))
+                out_per_src[si] += 1
+        else:
+            out_count = n
+            out_per_src = [1] * n
+
         # Show which encoder was selected (GPU vs CPU) for all codecs.
         codec = opts.get("codec", "h264")
         if not opts.get("hdr_output", False):
@@ -423,16 +443,14 @@ class _PipelineWorker:
                                  codec=opts.get("codec", "h264"),
                                  crf=opts.get("crf", 18))
 
-        frame_times = []
-
-        # Prefetch: a background thread decodes frames from the ffmpeg pipe
-        # while the GPU renders, so decode time overlaps rendering instead of
-        # serializing with it. (Plain threads are safe here — this runs in
-        # the Qt-free child process.)
+        # ── Decode prefetch thread ──────────────────────────────────────
+        # Queue of 4 frames balances decode prefetch against RAM pressure
+        # (4 × 4K frame ≈ 100MB). Larger queues risk pushing the system
+        # into swap when shared GPU memory already consumes most RAM.
         import queue as _queue
         import threading
 
-        frame_q: _queue.Queue = _queue.Queue(maxsize=3)
+        frame_q: _queue.Queue = _queue.Queue(maxsize=4)
 
         def _decode():
             try:
@@ -446,84 +464,90 @@ class _PipelineWorker:
         decoder = threading.Thread(target=_decode, daemon=True)
         decoder.start()
 
-        # Synchronous host->device transfer. The previous async version
-        # (pinned memory + non-blocking copy on a side stream) called
-        # upload_done.synchronize() right after, which already serialized the
-        # transfer — so it added side-stream/event complexity with no real
-        # overlap benefit. Sync upload is simpler and equally fast.
         def _prepare(frm):
             return prepare_input(frm, f_px, self._device, async_upload=False)
 
-        i = 0
-        first = frame_q.get()
-        if first is not None and not self._cancel_event.is_set():
-            prepared = _prepare(first)
-            del first
+        def _used_frames():
+            """Yield (frame_np, n_outputs) for each source frame kept in the
+            output (out_per_src[i] > 0); skipped frames are drained but not
+            yielded, so decimated frames cost nothing beyond decode."""
+            si = 0
+            while True:
+                frm = frame_q.get()
+                if frm is None:
+                    return
+                cnt = out_per_src[si] if si < len(out_per_src) else 0
+                si += 1
+                if cnt > 0:
+                    yield frm, cnt
 
-            # Timing accumulators for bottleneck diagnosis
-            t_pred_acc = t_rend_acc = t_enc_acc = 0.0
-            n_timed = 0
+        # ── Main conversion loop ────────────────────────────────────────
+        # Wall-clock timing: elapsed and avg_fps are computed from the real
+        # start time, NOT from instantaneous per-frame dt (which caused the
+        # timer to jump back and forth as frame times varied).
+        out_written = 0
+        t_start = time.time()
+        n_done = 0
+        used = _used_frames()
+        first = next(used, None)
+        if first is not None and not self._cancel_event.is_set():
+            frm, cnt = first
+            prepared = _prepare(frm)
+            del frm
 
             while True:
-                # Fetch the next frame and prepare it (sync upload).
-                nxt = frame_q.get()
-                nxt_prepared = None
-                if nxt is not None and not self._cancel_event.is_set():
-                    nxt_prepared = _prepare(nxt)
-                del nxt
-
                 img_r, df, ir, (w, h) = prepared
-                t0 = time.time()
 
-                # ── Predict + unproject ─────────────────────────────
+                # ── Predict + unproject (GPU-bound, ~500ms) ─────────
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
                     g_ndc = self._compiled(img_r, df)
                 g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
                                    INTERNAL_SHAPE, decompose_method=method)
-                t_pred = time.time() - t0
 
-                # ── Render + pack (sequential on main stream) ───────
-                t_r0 = time.time()
+                # ── Render + pack (GPU) ─────────────────────────────
                 sbs, _ = render_sbs(g, f_px, w, h,
                                     ipd=ipd_scene, convergence=conv,
                                     render_width=render_w)
                 packed = pack_stereo(fmt, sbs)
                 torch.cuda.synchronize()
-                t_rend = time.time() - t_r0
 
-                dt = time.time() - t0
-                frame_times.append(dt)
-
-                # ── Encode ──────────────────────────────────────────
-                t_e0 = time.time()
+                # ── Encode (write this frame `cnt` times) ───────────
                 sbs_np = packed.cpu().numpy()
-                if hdr_out:
-                    writer.write_frame(sbs_np)
-                else:
-                    writer.append_frame(sbs_np)
-                t_enc = time.time() - t_e0
+                for _ in range(cnt):
+                    if hdr_out:
+                        writer.write_frame(sbs_np)
+                    else:
+                        writer.append_frame(sbs_np)
+                    out_written += 1
 
-                t_pred_acc += t_pred
-                t_rend_acc += t_rend
-                t_enc_acc += t_enc
-                n_timed += 1
-                if n_timed % 10 == 0:
-                    self._respond("status", (
-                        f"耗时分布: predict {t_pred_acc/n_timed*1000:.0f}ms | "
-                        f"render {t_rend_acc/n_timed*1000:.0f}ms | "
-                        f"encode {t_enc_acc/n_timed*1000:.0f}ms",))
+                # Free GPU tensors immediately after encode to keep VRAM flat
+                del g, g_ndc, sbs, packed, img_r, prepared, sbs_np
 
-                self._respond("convert_progress", (i + 1, n, 1.0 / dt))
-                i += 1
-                del g, g_ndc, sbs, packed, img_r, prepared
-                # Deliberately NO per-frame torch.cuda.empty_cache(): it forces
-                # a device sync plus allocator churn on every frame. Shapes are
-                # constant frame-to-frame, so the caching allocator reuses its
-                # blocks and VRAM stays flat.
+                n_done += 1
+                elapsed = time.time() - t_start
+                avg_fps = n_done / elapsed if elapsed > 0 else 0.0
+                self._respond("convert_progress",
+                              (out_written, out_count, avg_fps, elapsed))
 
-                if nxt_prepared is None:
+                # Periodic cleanup every 30 frames: gc.collect() prevents RAM
+                # accumulation; empty_cache() returns fragmented VRAM blocks to
+                # CUDA so the allocator doesn't slowly creep into shared memory.
+                if n_done % 30 == 0:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                if self._cancel_event.is_set():
                     break
-                prepared = nxt_prepared
+
+                # ── Fetch + prepare next frame (overlaps with encode I/O
+                #    settling; the GPU is free here so the H2D copy and
+                #    F.interpolate resize run without contention) ─────
+                nxt = next(used, None)
+                if nxt is None:
+                    break
+                nxt_frm, cnt = nxt
+                prepared = _prepare(nxt_frm)
+                del nxt_frm
 
         # Unblock the producer if it is parked on a full queue, then join.
         while True:
@@ -541,11 +565,12 @@ class _PipelineWorker:
         else:
             writer.close(source_video=source)
 
-        avg = float(np.mean(frame_times)) if frame_times else 0.0
+        total_elapsed = time.time() - t_start
+        avg = n_done / total_elapsed if total_elapsed > 0 else 0.0
         self._respond("convert_done", ({
-            "output": str(out), "elapsed": sum(frame_times),
-            "fps": 1.0 / avg if avg else 0.0,
-            "n_frames": len(frame_times), "size": (out_w, out_h),
+            "output": str(out), "elapsed": total_elapsed,
+            "fps": avg,
+            "n_frames": n_done, "size": (out_w, out_h),
             "cancelled": self._cancel_event.is_set(), "hdr": hdr_out,
         },))
 
@@ -673,7 +698,7 @@ class EngineProcess(QObject):
     model_ready = Signal()
     prepared = Signal(dict)
     preview_ready = Signal(object)
-    convert_progress = Signal(int, int, float)
+    convert_progress = Signal(int, int, float, float)  # done, total, avg_fps, elapsed_s
     convert_done = Signal(dict)
     anim_frame = Signal(object)
     anim_progress = Signal(int, int)

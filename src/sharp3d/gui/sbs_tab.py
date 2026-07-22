@@ -351,11 +351,13 @@ class SbsTab(QWidget):
         self._engine.cancel()
         self.status_message.emit("正在取消…")
 
-    def _on_convert_progress(self, frame: int, total: int, fps: float) -> None:
+    def _on_convert_progress(self, frame: int, total: int, fps: float,
+                             elapsed: float) -> None:
         self._last_fps = fps
         self._progress.set_value(frame / total if total else 0.0)
-        elapsed = frame / fps if fps else 0.0
-        remain = (total - frame) / fps if fps else 0.0
+        # elapsed is real wall-clock time from the worker (no more jumping).
+        # Remaining estimate uses the running average fps.
+        remain = (total - frame) / fps if fps > 0 else 0.0
         self._prog_label.setText(
             f"帧 {frame}/{total} · {fps:.2f} fps · "
             f"已用 {_fmt_hms(elapsed)} · 剩余 {_fmt_hms(remain)}"
