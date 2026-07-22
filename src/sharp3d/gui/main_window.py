@@ -96,7 +96,7 @@ class MainWindow(QMainWindow):
         # status bar
         sb = QStatusBar()
         self.setStatusBar(sb)
-        self._status_label = QLabel("就绪")
+        self._status_label = QLabel("正在加载模型…")
         sb.addWidget(self._status_label, 1)
         self._theme_label = QLabel("")
         sb.addPermanentWidget(self._theme_label)
