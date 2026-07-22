@@ -514,8 +514,10 @@ class _PipelineWorker:
 
         # ── Temporal depth stabilization ─────────────────────────────────
         from sharp3d.temporal import TemporalStabilizer
+        from sharp3d.render import _compute_focus_depth_gpu
         stab_mode = opts.get("temporal_stabilize", "off")
         stab = TemporalStabilizer(mode=stab_mode, device=self._device)
+        prev_focus = None  # convergence EMA state
 
         # ── Main conversion loop ────────────────────────────────────────
         # Every frame from the queue is processed (ffmpeg already selected the
@@ -539,9 +541,20 @@ class _PipelineWorker:
                 g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
                                    INTERNAL_SHAPE, decompose_method=method)
 
+                # ── Convergence smoothing (anti-flicker) ────────────
+                # Auto-convergence per-frame quantile jumps cause global
+                # horizontal shift. EMA-smooth the focus depth scalar.
+                frame_conv = conv
+                if conv is None and stab_mode != "off":
+                    focus = _compute_focus_depth_gpu(g.mean_vectors)
+                    if prev_focus is not None:
+                        focus = 0.35 * focus + 0.65 * prev_focus
+                    prev_focus = focus
+                    frame_conv = focus
+
                 # ── Render + pack (GPU) ─────────────────────────────
                 sbs, _ = render_sbs(g, f_px, w, h,
-                                    ipd=ipd_scene, convergence=conv,
+                                    ipd=ipd_scene, convergence=frame_conv,
                                     render_width=render_w)
                 packed = pack_stereo(fmt, sbs)
                 torch.cuda.synchronize()
