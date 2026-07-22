@@ -273,6 +273,7 @@ class FrameReader:
                 ).copy()
         finally:
             proc.stdout.close()
+            proc.kill()  # prevent deadlock if ffmpeg still writing to full pipe
             proc.wait()
 
 
@@ -337,7 +338,9 @@ class Hdr10Writer:
     def close(self, audio_source: str | Path | None = None) -> None:
         """Finish encoding and optionally mux audio from a source video."""
         self._proc.stdin.close()
-        self._proc.wait()
+        rc = self._proc.wait()
+        if rc != 0:
+            raise RuntimeError(f"HDR10 编码器异常退出 (code={rc})")
 
         if audio_source is not None:
             cmd = [

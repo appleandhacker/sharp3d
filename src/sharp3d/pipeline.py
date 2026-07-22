@@ -221,6 +221,12 @@ class Sharp3DPipeline:
         decoder = threading.Thread(target=_decode, daemon=True)
         decoder.start()
 
+        # Temporal stabilization (same as GUI path).
+        from .temporal import TemporalStabilizer, KalmanScalar
+        from .render import _compute_focus_depth_gpu
+        stab = TemporalStabilizer(mode="adaptive", device=self.device)
+        conv_kf = KalmanScalar(q_pos=0.05, q_vel=0.02, r=0.15)
+
         # Pipeline the host->device transfer: prepare frame N+1 on a side
         # stream while frame N renders on the main stream (copy and compute
         # use separate engines, so the upload overlaps GPU work).
@@ -256,6 +262,7 @@ class Sharp3DPipeline:
                 t0 = time.time()
 
                 g_ndc = self.predictor.predict(img_resized, df)
+                stab.stabilize(g_ndc, img=img_resized)
                 g_world = fast_unproject(
                     g_ndc,
                     torch.eye(4, device=self.device),
@@ -263,8 +270,12 @@ class Sharp3DPipeline:
                     INTERNAL_SHAPE,
                     decompose_method=self.decompose_method,
                 )
+                # Convergence Kalman smoothing (auto mode).
+                focus = _compute_focus_depth_gpu(g_world.mean_vectors)
+                frame_conv = conv_kf.update(focus)
                 sbs_img, _ = render_sbs(
-                    g_world, f_px, orig_w, orig_h, ipd=self.ipd
+                    g_world, f_px, orig_w, orig_h, ipd=self.ipd,
+                    convergence=frame_conv,
                 )
 
                 torch.cuda.synchronize()

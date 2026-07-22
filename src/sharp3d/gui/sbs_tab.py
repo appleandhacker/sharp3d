@@ -369,7 +369,10 @@ class SbsTab(QWidget):
         if p.is_dir() and not self._batch_files:
             self._on_input(inp)
         if self._batch_files:
-            self._batch_idx = 0
+            # Resume from failed item if _batch_idx > 0 (error recovery),
+            # otherwise start fresh.
+            if self._batch_idx == 0 or self._batch_idx >= len(self._batch_files):
+                self._batch_idx = 0
             self._start_batch_item()
             return
 
@@ -509,7 +512,12 @@ class SbsTab(QWidget):
         self._btn_start.setEnabled(True)
         self._btn_cancel.setEnabled(False)
         self._progress.set_busy(False)
-        self._prog_label.setText("出错")
+        if self._batch_files and self._batch_idx < len(self._batch_files):
+            self._prog_label.setText(
+                f"批量 [{self._batch_idx + 1}/{len(self._batch_files)}] 出错，"
+                f"点击开始从断点继续")
+        else:
+            self._prog_label.setText("出错")
         self.status_message.emit(msg)
 
     # ------------------------------------------------------------------

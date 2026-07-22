@@ -74,21 +74,24 @@ def pack(fmt: str, sbs: "torch.Tensor") -> "torch.Tensor":
     left, right = sbs[:, :w], sbs[:, w:]
 
     if fmt == "full_sbs":
-        return sbs
-    if fmt == "cross":
-        return torch.cat([right, left], dim=1)
-    if fmt == "full_tb":
-        return torch.cat([left, right], dim=0)
-    if fmt == "anaglyph":
-        # Half-color anaglyph: red channel from the left eye, green/blue from
-        # the right. The classic red/cyan glasses format.
-        return torch.stack([left[..., 0], right[..., 1], right[..., 2]], dim=-1)
-    if fmt == "half_sbs":
+        out = sbs
+    elif fmt == "cross":
+        out = torch.cat([right, left], dim=1)
+    elif fmt == "full_tb":
+        out = torch.cat([left, right], dim=0)
+    elif fmt == "anaglyph":
+        out = torch.stack([left[..., 0], right[..., 1], right[..., 2]], dim=-1)
+    elif fmt == "half_sbs":
         half_w = _even(w // 2)
-        return torch.cat([_squeeze(left, (h, half_w)),
-                          _squeeze(right, (h, half_w))], dim=1)
-    if fmt == "half_tb":
+        out = torch.cat([_squeeze(left, (h, half_w)),
+                         _squeeze(right, (h, half_w))], dim=1)
+    elif fmt == "half_tb":
         half_h = _even(h // 2)
-        return torch.cat([_squeeze(left, (half_h, w)),
-                          _squeeze(right, (half_h, w))], dim=0)
-    raise ValueError(f"unknown stereo format: {fmt}")
+        out = torch.cat([_squeeze(left, (half_h, w)),
+                         _squeeze(right, (half_h, w))], dim=0)
+    else:
+        raise ValueError(f"unknown stereo format: {fmt}")
+
+    # Enforce even dimensions (video codecs require this).
+    oh, ow = out.shape[0], out.shape[1]
+    return out[:_even(oh), :_even(ow)]
