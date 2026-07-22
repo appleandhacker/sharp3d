@@ -253,8 +253,15 @@ class SbsTab(QWidget):
 
         # ---- progress card ------------------------------------------------
         prog_card = SectionCard(c, "转换进度")
+        prog_bar_row = QHBoxLayout()
         self._progress = AnimatedProgressBar(c)
-        prog_card.add_widget(self._progress)
+        prog_bar_row.addWidget(self._progress, 1)
+        self._pct_label = QLabel("0%")
+        self._pct_label.setProperty("cssClass", "mono")
+        self._pct_label.setFixedWidth(40)
+        self._pct_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        prog_bar_row.addWidget(self._pct_label)
+        prog_card.add_layout(prog_bar_row)
 
         prog_row = QHBoxLayout()
         self._prog_label = QLabel("就绪")
@@ -289,16 +296,19 @@ class SbsTab(QWidget):
     def _on_model_loading(self) -> None:
         self._progress.set_busy(False)
         self._progress.set_value(0.03)
+        self._pct_label.setText("3%")
         self._prog_label.setText("正在初始化…")
 
     def _on_model_load_progress(self, stage: str, pct: int) -> None:
         self._progress.set_busy(False)
         self._progress.set_value(pct / 100.0)
+        self._pct_label.setText(f"{pct}%")
         self._prog_label.setText(f"{stage}… {pct}%")
 
     def _on_model_ready(self) -> None:
         self._progress.set_value(1.0)
         self._progress.set_busy(False)
+        self._pct_label.setText("100%")
         self._prog_label.setText("模型就绪")
 
     def _on_res_changed(self, idx: int) -> None:
@@ -464,6 +474,7 @@ class SbsTab(QWidget):
         self._last_fps = fps
         file_frac = frame / total if total else 0.0
         self._progress.set_value(file_frac)
+        self._pct_label.setText(f"{int(file_frac * 100)}%")
         remain = (total - frame) / fps if fps > 0 else 0.0
 
         if self._batch_files:
@@ -488,6 +499,7 @@ class SbsTab(QWidget):
             self._btn_start.setEnabled(True)
             self._btn_cancel.setEnabled(False)
             self._progress.set_busy(False)
+            self._pct_label.setText("0%")
             self._prog_label.setText("已取消")
             self.status_message.emit("转换已取消")
             self._batch_files = []
@@ -504,6 +516,7 @@ class SbsTab(QWidget):
             self._btn_start.setEnabled(True)
             self._btn_cancel.setEnabled(False)
             self._progress.set_value(1.0)
+            self._pct_label.setText("100%")
             n = len(self._batch_files)
             self._prog_label.setText(f"批量完成 · 共 {n} 个文件")
             self.status_message.emit(f"批量转换完成 · {n} 个文件")
@@ -516,6 +529,7 @@ class SbsTab(QWidget):
         self._btn_cancel.setEnabled(False)
         self._progress.set_value(1.0)
         self._progress.set_busy(False)
+        self._pct_label.setText("100%")
         self._prog_label.setText(
             f"完成 · {result['n_frames']} 帧 · {result['fps']:.2f} fps · {result['output']}"
         )
