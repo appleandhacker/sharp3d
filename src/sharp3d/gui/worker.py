@@ -425,20 +425,22 @@ class _PipelineWorker:
                     img_r, df, ir, (w, h) = prepared
 
                     # ── GPU pipeline (predict→stabilize→render→pack) ──
-                    need_gaussians = (want_ply and n_done == 0)
                     result = engine.process_frame(
                         img_r, df, ir, (w, h),
                         return_depth=want_depth,
-                        return_gaussians=need_gaussians,
+                        return_gaussians=want_ply,
                     )
 
                     # Unpack results
-                    if need_gaussians:
+                    if want_ply:
                         sbs_np, depth_np, g_world = result
                         from sharp.utils.gaussians import save_ply
-                        ply_path = out.with_suffix(".ply")
+                        ply_path = out.with_suffix("") / f"{out.stem}_{n_done:05d}.ply"
+                        ply_path.parent.mkdir(parents=True, exist_ok=True)
                         save_ply(g_world, f_px, (h, w), ply_path)
-                        self._respond("status", (f"PLY 已导出: {ply_path.name}",))
+                        if n_done == 0:
+                            self._respond("status", (
+                                f"PLY 序列导出中: {ply_path.parent.name}/",))
                         del g_world
                     elif want_depth:
                         sbs_np, depth_np = result
