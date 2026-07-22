@@ -287,8 +287,8 @@ class SbsTab(QWidget):
             self._codec.setCurrentText("H.265")
 
     def _on_model_loading(self) -> None:
-        self._progress.set_value(0.0)
-        self._progress.set_busy(True)
+        self._progress.set_busy(False)
+        self._progress.set_value(0.03)
         self._prog_label.setText("正在初始化…")
 
     def _on_model_load_progress(self, stage: str, pct: int) -> None:
