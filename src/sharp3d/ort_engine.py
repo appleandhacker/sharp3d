@@ -243,7 +243,9 @@ class ORTEncoder(nn.Module):
     def _forward_iobinding(self, x: torch.Tensor):
         """Zero-copy IO Binding path: GPU tensor → ORT → GPU tensors."""
         batch = x.shape[0]
-        x_contig = x.detach().contiguous()
+        # Ensure FP32: after predictor.half(), patches may arrive as FP16,
+        # but the ONNX model and IO Binding expect FP32 input.
+        x_contig = x.detach().float().contiguous()
 
         # Pre-allocate output tensors on CUDA based on session metadata
         out_tensors = []

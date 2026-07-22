@@ -91,10 +91,6 @@ class _PipelineWorker:
         predictor.load_state_dict(state_dict)
         del state_dict  # free CPU copy immediately (~1.5GB RAM)
         predictor.eval().to(self._device)
-        # Convert stored weights to FP16: autocast already computes in FP16,
-        # so keeping FP32 weights just wastes ~1.5GB VRAM for no benefit.
-        predictor.half()
-        self._respond("status", ("模型权重 FP16（节省 ~1.5GB 显存）",))
         self._torch = torch
 
         # Apply channels_last memory format for Conv2d layers (lossless speedup)
@@ -135,6 +131,12 @@ class _PipelineWorker:
                     f"image_encoder: TensorRT + IO Binding",))
         except Exception:
             pass  # Fallback to PyTorch
+
+        # Convert remaining PyTorch weights to FP16 AFTER ORT export (export
+        # needs FP32 model + FP32 dummy input). ORT encoders have no PyTorch
+        # parameters so .half() is a no-op on them. Saves ~1.5GB VRAM.
+        predictor.half()
+        self._respond("status", ("模型权重 FP16（节省 ~1.5GB 显存）",))
 
         self._pipeline = predictor
 
