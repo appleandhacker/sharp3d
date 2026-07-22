@@ -104,8 +104,8 @@ class SbsTab(QWidget):
         conv_hint.setProperty("cssClass", "hint")
         stereo_card.add_widget(self._s_ipd)
         stereo_card.add_widget(self._s_conv)
-        stereo_card.add_widget(self._s_strength)
         stereo_card.add_widget(conv_hint)
+        stereo_card.add_widget(self._s_strength)
         left.addWidget(stereo_card)
         left.addStretch(1)
 
