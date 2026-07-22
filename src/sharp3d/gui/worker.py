@@ -531,12 +531,13 @@ class _PipelineWorker:
                 self._respond("convert_progress",
                               (out_written, out_count, avg_fps, elapsed))
 
-                # Periodic cleanup every 30 frames: gc.collect() prevents RAM
-                # accumulation; empty_cache() returns fragmented VRAM blocks to
-                # CUDA so the allocator doesn't slowly creep into shared memory.
+                # Periodic CPU GC every 30 frames prevents RAM accumulation.
+                # NOTE: deliberately NO torch.cuda.empty_cache() here — it forces
+                # a full device sync + allocator pool rebuild, which under tight
+                # VRAM caused progressive slowdown. Frame shapes are constant so
+                # the caching allocator reuses blocks naturally and VRAM stays flat.
                 if n_done % 30 == 0:
                     gc.collect()
-                    torch.cuda.empty_cache()
 
                 if self._cancel_event.is_set():
                     break

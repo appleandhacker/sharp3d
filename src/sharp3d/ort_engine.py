@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 # Default cache directories (relative to project root)
 _CACHE_DIR = Path(__file__).resolve().parent.parent.parent / ".cache"
 _ONNX_DIR = _CACHE_DIR / "onnx"
-_TRT_CACHE_DIR = _CACHE_DIR / "trt_v2"  # v2: rebuilt with 1GB workspace limit
+_TRT_CACHE_DIR = _CACHE_DIR / "trt_v3"  # v3: rebuilt with 2GB workspace
 
 
 def _ensure_cudnn_path():
@@ -203,9 +203,10 @@ class ORTEncoder(nn.Module):
 
         trt_opts = {
             "trt_fp16_enable": True,
-            # 1GB workspace per engine (was 4GB which caused 12GB VRAM overflow
-            # into shared system memory → PCIe-bound → 9% GPU utilization).
-            "trt_max_workspace_size": 1 * 1024 * 1024 * 1024,
+            # 2GB workspace per engine. 1GB forced TRT into slower algorithms
+            # (speed regression); 4GB overflowed 12GB VRAM into shared memory.
+            # 2GB keeps total VRAM ~9.5GB (safe margin) with fast algorithms.
+            "trt_max_workspace_size": 2 * 1024 * 1024 * 1024,
             "trt_engine_cache_enable": True,
             "trt_engine_cache_path": str(self._trt_cache_dir),
         }
