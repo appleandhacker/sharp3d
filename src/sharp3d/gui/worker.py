@@ -176,17 +176,17 @@ class _PipelineWorker:
             video_exts = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
             is_video = path.suffix.lower() in video_exts
             if is_video:
-                self._convert_video(path, out, opts, ipd_scene, conv, method,
+                self._convert_video(path, out, opts, ipd_scene, conv_q, method,
                                     prepare_input, fast_unproject, render_sbs,
                                     INTERNAL_SHAPE, torch)
             else:
-                self._convert_image(path, out, opts, ipd_scene, conv, method,
+                self._convert_image(path, out, opts, ipd_scene, conv_q, method,
                                     prepare_input, fast_unproject, render_sbs,
                                     INTERNAL_SHAPE, torch, sharp_io)
         except Exception as exc:  # noqa: BLE001
             self._respond("error", (f"转换失败: {exc}",))
 
-    def _convert_image(self, path, out, opts, ipd_scene, conv, method,
+    def _convert_image(self, path, out, opts, ipd_scene, conv_q, method,
                        prepare_input, fast_unproject, render_sbs,
                        INTERNAL_SHAPE, torch, sharp_io):
         from PIL import Image
@@ -239,7 +239,7 @@ class _PipelineWorker:
             "n_frames": 1, "size": output_size(fmt, sw, sh),
         },))
 
-    def _convert_video(self, path, out, opts, ipd_scene, conv, method,
+    def _convert_video(self, path, out, opts, ipd_scene, conv_q, method,
                        prepare_input, fast_unproject, render_sbs,
                        INTERNAL_SHAPE, torch):
         from sharp3d.hdr import FrameReader, Hdr10Writer
