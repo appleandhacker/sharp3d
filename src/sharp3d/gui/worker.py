@@ -143,9 +143,10 @@ class _PipelineWorker:
             return
         try:
             torch = self._torch
-            from sharp3d.render import render_sbs
+            from sharp3d.render import render_sbs, _compute_focus_depth_gpu
             ipd_scene = (ipd_mm / 1000.0) * strength
-            conv = None if convergence <= 0 else convergence
+            q = convergence if convergence > 0 else 0.50
+            conv = _compute_focus_depth_gpu(self._gaussians.mean_vectors, q_focus=q)
             with torch.no_grad():
                 sbs, _ = render_sbs(
                     self._gaussians, self._f_px, self._orig_w, self._orig_h,
@@ -169,7 +170,7 @@ class _PipelineWorker:
             path = Path(opts["input"])
             out = Path(opts["output"])
             ipd_scene = (opts["ipd_mm"] / 1000.0) * opts["strength"]
-            conv = None if opts["convergence"] <= 0 else opts["convergence"]
+            conv_q = opts["convergence"] if opts["convergence"] > 0 else None
             method = opts.get("decompose", "analytical")
 
             video_exts = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
@@ -208,8 +209,11 @@ class _PipelineWorker:
             g_ndc = self._compiled(img_r, df)
         g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
                            INTERNAL_SHAPE, decompose_method=method)
+        from sharp3d.render import _compute_focus_depth_gpu
+        q = conv_q if conv_q else 0.50
+        conv_dist = _compute_focus_depth_gpu(g.mean_vectors, q_focus=q)
         sbs, (sw, sh) = render_sbs(g, f_px, w, h, ipd=ipd_scene,
-                                   convergence=conv, render_width=render_w)
+                                   convergence=conv_dist, render_width=render_w)
         packed = pack_stereo(fmt, sbs)
         torch.cuda.synchronize()
         elapsed = time.time() - t0
@@ -388,7 +392,7 @@ class _PipelineWorker:
             f_px=f_px,
             fmt=fmt,
             ipd=ipd_scene,
-            convergence=conv,
+            convergence_q=conv_q,
             decompose_method=method,
             stabilize_mode=stab_mode,
             render_width=render_w,

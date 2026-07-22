@@ -96,11 +96,11 @@ class SbsTab(QWidget):
         stereo_card = SectionCard(c, "立体参数")
         self._s_ipd = StereoSlider(c, "瞳距 IPD", 50, 80, 63, fmt="{:.0f}",
                                    unit="mm", stereo=True)
-        self._s_conv = StereoSlider(c, "收敛深度", 0, 20, 0, fmt="{:.1f}",
-                                    unit="m")
+        self._s_conv = StereoSlider(c, "收敛分位", 0, 100, 0, fmt="{:.0f}",
+                                    unit="%")
         self._s_strength = StereoSlider(c, "立体强度", 0.2, 2.5, 1.0,
                                         fmt="{:.2f}", unit="x")
-        conv_hint = QLabel("0 = 自动(50%前景突出) · 值越大前景突出越多")
+        conv_hint = QLabel("0 = 自动(50%) · 值越大前景突出越多 · 100=全部突出")
         conv_hint.setProperty("cssClass", "hint")
         stereo_card.add_widget(self._s_ipd)
         stereo_card.add_widget(self._s_conv)
@@ -409,7 +409,7 @@ class SbsTab(QWidget):
             output=out,
             format=FORMATS[self._format.currentIndex()][0],
             ipd_mm=self._s_ipd.value(),
-            convergence=self._s_conv.value(),
+            convergence=self._s_conv.value() / 100.0,  # 0=auto, else quantile
             strength=self._s_strength.value(),
             codec=codec_map[self._codec.currentText()],
             crf=int(self._crf.currentText()),

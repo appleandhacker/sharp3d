@@ -37,7 +37,7 @@ class VideoConversionEngine:
         f_px: float,
         fmt: str = "full_sbs",
         ipd: float = 0.063,
-        convergence: float | None = None,
+        convergence_q: float | None = None,
         decompose_method: str = "analytical",
         stabilize_mode: str = "adaptive",
         render_width: int | None = None,
@@ -49,7 +49,8 @@ class VideoConversionEngine:
             f_px: Focal length in pixels (source image space).
             fmt: Stereo packing format key.
             ipd: Inter-pupillary distance in scene units.
-            convergence: Fixed convergence distance, or None for auto (Kalman-smoothed).
+            convergence_q: Quantile for convergence plane (0-1). None or 0 = auto (0.50).
+                           E.g., 0.3 = 30% of geometry pops out.
             decompose_method: "analytical" or "svd".
             stabilize_mode: "off", "global", "adaptive", or "flow".
             render_width: Per-eye render width (None = source resolution).
@@ -59,7 +60,7 @@ class VideoConversionEngine:
         self._f_px = f_px
         self._fmt = fmt
         self._ipd = ipd
-        self._convergence = convergence
+        self._convergence_q = convergence_q if convergence_q else 0.50
         self._decompose = decompose_method
         self._render_width = render_width
 
@@ -97,11 +98,10 @@ class VideoConversionEngine:
                            INTERNAL_SHAPE, decompose_method=self._decompose)
         del g_ndc
 
-        # Convergence Kalman (auto mode only)
-        frame_conv = self._convergence
-        if frame_conv is None:
-            focus = _compute_focus_depth_gpu(g.mean_vectors)
-            frame_conv = self._conv_kf.update(focus)
+        # Convergence: compute focus depth at specified quantile + Kalman smooth
+        focus = _compute_focus_depth_gpu(g.mean_vectors,
+                                         q_focus=self._convergence_q)
+        frame_conv = self._conv_kf.update(focus)
 
         # Render stereo pair + pack format
         sbs, _ = render_sbs(g, self._f_px, w, h,
