@@ -513,11 +513,11 @@ class _PipelineWorker:
             return prepare_input(frm, f_px, self._device, async_upload=False)
 
         # ── Temporal depth stabilization ─────────────────────────────────
-        from sharp3d.temporal import TemporalStabilizer
+        from sharp3d.temporal import TemporalStabilizer, KalmanScalar
         from sharp3d.render import _compute_focus_depth_gpu
         stab_mode = opts.get("temporal_stabilize", "off")
         stab = TemporalStabilizer(mode=stab_mode, device=self._device)
-        prev_focus = None  # convergence EMA state
+        conv_kf = KalmanScalar(q_pos=0.05, q_vel=0.02, r=0.15)
 
         # ── Main conversion loop ────────────────────────────────────────
         # Every frame from the queue is processed (ffmpeg already selected the
@@ -543,14 +543,12 @@ class _PipelineWorker:
 
                 # ── Convergence smoothing (anti-flicker) ────────────
                 # Auto-convergence per-frame quantile jumps cause global
-                # horizontal shift. EMA-smooth the focus depth scalar.
+                # horizontal shift. Kalman filter tracks the true convergence
+                # with minimal lag while rejecting per-frame jitter.
                 frame_conv = conv
                 if conv is None and stab_mode != "off":
                     focus = _compute_focus_depth_gpu(g.mean_vectors)
-                    if prev_focus is not None:
-                        focus = 0.35 * focus + 0.65 * prev_focus
-                    prev_focus = focus
-                    frame_conv = focus
+                    frame_conv = conv_kf.update(focus)
 
                 # ── Render + pack (GPU) ─────────────────────────────
                 sbs, _ = render_sbs(g, f_px, w, h,

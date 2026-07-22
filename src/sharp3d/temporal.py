@@ -15,6 +15,82 @@ import torch
 import torch.nn.functional as F
 
 
+class KalmanScalar:
+    """Constant-velocity Kalman filter for a scalar signal.
+
+    Smooths a noisy per-frame measurement (e.g., convergence depth) while
+    tracking genuine trends (camera dolly) with minimal lag.
+
+    State: [x, v] — position and velocity.
+    Measurement: z = x + noise.
+
+    Usage:
+        kf = KalmanScalar(q_pos=0.01, q_vel=0.005, r=0.02)
+        for each frame:
+            smoothed = kf.update(measured_value)
+    """
+
+    def __init__(self, q_pos: float = 0.01, q_vel: float = 0.005,
+                 r: float = 0.02):
+        """
+        Args:
+            q_pos: Process noise std for position (how fast true value can change).
+            q_vel: Process noise std for velocity (how fast trend can accelerate).
+            r: Measurement noise std (per-frame quantile jitter).
+        """
+        self._q_pos = q_pos ** 2
+        self._q_vel = q_vel ** 2
+        self._r = r ** 2
+        # State: [x, v], covariance 2x2
+        self._x: float | None = None
+        self._v: float = 0.0
+        self._p = [[1.0, 0.0], [0.0, 1.0]]  # initial uncertainty
+
+    def reset(self) -> None:
+        self._x = None
+        self._v = 0.0
+        self._p = [[1.0, 0.0], [0.0, 1.0]]
+
+    def update(self, z: float) -> float:
+        """Feed a new measurement, return the filtered estimate."""
+        if self._x is None:
+            # First measurement: initialize state directly.
+            self._x = z
+            self._v = 0.0
+            self._p = [[self._r, 0.0], [0.0, 1.0]]
+            return z
+
+        # ── Predict ──────────────────────────────────────────────────────
+        x_pred = self._x + self._v
+        v_pred = self._v
+        # P_pred = F @ P @ F.T + Q, where F = [[1,1],[0,1]]
+        p = self._p
+        p00 = p[0][0] + p[0][1] + p[1][0] + p[1][1] + self._q_pos
+        p01 = p[0][1] + p[1][1]
+        p10 = p[1][0] + p[1][1]
+        p11 = p[1][1] + self._q_vel
+
+        # ── Update ───────────────────────────────────────────────────────
+        # Innovation: y = z - H @ x_pred, H = [1, 0]
+        innov = z - x_pred
+        # S = H @ P_pred @ H.T + R = p00 + R
+        s = p00 + self._r
+        # K = P_pred @ H.T / S = [p00, p10] / s
+        k0 = p00 / s
+        k1 = p10 / s
+
+        self._x = x_pred + k0 * innov
+        self._v = v_pred + k1 * innov
+
+        # P = (I - K @ H) @ P_pred
+        self._p = [
+            [(1 - k0) * p00, (1 - k0) * p01],
+            [p10 - k1 * p00, p11 - k1 * p01],
+        ]
+
+        return self._x
+
+
 class TemporalStabilizer:
     """Frame-to-frame depth stabilizer for the video conversion loop.
 
