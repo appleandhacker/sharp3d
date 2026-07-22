@@ -72,6 +72,7 @@ class _PipelineWorker:
             return
         self._perf_mode_active = perf_mode
         self._respond("model_loading", ())
+        self._respond("model_load_progress", ("加载模型权重", 8))
         self._respond("status", ("正在加载 SHARP 模型权重…",))
 
         import torch
@@ -141,6 +142,7 @@ class _PipelineWorker:
             spn = predictor.monodepth_model.monodepth_predictor.encoder
             if hasattr(spn.patch_encoder, '_session'):
                 n_patches = 35 if params.monodepth.use_patch_overlap else 21
+                self._respond("model_load_progress", ("构建 TensorRT 引擎", 35))
                 self._respond("status", (
                     f"正在构建 TensorRT 引擎（{n_patches} patches，首次约30秒）…",))
                 dummy_patches = torch.zeros(
@@ -159,6 +161,7 @@ class _PipelineWorker:
         except Exception:
             pass  # Non-critical; engines will build on first real use
 
+        self._respond("model_load_progress", ("编译预测器", 55))
         self._respond("status", ("正在编译预测器 (torch.compile)…",))
         torch._dynamo.config.capture_scalar_outputs = True
         # ORT encoders are @torch.compiler.disable'd → graph breaks.
@@ -175,6 +178,9 @@ class _PipelineWorker:
         except Exception:
             n_workers = 4  # safe fallback
         torch._inductor.config.compile_threads = n_workers
+        # compile_threads>1 spawns worker subprocesses; the default 'subprocess'
+        # start method uses pass_fds which crashes on Windows. Force 'spawn'.
+        os.environ.setdefault("TORCHINDUCTOR_WORKER_START", "spawn")
         self._respond("status", (f"编译线程: {n_workers}（按可用内存自动分配）",))
         # Coordinate-descent kernel tuning is the most memory/time-intensive
         # autotune phase for only marginal runtime gain — skip it.
@@ -184,6 +190,7 @@ class _PipelineWorker:
         from sharp3d.unproject import INTERNAL_SHAPE
         dummy_img = torch.zeros(1, 3, *INTERNAL_SHAPE, device=self._device)
         dummy_df = torch.tensor([1.0], device=self._device, dtype=torch.float32)
+        self._respond("model_load_progress", ("预热推理", 72))
         self._respond("status", ("正在预热推理（编译内核，首次约1分钟）…",))
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
             g_ndc = self._compiled(dummy_img, dummy_df)
@@ -192,6 +199,7 @@ class _PipelineWorker:
         # Trigger gsplat's one-time CUDA JIT here as well (it compiles its
         # rasterization kernels on first use), so the first real frame
         # renders at full speed instead of stalling ~15s.
+        self._respond("model_load_progress", ("编译渲染内核", 90))
         self._respond("status", ("正在编译渲染内核 (gsplat)…",))
         try:
             from sharp3d.unproject import fast_unproject
@@ -214,6 +222,7 @@ class _PipelineWorker:
         del dummy_img, dummy_df, g_ndc
         torch.cuda.empty_cache()
 
+        self._respond("model_load_progress", ("就绪", 100))
         self._respond("model_ready", ())
         self._respond("status", ("模型就绪",))
 
@@ -315,6 +324,13 @@ class _PipelineWorker:
         fmt = opts.get("format", "full_sbs")
         image_np, _, f_px = sharp_io.load_rgb(path)
         h, w = image_np.shape[:2]
+
+        # Output resolution: custom width or scale fraction of source width.
+        custom_w = opts.get("out_width")
+        out_scale = opts.get("out_scale", 1.0)
+        render_w = int(custom_w) if custom_w else int(round(w * out_scale))
+        render_w = max(2, render_w + render_w % 2)
+
         img_r, df, ir, _ = prepare_input(image_np, f_px, self._device)
 
         t0 = time.time()
@@ -322,7 +338,8 @@ class _PipelineWorker:
             g_ndc = self._compiled(img_r, df)
         g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
                            INTERNAL_SHAPE, decompose_method=method)
-        sbs, (sw, sh) = render_sbs(g, f_px, w, h, ipd=ipd_scene, convergence=conv)
+        sbs, (sw, sh) = render_sbs(g, f_px, w, h, ipd=ipd_scene,
+                                   convergence=conv, render_width=render_w)
         packed = pack_stereo(fmt, sbs)
         torch.cuda.synchronize()
         elapsed = time.time() - t0
@@ -360,7 +377,28 @@ class _PipelineWorker:
         f_px = reader.width * 1.2
 
         fmt = opts.get("format", "full_sbs")
-        out_w, out_h = output_size(fmt, reader.width, reader.height)
+
+        # ── Output resolution: custom width or scale fraction of source ──
+        custom_w = opts.get("out_width")          # per-eye width (px) or None
+        out_scale = opts.get("out_scale", 1.0)    # fraction of source width
+        if custom_w:
+            render_w = int(custom_w)
+        else:
+            render_w = int(round(reader.width * out_scale))
+        render_w = max(2, render_w + render_w % 2)
+        # Per-eye render height follows the source aspect ratio (even), matching
+        # render_sbs/_get_screen_resolution so the writer size stays consistent.
+        render_h = int(round(reader.height * (render_w / reader.width)))
+        render_h = max(2, render_h + render_h % 2)
+        sw, sh = render_w, render_h
+        if sh > 3000:                      # mirrors _get_screen_resolution
+            sw, sh = sw // 2, sh // 2
+        sw += sw % 2
+        sh += sh % 2
+        out_w, out_h = output_size(fmt, sw, sh)
+
+        # ── Output frame rate (None → keep source fps) ──
+        out_fps = opts.get("out_fps") or reader.fps
 
         # Show which encoder was selected (GPU vs CPU) for all codecs.
         codec = opts.get("codec", "h264")
@@ -378,10 +416,10 @@ class _PipelineWorker:
         hdr_out = opts.get("hdr_output", False)
         if hdr_out:
             writer = Hdr10Writer(out, width=out_w, height=out_h,
-                                 fps=reader.fps, codec=opts.get("codec", "h265"),
+                                 fps=out_fps, codec=opts.get("codec", "h265"),
                                  crf=opts.get("crf", 18))
         else:
-            writer = VideoWriter(out, fps=reader.fps, width=out_w, height=out_h,
+            writer = VideoWriter(out, fps=out_fps, width=out_w, height=out_h,
                                  codec=opts.get("codec", "h264"),
                                  crf=opts.get("crf", 18))
 
@@ -447,7 +485,8 @@ class _PipelineWorker:
                 # ── Render + pack (sequential on main stream) ───────
                 t_r0 = time.time()
                 sbs, _ = render_sbs(g, f_px, w, h,
-                                    ipd=ipd_scene, convergence=conv)
+                                    ipd=ipd_scene, convergence=conv,
+                                    render_width=render_w)
                 packed = pack_stereo(fmt, sbs)
                 torch.cuda.synchronize()
                 t_rend = time.time() - t_r0
@@ -630,6 +669,7 @@ class EngineProcess(QObject):
     """
 
     model_loading = Signal()
+    model_load_progress = Signal(str, int)   # (stage name, percent 0-100)
     model_ready = Signal()
     prepared = Signal(dict)
     preview_ready = Signal(object)

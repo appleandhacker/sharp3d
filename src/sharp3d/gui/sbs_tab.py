@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -136,6 +137,43 @@ class SbsTab(QWidget):
         crf_row.addWidget(self._crf, 1)
         enc_card.add_layout(crf_row)
 
+        fps_row = QHBoxLayout()
+        fps_row.addWidget(QLabel("输出帧率"))
+        self._fps = QComboBox()
+        self._fps.addItems(["跟随源", "24", "30", "60"])
+        self._fps.setToolTip(
+            "输出视频的帧率。\n"
+            "“跟随源”保持输入视频原帧率；选择固定值会改变播放速度/时长。"
+        )
+        fps_row.addWidget(self._fps, 1)
+        enc_card.add_layout(fps_row)
+
+        res_row = QHBoxLayout()
+        res_row.addWidget(QLabel("输出分辨率"))
+        self._res_scale = QComboBox()
+        self._res_scale.addItems(["源尺寸 (100%)", "75%", "50%", "25%", "自定义宽度"])
+        self._res_scale.setToolTip(
+            "按百分比缩放输出分辨率（等比，高度自动）。\n"
+            "模型推理成本固定，但渲染+编码随像素数变化——\n"
+            "降到 50% 像素数变为 1/4，渲染/编码约快 4 倍。"
+        )
+        self._res_scale.currentIndexChanged.connect(self._on_res_changed)
+        res_row.addWidget(self._res_scale, 1)
+        enc_card.add_layout(res_row)
+
+        self._res_custom_row = QHBoxLayout()
+        self._res_custom_row.addWidget(QLabel("自定义宽度"))
+        self._res_width = QSpinBox()
+        self._res_width.setRange(64, 15360)
+        self._res_width.setSingleStep(2)
+        self._res_width.setSuffix(" px")
+        self._res_width.setValue(1920)
+        self._res_width.setToolTip("单眼输出宽度（像素），高度按源宽高比自动计算")
+        self._res_custom_row.addWidget(self._res_width, 1)
+        self._res_custom_row_enabled = False
+        enc_card.add_layout(self._res_custom_row)
+        self._set_res_custom_visible(False)
+
         self._chk_audio = QCheckBox("保留原始音轨")
         self._chk_audio.setChecked(True)
         enc_card.add_widget(self._chk_audio)
@@ -204,6 +242,9 @@ class SbsTab(QWidget):
 
         # ---- engine wiring ------------------------------------------------
         self.request_convert.connect(engine.convert)
+        engine.model_loading.connect(self._on_model_loading)
+        engine.model_load_progress.connect(self._on_model_load_progress)
+        engine.model_ready.connect(self._on_model_ready)
         engine.convert_progress.connect(self._on_convert_progress)
         engine.convert_done.connect(self._on_convert_done)
         engine.error.connect(self._on_error)
@@ -212,6 +253,32 @@ class SbsTab(QWidget):
     def _on_hdr_toggled(self, checked: bool) -> None:
         if checked and self._codec.currentText() == "H.264":
             self._codec.setCurrentText("H.265")
+
+    def _on_model_loading(self) -> None:
+        self._progress.set_value(0.0)
+        self._progress.set_busy(True)
+        self._prog_label.setText("正在初始化…")
+
+    def _on_model_load_progress(self, stage: str, pct: int) -> None:
+        self._progress.set_busy(False)
+        self._progress.set_value(pct / 100.0)
+        self._prog_label.setText(f"{stage}… {pct}%")
+
+    def _on_model_ready(self) -> None:
+        self._progress.set_value(1.0)
+        self._progress.set_busy(False)
+        self._prog_label.setText("模型就绪")
+
+    def _on_res_changed(self, idx: int) -> None:
+        # Last item ("自定义宽度") reveals the custom width spinbox.
+        custom = (self._res_scale.currentText() == "自定义宽度")
+        self._set_res_custom_visible(custom)
+
+    def _set_res_custom_visible(self, visible: bool) -> None:
+        for i in range(self._res_custom_row.count()):
+            item = self._res_custom_row.itemAt(i)
+            if item.widget():
+                item.widget().setVisible(visible)
 
     def _on_input(self, path: str) -> None:
         p = Path(path)
@@ -247,6 +314,18 @@ class SbsTab(QWidget):
         self._progress.set_value(0.0)
 
         codec_map = {"H.264": "h264", "H.265": "h265", "AV1": "av1"}
+        # Output frame rate: None = keep source fps.
+        fps_text = self._fps.currentText()
+        out_fps = None if fps_text == "跟随源" else int(fps_text)
+        # Output resolution: custom width (px) or scale fraction of source.
+        scale_map = {"源尺寸 (100%)": 1.0, "75%": 0.75, "50%": 0.5, "25%": 0.25}
+        res_text = self._res_scale.currentText()
+        if res_text == "自定义宽度":
+            out_width = self._res_width.value()
+            out_scale = 1.0
+        else:
+            out_width = None
+            out_scale = scale_map.get(res_text, 1.0)
         opts = {
             "input": inp,
             "output": out,
@@ -262,6 +341,9 @@ class SbsTab(QWidget):
             "ply": self._chk_ply.isChecked(),
             "hdr_output": self._chk_hdr.isChecked(),
             "perf_mode": "quality" if self._perf_mode.currentIndex() == 0 else "speed",
+            "out_fps": out_fps,
+            "out_scale": out_scale,
+            "out_width": out_width,
         }
         self.request_convert.emit(opts)
 
