@@ -71,13 +71,11 @@ class SbsTab(QWidget):
 
         # ---- IO card ------------------------------------------------------
         io_card = SectionCard(c, "输入 / 输出")
-        self._input = FileField(c, "输入", file_filter=f"{IMG_FILTER};;{VID_FILTER}")
+        self._input = FileField(c, "输入", file_filter=f"{IMG_FILTER};;{VID_FILTER}",
+                                allow_folder=True)
         self._output = FileField(c, "输出", save=True)
         self._input.path_selected.connect(self._on_input)
         io_card.add_widget(self._input)
-        btn_folder = QPushButton("选择文件夹（批量）")
-        btn_folder.clicked.connect(self._on_browse_folder)
-        io_card.add_widget(btn_folder)
         io_card.add_widget(self._output)
         root.addWidget(io_card)
 

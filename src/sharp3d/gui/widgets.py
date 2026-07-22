@@ -355,6 +355,7 @@ class FileField(QWidget):
         pick_dir: bool = False,
         file_filter: str = "",
         save: bool = False,
+        allow_folder: bool = False,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -362,6 +363,7 @@ class FileField(QWidget):
         self._pick_dir = pick_dir
         self._filter = file_filter
         self._save = save
+        self._allow_folder = allow_folder
         self.setAcceptDrops(True)
 
         layout = QHBoxLayout(self)
@@ -374,7 +376,7 @@ class FileField(QWidget):
 
         self._edit = QLineEdit()
         self._edit.setReadOnly(True)
-        self._edit.setPlaceholderText("拖入文件，或点击浏览…")
+        self._edit.setPlaceholderText("拖入文件/文件夹，或点击浏览…")
 
         self._btn = QPushButton("浏览…")
         self._btn.setFixedWidth(64)
@@ -390,6 +392,21 @@ class FileField(QWidget):
             path = QFileDialog.getExistingDirectory(self, "选择目录", start)
         elif self._save:
             path, _ = QFileDialog.getSaveFileName(self, "保存", start, self._filter)
+        elif self._allow_folder:
+            # Offer both file and folder selection via menu
+            from PySide6.QtWidgets import QMenu
+            from PySide6.QtCore import QPoint
+            menu = QMenu(self)
+            act_file = menu.addAction("选择文件")
+            act_folder = menu.addAction("选择文件夹（批量）")
+            chosen = menu.exec(self._btn.mapToGlobal(
+                QPoint(0, self._btn.height())))
+            if chosen == act_file:
+                path, _ = QFileDialog.getOpenFileName(self, "打开", start, self._filter)
+            elif chosen == act_folder:
+                path = QFileDialog.getExistingDirectory(self, "选择文件夹（批量）", start)
+            else:
+                return
         else:
             path, _ = QFileDialog.getOpenFileName(self, "打开", start, self._filter)
         if path:
