@@ -60,6 +60,8 @@ class SbsTab(QWidget):
         self._n_frames = 1
         self._converting = False
         self._last_fps = 0.0
+        self._batch_files: list[str] = []
+        self._batch_idx = 0
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 12, 14, 14)
@@ -73,6 +75,13 @@ class SbsTab(QWidget):
         self._output = FileField(c, "输出", save=True)
         self._input.path_selected.connect(self._on_input)
         io_card.add_widget(self._input)
+        # Folder browse for batch mode
+        folder_row = QHBoxLayout()
+        btn_folder = QPushButton("选择文件夹（批量）")
+        btn_folder.clicked.connect(self._on_browse_folder)
+        folder_row.addWidget(btn_folder)
+        folder_row.addStretch(1)
+        io_card.add_layout(folder_row)
         io_card.add_widget(self._output)
         root.addWidget(io_card)
 
@@ -281,8 +290,32 @@ class SbsTab(QWidget):
             if item.widget():
                 item.widget().setVisible(visible)
 
+    def _on_browse_folder(self) -> None:
+        from PySide6.QtWidgets import QFileDialog
+        path = QFileDialog.getExistingDirectory(self, "选择文件夹（批量转换）")
+        if path:
+            self._input.set_path(path)
+
     def _on_input(self, path: str) -> None:
         p = Path(path)
+        # Folder input: scan for supported files
+        if p.is_dir():
+            exts = VIDEO_EXTS | {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+            files = sorted(f for f in p.iterdir() if f.suffix.lower() in exts)
+            if not files:
+                self.status_message.emit("文件夹中没有找到支持的图片/视频文件")
+                return
+            self._batch_files = [str(f) for f in files]
+            self._batch_idx = 0
+            self._is_video = files[0].suffix.lower() in VIDEO_EXTS
+            self._output.set_path(str(p))
+            self.status_message.emit(f"已识别 {len(files)} 个文件（批量模式）")
+            self._n_frames = 1
+            return
+
+        # Single file input
+        self._batch_files = []
+        self._batch_idx = 0
         self._is_video = p.suffix.lower() in VIDEO_EXTS
         out = p.parent / f"{p.stem}_sbs{('.mp4' if self._is_video else p.suffix)}"
         self._output.set_path(str(out))
@@ -304,21 +337,36 @@ class SbsTab(QWidget):
     # ------------------------------------------------------------------
     def _on_start(self) -> None:
         inp = self._input.path()
+        if not inp:
+            self.status_message.emit("请先选择输入路径")
+            return
+
+        # Batch mode: folder was selected
+        p = Path(inp)
+        if p.is_dir() and not self._batch_files:
+            self._on_input(inp)
+        if self._batch_files:
+            self._batch_idx = 0
+            self._start_batch_item()
+            return
+
+        # Single file mode
         out = self._output.path()
-        if not inp or not out:
-            self.status_message.emit("请先选择输入和输出路径")
+        if not out:
+            self.status_message.emit("请先选择输出路径")
             return
         self._converting = True
         self._btn_start.setEnabled(False)
         self._btn_cancel.setEnabled(True)
         self._progress.set_busy(False)
         self._progress.set_value(0.0)
+        self.request_convert.emit(self._build_opts(inp, out))
 
+    def _build_opts(self, inp: str, out: str) -> dict:
+        """Build conversion options dict for a single file."""
         codec_map = {"H.264": "h264", "H.265": "h265", "AV1": "av1"}
-        # Output frame rate: None = keep source fps.
         fps_text = self._fps.currentText()
         out_fps = None if fps_text == "跟随源" else float(fps_text)
-        # Output resolution: custom width (px) or scale fraction of source.
         scale_map = {"源尺寸 (100%)": 1.0, "75%": 0.75, "50%": 0.5, "25%": 0.25}
         res_text = self._res_scale.currentText()
         if res_text == "自定义宽度":
@@ -327,7 +375,7 @@ class SbsTab(QWidget):
         else:
             out_width = None
             out_scale = scale_map.get(res_text, 1.0)
-        opts = {
+        return {
             "input": inp,
             "output": out,
             "format": FORMATS[self._format.currentIndex()][0],
@@ -346,7 +394,34 @@ class SbsTab(QWidget):
             "out_scale": out_scale,
             "out_width": out_width,
         }
-        self.request_convert.emit(opts)
+
+    def _start_batch_item(self) -> None:
+        """Start converting the current item in the batch queue."""
+        if self._batch_idx >= len(self._batch_files):
+            self._converting = False
+            self._btn_start.setEnabled(True)
+            self._btn_cancel.setEnabled(False)
+            self._progress.set_value(1.0)
+            self._prog_label.setText(
+                f"批量完成 · 共 {len(self._batch_files)} 个文件")
+            self.status_message.emit(
+                f"批量转换完成 · {len(self._batch_files)} 个文件")
+            self._batch_files = []
+            return
+
+        inp = self._batch_files[self._batch_idx]
+        p = Path(inp)
+        is_vid = p.suffix.lower() in VIDEO_EXTS
+        out = str(p.parent / f"{p.stem}_sbs{('.mp4' if is_vid else p.suffix)}")
+
+        self._converting = True
+        self._btn_start.setEnabled(False)
+        self._btn_cancel.setEnabled(True)
+        self._progress.set_busy(False)
+        self._progress.set_value(0.0)
+        self._prog_label.setText(
+            f"文件 {self._batch_idx + 1}/{len(self._batch_files)} · {p.name}")
+        self.request_convert.emit(self._build_opts(inp, out))
 
     def _on_cancel(self) -> None:
         self._engine.cancel()
@@ -356,28 +431,53 @@ class SbsTab(QWidget):
                              elapsed: float) -> None:
         self._last_fps = fps
         self._progress.set_value(frame / total if total else 0.0)
-        # elapsed is real wall-clock time from the worker (no more jumping).
-        # Remaining estimate uses the running average fps.
         remain = (total - frame) / fps if fps > 0 else 0.0
+        batch_prefix = ""
+        if self._batch_files:
+            batch_prefix = (f"[{self._batch_idx + 1}/{len(self._batch_files)}] ")
         self._prog_label.setText(
-            f"帧 {frame}/{total} · {fps:.2f} fps · "
+            f"{batch_prefix}帧 {frame}/{total} · {fps:.2f} fps · "
             f"已用 {_fmt_hms(elapsed)} · 剩余 {_fmt_hms(remain)}"
         )
 
     def _on_convert_done(self, result: dict) -> None:
+        if result.get("cancelled"):
+            self._converting = False
+            self._btn_start.setEnabled(True)
+            self._btn_cancel.setEnabled(False)
+            self._progress.set_busy(False)
+            self._prog_label.setText("已取消")
+            self.status_message.emit("转换已取消")
+            self._batch_files = []
+            return
+
+        # Batch mode: auto-start next file
+        if self._batch_files:
+            self._batch_idx += 1
+            if self._batch_idx < len(self._batch_files):
+                self._start_batch_item()
+                return
+            # Batch complete
+            self._converting = False
+            self._btn_start.setEnabled(True)
+            self._btn_cancel.setEnabled(False)
+            self._progress.set_value(1.0)
+            n = len(self._batch_files)
+            self._prog_label.setText(f"批量完成 · 共 {n} 个文件")
+            self.status_message.emit(f"批量转换完成 · {n} 个文件")
+            self._batch_files = []
+            return
+
+        # Single file done
         self._converting = False
         self._btn_start.setEnabled(True)
         self._btn_cancel.setEnabled(False)
         self._progress.set_value(1.0)
         self._progress.set_busy(False)
-        if result.get("cancelled"):
-            self._prog_label.setText("已取消")
-            self.status_message.emit("转换已取消")
-        else:
-            self._prog_label.setText(
-                f"完成 · {result['n_frames']} 帧 · {result['fps']:.2f} fps · {result['output']}"
-            )
-            self.status_message.emit(f"转换完成 → {result['output']}")
+        self._prog_label.setText(
+            f"完成 · {result['n_frames']} 帧 · {result['fps']:.2f} fps · {result['output']}"
+        )
+        self.status_message.emit(f"转换完成 → {result['output']}")
 
     def _on_error(self, msg: str) -> None:
         self._converting = False
