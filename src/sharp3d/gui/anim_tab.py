@@ -1,16 +1,16 @@
 """2.5D parallax animation tab.
 
 Renders a camera trajectory around the reconstructed 3D scene (SHARP's four
-trajectory types) and plays it back as a loop. Single-view preview pane.
+trajectory types) and exports as video. No inline preview — use the Gaussian
+Viewer tab for interactive 3D preview.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
-    QButtonGroup,
     QComboBox,
     QHBoxLayout,
     QLabel,
@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from .theme import Colors, ThemeManager
-from .widgets import AnimatedProgressBar, FileField, PreviewPane, SectionCard, StereoSlider
+from .widgets import AnimatedProgressBar, FileField, SectionCard, StereoSlider
 from .worker import EngineProcess
 
 IMG_FILTER = "图片 (*.png *.jpg *.jpeg *.bmp *.webp);;所有文件 (*)"
@@ -47,6 +47,7 @@ class TrajectoryPicker(QWidget):
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
+        from PySide6.QtWidgets import QButtonGroup
         group = QButtonGroup(self)
         group.setExclusive(True)
         for key, label in TRAJECTORIES:
@@ -91,13 +92,10 @@ class TrajectoryPicker(QWidget):
 
 
 class AnimTab(QWidget):
-    """2.5D parallax animation workspace."""
+    """2.5D parallax animation workspace (no inline preview)."""
 
     status_message = Signal(str)
 
-    # Request signals: the engine's request methods are non-blocking (they
-    # enqueue to the child pipeline process), but going through signals keeps
-    # the call path uniform and safe.
     request_prepare = Signal(str, int)
     request_render_anim = Signal(dict)
     request_export_anim = Signal(dict)
@@ -109,7 +107,6 @@ class AnimTab(QWidget):
         self._prepared = False
         self._awaiting_prepare = False
         self._frames: list = []
-        self._play_idx = 0
         self._rendering = False
 
         root = QVBoxLayout(self)
@@ -124,34 +121,13 @@ class AnimTab(QWidget):
         io_card.add_widget(self._input)
         root.addWidget(io_card)
 
-        # ---- middle: preview + params ------------------------------------
+        # ---- params + export in two columns ------------------------------
         middle = QHBoxLayout()
         middle.setSpacing(12)
 
-        preview_card = SectionCard(c, "动画预览")
-        self._preview = PreviewPane(c, stereo=False)
-        self._preview.set_message("加载图片后\n选择轨迹生成视差动画")
-        self._preview.file_dropped.connect(self._input.set_path)
-        preview_card.add_widget(self._preview)
-
-        ctrl = QHBoxLayout()
-        self._btn_play = QPushButton("▶ 播放")
-        self._btn_play.setEnabled(False)
-        self._btn_play.clicked.connect(self._toggle_play)
-        self._btn_render = QPushButton("生成动画")
-        self._btn_render.clicked.connect(self._on_render)
-        self._frame_info = QLabel("0 帧")
-        self._frame_info.setProperty("cssClass", "mono")
-        ctrl.addWidget(self._btn_render)
-        ctrl.addWidget(self._btn_play)
-        ctrl.addStretch(1)
-        ctrl.addWidget(self._frame_info)
-        preview_card.add_layout(ctrl)
-        middle.addWidget(preview_card, 3)
-
-        # right column
-        right = QVBoxLayout()
-        right.setSpacing(12)
+        # left column: trajectory + animation settings
+        left = QVBoxLayout()
+        left.setSpacing(12)
 
         traj_card = SectionCard(c, "相机轨迹")
         self._picker = TrajectoryPicker(c)
@@ -160,7 +136,7 @@ class AnimTab(QWidget):
         self._s_zoom = StereoSlider(c, "缩放幅度", 0.0, 0.4, 0.15, fmt="{:.2f}")
         traj_card.add_widget(self._s_disparity)
         traj_card.add_widget(self._s_zoom)
-        right.addWidget(traj_card)
+        left.addWidget(traj_card)
 
         steps_card = SectionCard(c, "动画设置")
         steps_row = QHBoxLayout()
@@ -186,7 +162,22 @@ class AnimTab(QWidget):
         self._fps.setCurrentText("30")
         fps_row.addWidget(self._fps, 1)
         steps_card.add_layout(fps_row)
-        right.addWidget(steps_card)
+        left.addWidget(steps_card)
+
+        middle.addLayout(left, 2)
+
+        # right column: actions + export
+        right = QVBoxLayout()
+        right.setSpacing(12)
+
+        action_card = SectionCard(c, "操作")
+        self._btn_render = QPushButton("生成动画")
+        self._btn_render.clicked.connect(self._on_render)
+        action_card.add_widget(self._btn_render)
+        self._frame_info = QLabel("0 帧")
+        self._frame_info.setProperty("cssClass", "mono")
+        action_card.add_widget(self._frame_info)
+        right.addWidget(action_card)
 
         export_card = SectionCard(c, "导出")
         codec_row = QHBoxLayout()
@@ -213,10 +204,6 @@ class AnimTab(QWidget):
         prog_card.add_widget(self._prog_label)
         root.addWidget(prog_card)
 
-        # ---- playback timer ----------------------------------------------
-        self._play_timer = QTimer(self)
-        self._play_timer.timeout.connect(self._play_step)
-
         # ---- engine wiring ------------------------------------------------
         self.request_prepare.connect(engine.prepare)
         self.request_render_anim.connect(engine.render_anim)
@@ -233,22 +220,17 @@ class AnimTab(QWidget):
     def _on_input(self, path: str) -> None:
         self._prepared = False
         self._frames = []
-        self._play_timer.stop()
-        self._btn_play.setText("▶ 播放")
-        self._btn_play.setEnabled(False)
         self._btn_export.setEnabled(False)
-        self._preview.clear_image()
-        self._preview.set_message("正在重建 3D 场景…")
         self._awaiting_prepare = True
+        self._prog_label.setText("正在重建 3D 场景…")
         self.request_prepare.emit(path, 0)
 
     def _on_prepared(self, info: dict) -> None:
-        # Both tabs hear engine.prepared; only react to our own request.
         if not self._awaiting_prepare:
             return
         self._awaiting_prepare = False
         self._prepared = True
-        self._preview.set_message("场景就绪 · 点击「生成动画」")
+        self._prog_label.setText("场景就绪 · 点击「生成动画」")
         self.status_message.emit(f"场景重建完成 · {info['n_gaussians']:,} 高斯")
 
     def _on_render(self) -> None:
@@ -256,8 +238,6 @@ class AnimTab(QWidget):
             return
         self._rendering = True
         self._frames = []
-        self._play_timer.stop()
-        self._btn_play.setEnabled(False)
         self._btn_export.setEnabled(False)
         self._btn_render.setEnabled(False)
         self._progress.set_value(0.0)
@@ -273,8 +253,6 @@ class AnimTab(QWidget):
 
     def _on_anim_frame(self, frame: object) -> None:
         self._frames.append(frame)
-        # live-show the latest rendered frame
-        self._preview.set_image(frame)
 
     def _on_anim_progress(self, i: int, total: int) -> None:
         self._progress.set_value(i / total if total else 0.0)
@@ -288,10 +266,7 @@ class AnimTab(QWidget):
         self._frame_info.setText(f"{n} 帧")
         self._prog_label.setText(f"完成 · {n} 帧")
         if n > 0:
-            self._btn_play.setEnabled(True)
             self._btn_export.setEnabled(True)
-            self._play_idx = 0
-            self._start_playback()
 
     def _on_error(self, msg: str) -> None:
         self._rendering = False
@@ -301,27 +276,6 @@ class AnimTab(QWidget):
             self._btn_export.setEnabled(True)
         self._prog_label.setText("出错")
         self.status_message.emit(msg)
-
-    # ------------------------------------------------------------------
-    def _toggle_play(self) -> None:
-        if self._play_timer.isActive():
-            self._play_timer.stop()
-            self._btn_play.setText("▶ 播放")
-        else:
-            self._start_playback()
-
-    def _start_playback(self) -> None:
-        if not self._frames:
-            return
-        self._btn_play.setText("⏸ 暂停")
-        interval = int(1000 / int(self._fps.currentText()))
-        self._play_timer.start(interval)
-
-    def _play_step(self) -> None:
-        if not self._frames:
-            return
-        self._preview.set_image(self._frames[self._play_idx])
-        self._play_idx = (self._play_idx + 1) % len(self._frames)
 
     # ------------------------------------------------------------------
     def _on_export(self) -> None:
@@ -341,7 +295,6 @@ class AnimTab(QWidget):
         self.status_message.emit(f"正在导出 {path} …")
         self._prog_label.setText("正在导出视频…")
         self._btn_export.setEnabled(False)
-        # Encode on the worker thread (imageio encoding would freeze the GUI).
         self.request_export_anim.emit({
             "path": path, "codec": codec, "fps": fps, "frames": self._frames,
         })
@@ -353,7 +306,6 @@ class AnimTab(QWidget):
 
     # ------------------------------------------------------------------
     def apply_theme(self, c: Colors) -> None:
-        self._preview.set_colors(c)
         self._progress._colors = c
         self._picker.set_colors(c)
         for s in (self._s_disparity, self._s_zoom):

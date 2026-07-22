@@ -667,6 +667,66 @@ class _PipelineWorker:
         except Exception as exc:  # noqa: BLE001
             self._respond("error", (f"动画导出失败: {exc}",))
 
+    # ---- Gaussian viewer: load PLY + orbit render ----------------------
+    def load_ply(self, path):
+        """Load a .ply gaussian file for the viewer tab."""
+        try:
+            import torch
+            from sharp.utils.gaussians import load_ply
+            from pathlib import Path as _P
+
+            self._torch = torch
+            self._device = torch.device("cuda")
+            gaussians, metadata = load_ply(_P(path))
+            self._gaussians = gaussians
+            # Derive focal length and original size from metadata if available
+            self._f_px = getattr(metadata, 'focal_length', None) or 1000.0
+            self._orig_w = getattr(metadata, 'width', 0) or 1024
+            self._orig_h = getattr(metadata, 'height', 0) or 1024
+            n_g = gaussians.mean_vectors.numel() // 3
+            self._respond("ply_loaded", ({
+                "n_gaussians": n_g,
+                "width": self._orig_w,
+                "height": self._orig_h,
+            },))
+            self._respond("status", (f"已加载 PLY · {n_g:,} 高斯点",))
+        except Exception as exc:  # noqa: BLE001
+            self._respond("error", (f"PLY 加载失败: {exc}",))
+
+    def render_orbit(self, opts):
+        """Render a single orbit view from spherical coordinates."""
+        try:
+            import math
+            torch = self._torch
+            from sharp3d.render import render_single
+
+            if self._gaussians is None:
+                self._respond("error", ("请先加载 PLY 文件",))
+                return
+
+            azimuth = math.radians(opts.get("azimuth", 0.0))
+            elevation = math.radians(opts.get("elevation", 0.0))
+            distance = opts.get("distance", 5.0)
+            render_width = opts.get("render_width", 960)
+
+            # Spherical → Cartesian eye position
+            eye_pos = torch.tensor([
+                distance * math.cos(elevation) * math.sin(azimuth),
+                distance * math.sin(elevation),
+                distance * math.cos(elevation) * math.cos(azimuth),
+            ], dtype=torch.float32, device=self._device)
+
+            with torch.no_grad():
+                img = render_single(
+                    self._gaussians, self._f_px,
+                    self._orig_w, self._orig_h,
+                    eye_pos, render_width=render_width,
+                )
+            torch.cuda.synchronize()
+            self._respond("orbit_frame", (img.cpu().numpy(),))
+        except Exception as exc:  # noqa: BLE001
+            self._respond("error", (f"渲染失败: {exc}",))
+
 
 def _child_main(req_q, resp_q, cancel_event):
     """Child-process entry point. Dispatches requests to the pipeline worker."""
@@ -724,6 +784,8 @@ class EngineProcess(QObject):
     anim_progress = Signal(int, int)
     anim_done = Signal(dict)
     anim_exported = Signal(str)
+    ply_loaded = Signal(dict)
+    orbit_frame = Signal(object)
     error = Signal(str)
     status = Signal(str)
 
@@ -783,6 +845,12 @@ class EngineProcess(QObject):
 
     def export_anim(self, opts):
         self._req_q.put(("export_anim", {"opts": opts}))
+
+    def load_ply(self, path):
+        self._req_q.put(("load_ply", {"path": path}))
+
+    def render_orbit(self, opts):
+        self._req_q.put(("render_orbit", {"opts": opts}))
 
     def cancel(self):
         # Cross-process cancel: set the shared event the child loop polls.

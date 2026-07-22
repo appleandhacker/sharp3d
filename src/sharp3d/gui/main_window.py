@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from .anim_tab import AnimTab
+from .gaussian_tab import GaussianTab
 from .sbs_tab import SbsTab
 from .theme import DISPLAY_FONT, ThemeManager, build_palette, build_qss
 from .widgets import GpuMeter
@@ -86,8 +87,10 @@ class MainWindow(QMainWindow):
         self._tabs = QTabWidget()
         self._tabs.setDocumentMode(True)
         self._sbs = SbsTab(self._theme, self._engine)
+        self._gaussian = GaussianTab(self._theme, self._engine)
         self._anim = AnimTab(self._theme, self._engine)
         self._tabs.addTab(self._sbs, "SBS 立体转换")
+        self._tabs.addTab(self._gaussian, "高斯查看器")
         self._tabs.addTab(self._anim, "2.5D 视差动画")
         root.addWidget(self._tabs, 1)
 
@@ -104,6 +107,7 @@ class MainWindow(QMainWindow):
         self._engine.status.connect(self._status_label.setText)
         self._engine.error.connect(self._status_label.setText)
         self._sbs.status_message.connect(self._status_label.setText)
+        self._gaussian.status_message.connect(self._status_label.setText)
         self._anim.status_message.connect(self._status_label.setText)
 
         self._apply_theme(self._theme.is_dark)
@@ -124,6 +128,7 @@ class MainWindow(QMainWindow):
         qapp.setStyleSheet(build_qss(c))
         self._gpu.set_colors(c)
         self._sbs.apply_theme(c)
+        self._gaussian.apply_theme(c)
         self._anim.apply_theme(c)
         self._theme_label.setText("暗色模式" if is_dark else "亮色模式")
 
