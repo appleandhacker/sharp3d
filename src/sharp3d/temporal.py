@@ -96,7 +96,8 @@ class TemporalStabilizer:
 
     def _stabilize_ema(self, g_ndc) -> None:
         """Global or adaptive EMA stabilization."""
-        z = g_ndc.mean_vectors[:, 2]  # (N,) depth in NDC
+        # Force float32 — N can exceed FP16 max (65504), causing inf/nan.
+        z = g_ndc.mean_vectors[:, 2].float()  # (N,) depth in NDC
         N = z.numel()
 
         # First frame: just store and return.
@@ -114,7 +115,7 @@ class TemporalStabilizer:
         sxx = (x * x).sum()
         sxy = (x * y).sum()
         sy = y.sum()
-        n = torch.tensor(float(N), device=z.device, dtype=z.dtype)
+        n = torch.tensor(float(N), device=z.device, dtype=torch.float32)
 
         det = sxx * n - sx * sx
         if det.abs() < 1e-12:
@@ -142,8 +143,9 @@ class TemporalStabilizer:
             z_smooth = self.alpha * z_aligned + (1.0 - self.alpha) * prev
             z_out = confidence * z_smooth + (1.0 - confidence) * z
 
-        g_ndc.mean_vectors[:, 2] = z_out
-        self._prev_z = z_out.clone()
+        # Write back in original dtype; keep prev in float32.
+        g_ndc.mean_vectors[:, 2] = z_out.to(g_ndc.mean_vectors.dtype)
+        self._prev_z = z_out
 
     # ─── Optical flow warp method ─────────────────────────────────────────
 
@@ -154,7 +156,7 @@ class TemporalStabilizer:
             self._stabilize_ema(g_ndc)
             return
 
-        z = g_ndc.mean_vectors[:, 2]  # (N,)
+        z = g_ndc.mean_vectors[:, 2].float()  # (N,) — float32 to avoid FP16 overflow
         N = z.numel()
 
         # Prepare current frame at flow resolution.
@@ -243,7 +245,7 @@ class TemporalStabilizer:
             sxx = (xv * xv).sum()
             sxy = (xv * yv).sum()
             sy = yv.sum()
-            nv = torch.tensor(float(xv.numel()), device=z.device, dtype=z.dtype)
+            nv = torch.tensor(float(xv.numel()), device=z.device, dtype=torch.float32)
             det = sxx * nv - sx * sx
             if det.abs() > 1e-12:
                 s = (sxy * nv - sx * sy) / det
@@ -278,8 +280,8 @@ class TemporalStabilizer:
         z_out[vis] = (self.alpha * z_aligned[vis]
                       + (1.0 - self.alpha) * warped_flat[vis])
 
-        g_ndc.mean_vectors[:, 2] = z_out
-        self._prev_z = z_out.clone()
+        g_ndc.mean_vectors[:, 2] = z_out.to(g_ndc.mean_vectors.dtype)
+        self._prev_z = z_out
         self._prev_img = curr_img
 
     @staticmethod
