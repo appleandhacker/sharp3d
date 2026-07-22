@@ -133,6 +133,11 @@ class TemporalStabilizer:
         self._prev_z: torch.Tensor | None = None
         self._shape: tuple[int, ...] | None = None  # (L, H, W)
 
+        # Attribute smoothing state (opacity + scale).
+        self._prev_opacities: torch.Tensor | None = None
+        self._prev_scales: torch.Tensor | None = None
+        self._attr_alpha = 0.4  # EMA factor for attributes (higher = less smoothing)
+
         # Flow mode state.
         self._prev_img: torch.Tensor | None = None  # (1, 3, flow_res, flow_res)
         self._flow_model = None
@@ -142,6 +147,8 @@ class TemporalStabilizer:
         self._prev_z = None
         self._shape = None
         self._prev_img = None
+        self._prev_opacities = None
+        self._prev_scales = None
 
     def _ensure_flow_model(self) -> None:
         """Lazy-load RAFT model on first use."""
@@ -154,7 +161,7 @@ class TemporalStabilizer:
 
     @torch.no_grad()
     def stabilize(self, g_ndc, img: torch.Tensor | None = None) -> None:
-        """Stabilize the z-component of g_ndc.mean_vectors in-place.
+        """Stabilize g_ndc attributes in-place (z, opacity, scale).
 
         Args:
             g_ndc: Gaussians3D with mean_vectors (N, 3) in NDC space.
@@ -167,6 +174,29 @@ class TemporalStabilizer:
             self._stabilize_flow(g_ndc, img)
         else:
             self._stabilize_ema(g_ndc)
+
+        # ── Attribute smoothing (opacity + scale) ────────────────────────
+        # Gaussians have fixed grid correspondence between frames (same pixel
+        # × layer index), so per-index EMA directly reduces edge flickering.
+        self._smooth_attributes(g_ndc)
+
+    def _smooth_attributes(self, g_ndc) -> None:
+        """EMA-smooth opacities and singular_values to reduce edge flicker."""
+        a = self._attr_alpha
+
+        # Opacities: (N, 1) or (N,)
+        opac = g_ndc.opacities.float()
+        if self._prev_opacities is not None:
+            g_ndc.opacities = (a * opac + (1 - a) * self._prev_opacities).to(
+                g_ndc.opacities.dtype)
+        self._prev_opacities = opac
+
+        # Scale (singular_values): (N, 3)
+        scales = g_ndc.singular_values.float()
+        if self._prev_scales is not None:
+            g_ndc.singular_values = (a * scales + (1 - a) * self._prev_scales).to(
+                g_ndc.singular_values.dtype)
+        self._prev_scales = scales
 
     # ─── EMA-based methods (global / adaptive) ────────────────────────────
 
