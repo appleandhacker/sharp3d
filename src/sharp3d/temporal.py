@@ -160,15 +160,18 @@ class TemporalStabilizer:
         self._flow_transforms = weights.transforms()
 
     @torch.no_grad()
-    def stabilize(self, g_ndc, img: torch.Tensor | None = None) -> None:
+    def stabilize(self, g_ndc, img: torch.Tensor | None = None) -> bool:
         """Stabilize g_ndc attributes in-place (z, opacity, scale).
 
         Args:
             g_ndc: Gaussians3D with mean_vectors (N, 3) in NDC space.
             img: (1, 3, H, W) float tensor [0,1] — required for flow mode.
+
+        Returns:
+            True if a scene cut was detected (caller should reset external state).
         """
         if self.mode == "off":
-            return
+            return False
 
         if self.mode == "flow":
             scene_cut = self._stabilize_flow(g_ndc, img)
@@ -183,6 +186,7 @@ class TemporalStabilizer:
             self._prev_opacities = None
             self._prev_scales = None
         self._smooth_attributes(g_ndc)
+        return scene_cut
 
     def _smooth_attributes(self, g_ndc) -> None:
         """Recursive EMA-smooth opacities and singular_values."""

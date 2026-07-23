@@ -93,7 +93,7 @@ class VideoConversionEngine:
         # Predict + temporal stabilize (z + opacity + scale)
         with torch.autocast("cuda", dtype=torch.float16):
             g_ndc = self._predict(img_r, df)
-        self._stab.stabilize(g_ndc, img=img_r)
+        scene_cut = self._stab.stabilize(g_ndc, img=img_r)
 
         # Optional: soften depth edges to reduce disocclusion stretching
         if self._edge_soften:
@@ -107,6 +107,8 @@ class VideoConversionEngine:
         # Convergence: compute focus depth at specified quantile + Kalman smooth
         focus = _compute_focus_depth_gpu(g.mean_vectors,
                                          q_focus=self._convergence_q)
+        if scene_cut:
+            self._conv_kf.reset()
         frame_conv = self._conv_kf.update(focus)
 
         # Render stereo pair + pack format
