@@ -7,6 +7,7 @@ from PyInstaller.utils.hooks import (
     collect_data_files,
     collect_dynamic_libs,
     collect_submodules,
+    copy_metadata,
 )
 
 block_cipher = None
@@ -54,6 +55,32 @@ datas += [(str(ROOT / "assets" / "sharp3d_icon.ico"), "assets")]
 # PySide6 Qt plugins
 datas += collect_data_files("PySide6", subdir="Qt")
 
+# ---- Package metadata (importlib.metadata / pkg_resources) ----
+# These packages query their own version or discover plugins at runtime.
+for pkg in [
+    "imageio",
+    "imageio-ffmpeg",
+    "numpy",
+    "Pillow",
+    "torch",
+    "torchvision",
+    "onnxruntime-gpu",
+    "gsplat",
+    "huggingface_hub",
+    "timm",
+    "safetensors",
+    "scipy",
+    "plyfile",
+    "pynvml",
+    "PySide6",
+    "onnx",
+    "onnxscript",
+]:
+    try:
+        datas += copy_metadata(pkg)
+    except Exception:
+        pass
+
 # ---- Hidden imports ----
 hiddenimports = [
     # sharp3d
@@ -81,6 +108,8 @@ hiddenimports = [
     "plyfile",
     "pynvml",
     "onnxruntime",
+    "onnx",
+    "onnxscript",
     "scipy",
     "scipy.spatial.transform",
     "timm",
@@ -88,17 +117,8 @@ hiddenimports = [
     "huggingface_hub",
 ]
 
-# ---- Excludes (reduce size) ----
-excludes = [
-    "matplotlib",
-    "tkinter",
-    "pytest",
-    "IPython",
-    "notebook",
-    "sphinx",
-    "torch.distributed",
-    "torch.testing",
-]
+# ---- Excludes ----
+excludes = []
 
 a = Analysis(
     [str(ROOT / "launcher.py")],
@@ -128,7 +148,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
-    console=True,  # DEBUG: 临时开启控制台查看子进程报错
+    console=False,
     icon=str(ROOT / "assets" / "sharp3d_icon.ico"),
 )
 
