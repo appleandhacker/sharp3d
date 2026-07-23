@@ -18,7 +18,6 @@ BUG#8 FIX: CUDA non-default streams are incompatible with torch.compile
 from __future__ import annotations
 
 import logging
-import shutil
 from pathlib import Path
 from typing import Callable
 
@@ -31,62 +30,6 @@ MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt"
 
 # Type alias for progress callback: (stage_description, percent_0_100)
 ProgressCB = Callable[[str, int], None] | None
-
-
-def _inject_msvc_env() -> None:
-    """Auto-detect MSVC and inject its environment into os.environ.
-
-    Locates vcvarsall.bat via vswhere.exe (VS Installer) or common install
-    paths, runs it in a subprocess, and merges the resulting PATH/INCLUDE/LIB
-    into the current process environment. This allows torch.compile to find
-    cl.exe without the user manually running vcvarsall.bat.
-    """
-    import os
-    import subprocess
-
-    vcvarsall = None
-
-    # Method 1: vswhere.exe (reliable, always present with VS Installer)
-    vswhere = Path(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe")
-    if vswhere.exists():
-        try:
-            out = subprocess.check_output(
-                [str(vswhere), "-latest", "-property", "installationPath"],
-                text=True, stderr=subprocess.DEVNULL).strip()
-            if out:
-                candidate = Path(out) / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
-                if candidate.exists():
-                    vcvarsall = candidate
-        except Exception:
-            pass
-
-    # Method 2: common install paths
-    if vcvarsall is None:
-        for edition in ("Community", "Professional", "Enterprise", "BuildTools"):
-            for year in ("2022", "2019"):
-                p = Path(rf"C:\Program Files\Microsoft Visual Studio\{year}\{edition}"
-                         r"\VC\Auxiliary\Build\vcvarsall.bat")
-                if p.exists():
-                    vcvarsall = p
-                    break
-            if vcvarsall:
-                break
-
-    if vcvarsall is None:
-        return
-
-    # Run vcvarsall.bat and capture the resulting environment
-    try:
-        out = subprocess.check_output(
-            f'cmd /c ""{vcvarsall}" x64 >nul 2>&1 && set"',
-            text=True, stderr=subprocess.DEVNULL)
-        for line in out.splitlines():
-            if "=" in line:
-                key, _, value = line.partition("=")
-                os.environ[key] = value
-        logger.info("已自动注入 MSVC 环境: %s", vcvarsall)
-    except Exception:
-        pass
 
 
 class SharpPredictor:
@@ -213,14 +156,12 @@ class SharpPredictor:
         except Exception:
             pass
 
-        # ── torch.compile (自动探测 MSVC，失败则回退 eager) ──────────────
+        # ── torch.compile (triton JIT 编译，无需 MSVC；失败则回退 eager) ──
         import os as _os
         if _os.environ.get("SHARP3D_NO_COMPILE"):
             self._progress("跳过编译（打包模式）", 55)
             self._compiled = predictor
         else:
-            if not shutil.which("cl"):
-                _inject_msvc_env()
             try:
                 self._progress("编译预测器", 55)
                 torch._dynamo.config.capture_scalar_outputs = True
