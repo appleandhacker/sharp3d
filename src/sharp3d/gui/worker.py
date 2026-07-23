@@ -671,22 +671,8 @@ def _child_main_inner(req_q, resp_q, cancel_event):
     """Actual child-process logic (wrapped by _child_main for error handling)."""
     # ---- 强制 UTF-8：修复中文 Windows 下 torch.compile GBK 编码错误 ----
     import os as _os
-    _os.environ["PYTHONUTF8"] = "1"
-
-    # ---- debug tracing (frozen mode) ----
     import sys as _sys
-    import time as _time
-
-    def _dbg(msg):
-        try:
-            log = Path(_os.environ.get("LOCALAPPDATA", ".")) / "sharp3d" / "debug.log"
-            log.parent.mkdir(parents=True, exist_ok=True)
-            with open(log, "a", encoding="utf-8") as f:
-                f.write(f"[{_time.strftime('%H:%M:%S')}] {msg}\n")
-        except Exception:
-            pass
-
-    _dbg("child_main_inner 进入")
+    _os.environ["PYTHONUTF8"] = "1"
 
     # ---- persistent compile cache: compile once, reuse forever ----
     # Must be set before torch is imported in this process.
@@ -699,14 +685,11 @@ def _child_main_inner(req_q, resp_q, cancel_event):
     _os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", str(_cache_dir / "inductor"))
     _os.environ.setdefault("TRITON_CACHE_DIR", str(_cache_dir / "triton"))
     _cache_dir.mkdir(parents=True, exist_ok=True)
-    _dbg(f"缓存目录: {_cache_dir}")
 
-    _dbg("创建 PipelineWorker...")
     worker = _PipelineWorker(
         respond=lambda name, args: resp_q.put((name, args)),
         cancel_event=cancel_event,
     )
-    _dbg("PipelineWorker 就绪，进入消息循环")
     while True:
         try:
             msg = req_q.get()
