@@ -171,8 +171,19 @@ class SharpPredictor:
                 self._compiled = torch.compile(predictor, mode="max-autotune", dynamic=False)
             except Exception as e:
                 self._progress("跳过编译（回退 eager）", 55)
+                import traceback
+                _err = traceback.format_exc()
                 logger.warning("torch.compile 失败，回退 eager 模式: %s", e)
+                try:
+                    Path(_os.environ.get("LOCALAPPDATA", ".")).joinpath(
+                        "sharp3d", "compile_error.log").write_text(_err, encoding="utf-8")
+                except Exception:
+                    pass
                 self._compiled = predictor
+        _is_compiled = hasattr(self._compiled, "_orig_mod")
+        _mode = "torch.compile 已启用" if _is_compiled else "eager 模式（未编译）"
+        logger.info("torch.compile 状态: %s", _mode)
+        self._progress(_mode, 60)
 
         # ── Warmup inference ─────────────────────────────────────────────
         from .unproject import INTERNAL_SHAPE
