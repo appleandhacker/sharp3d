@@ -354,16 +354,15 @@ class _PipelineWorker:
         decoder = threading.Thread(target=_decode, daemon=True)
         decoder.start()
 
-        # ── Async H2D upload on side stream (overlaps with encode) ──────
+        # ── Async H2D upload on side stream (overlaps with GPU compute) ──
         _side_stream = torch.cuda.Stream()
 
         def _prepare(frm):
             with torch.cuda.stream(_side_stream):
                 prepared = prepare_input(frm, f_px, self._device,
                                          async_upload=True)
-                upload_done = _side_stream.record_event()
-            upload_done.synchronize()
-            return prepared
+                upload_event = _side_stream.record_event()
+            return prepared, upload_event
 
         # ── Encode thread (overlaps CPU encoding with GPU compute) ──────
         import queue as _queue
@@ -419,13 +418,22 @@ class _PipelineWorker:
         first = frame_q.get()
         try:
             if first is not None and not self._cancel_event.is_set():
-                prepared = _prepare(first)
+                prepared, upload_ev = _prepare(first)
                 del first
 
                 while True:
+                    # ── 预取下一帧（与当前帧 GPU 计算重叠）──────────
+                    nxt_frm = frame_q.get()
+                    if nxt_frm is not None:
+                        nxt_prepared, nxt_ev = _prepare(nxt_frm)
+                        del nxt_frm
+                    else:
+                        nxt_prepared, nxt_ev = None, None
+
+                    # ── 等待当前帧上传完成，然后 GPU 处理 ──────────
+                    upload_ev.synchronize()
                     img_r, df, ir, (w, h) = prepared
 
-                    # ── GPU pipeline (predict→stabilize→render→pack) ──
                     result = engine.process_frame(
                         img_r, df, ir, (w, h),
                         return_depth=want_depth,
@@ -465,19 +473,17 @@ class _PipelineWorker:
                     self._respond("convert_progress",
                                   (out_written, out_count, avg_fps, elapsed))
 
-                    # Periodic CPU GC every 30 frames prevents RAM accumulation.
-                    if n_done % 30 == 0:
+                    # Periodic CPU GC every 60 frames prevents RAM accumulation.
+                    if n_done % 60 == 0:
                         gc.collect()
 
                     if self._cancel_event.is_set():
                         break
-
-                    # ── Fetch + prepare next frame ──────────────────────
-                    nxt_frm = frame_q.get()
-                    if nxt_frm is None:
+                    if nxt_prepared is None:
                         break
-                    prepared = _prepare(nxt_frm)
-                    del nxt_frm
+
+                    # ── 下一帧已预取，直接进入下一轮 ──────────────
+                    prepared, upload_ev = nxt_prepared, nxt_ev
         finally:
             # Stop encode thread (flush remaining frames).
             encode_q.put(None)

@@ -68,6 +68,7 @@ class VideoConversionEngine:
 
         self._stab = TemporalStabilizer(mode=stabilize_mode, device=device)
         self._conv_kf = KalmanScalar(q_pos=0.05, q_vel=0.02, r=0.15)
+        self._eye4 = torch.eye(4, device=device)
 
     @torch.no_grad()
     def process_frame(self, img_r, df, ir, orig_size: tuple[int, int],
@@ -100,7 +101,7 @@ class VideoConversionEngine:
             self._soften_depth_edges(g_ndc)
 
         # Unproject NDC → world
-        g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
+        g = fast_unproject(g_ndc, self._eye4, ir,
                            INTERNAL_SHAPE, decompose_method=self._decompose)
         del g_ndc
 
