@@ -669,8 +669,11 @@ def _child_main(req_q, resp_q, cancel_event):
 
 def _child_main_inner(req_q, resp_q, cancel_event):
     """Actual child-process logic (wrapped by _child_main for error handling)."""
-    # ---- debug tracing (frozen mode) ----
+    # ---- 强制 UTF-8：修复中文 Windows 下 torch.compile GBK 编码错误 ----
     import os as _os
+    _os.environ["PYTHONUTF8"] = "1"
+
+    # ---- debug tracing (frozen mode) ----
     import sys as _sys
     import time as _time
 
