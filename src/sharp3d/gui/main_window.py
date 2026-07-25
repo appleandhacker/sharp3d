@@ -30,8 +30,12 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"sharp3d v{__version__}")
 
         # Window icon
+        import sys as _sys
         from pathlib import Path
-        icon_path = Path(__file__).resolve().parents[3] / "assets" / "sharp3d_icon.svg"
+        if getattr(_sys, "frozen", False):
+            icon_path = Path(_sys._MEIPASS) / "assets" / "sharp3d_icon.ico"
+        else:
+            icon_path = Path(__file__).resolve().parents[3] / "assets" / "sharp3d_icon.svg"
         if icon_path.exists():
             self.setWindowIcon(QIcon(str(icon_path)))
 

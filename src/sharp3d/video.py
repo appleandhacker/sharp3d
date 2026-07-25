@@ -6,12 +6,16 @@ Encoding: H.264 (libx264 crf18) / H.265 (libx265) / AV1 (best available).
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import imageio
 import numpy as np
 
 from .hdr import FFMPEG
+
+# 隐藏 Windows 子进程控制台窗口
+_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 # imageio bundles its own minimal ffmpeg that may lack libsvtav1 (the AV1
 # encoder the GUI offers). Pin it to the same full-featured binary the rest
@@ -200,7 +204,8 @@ class VideoWriter:
         # binary capture: only the return code matters; text decoding of
         # ffmpeg's stderr (which echoes CJK filenames as UTF-8) would crash
         # under the GBK locale.
-        result = subprocess.run(cmd, capture_output=True)
+        result = subprocess.run(cmd, capture_output=True,
+                                creationflags=_NO_WINDOW)
         if result.returncode == 0:
             self.tmp_path.unlink(missing_ok=True)
         else:

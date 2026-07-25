@@ -20,9 +20,13 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
+
+# 隐藏 Windows 子进程控制台窗口
+_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
 
 def _exe(name: str) -> str:
@@ -63,7 +67,8 @@ def available_encoders() -> set[str]:
         names: set[str] = set()
         try:
             out = subprocess.run(
-                [exe, "-hide_banner", "-encoders"], capture_output=True
+                [exe, "-hide_banner", "-encoders"], capture_output=True,
+                creationflags=_NO_WINDOW,
             ).stdout.decode("utf-8", "replace")
             for line in out.splitlines():
                 parts = line.split()
@@ -92,6 +97,7 @@ def hwaccel_cuda_available() -> bool:
             out = subprocess.run(
                 [FFMPEG, "-hide_banner", "-hwaccels"],
                 capture_output=True,
+                creationflags=_NO_WINDOW,
             ).stdout.decode("utf-8", "replace")
             _HWACCEL_CUDA = "cuda" in out.lower()
         except Exception:
@@ -149,7 +155,8 @@ def probe_video(path: str | Path) -> dict:
     # ffprobe emits UTF-8 (the JSON embeds the filename); text=True alone
     # would decode as GBK on Chinese Windows and crash on CJK filenames.
     result = subprocess.run(cmd, capture_output=True, text=True,
-                            encoding="utf-8", errors="replace")
+                            encoding="utf-8", errors="replace",
+                            creationflags=_NO_WINDOW)
     data = json.loads(result.stdout) if result.stdout else {}
 
     vstream = None
@@ -248,7 +255,8 @@ class FrameReader:
         cmd = [FFMPEG, *self._hwaccel(), "-ss", f"{t:.4f}", "-i", self.path,
                "-vframes", "1", *self._vf(),
                "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
-        result = subprocess.run(cmd, capture_output=True)
+        result = subprocess.run(cmd, capture_output=True,
+                                creationflags=_NO_WINDOW)
         raw = result.stdout
         if len(raw) < self._frame_size:
             raise RuntimeError(f"Failed to decode frame {idx}")
@@ -262,7 +270,8 @@ class FrameReader:
                "-i", self.path, *self._vf(),
                "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL)
+                                stderr=subprocess.DEVNULL,
+                                creationflags=_NO_WINDOW)
         try:
             while True:
                 raw = proc.stdout.read(self._frame_size)
@@ -329,7 +338,8 @@ class Hdr10Writer:
             str(self.tmp_path),
         ]
         self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                      stderr=subprocess.DEVNULL)
+                                      stderr=subprocess.DEVNULL,
+                                      creationflags=_NO_WINDOW)
 
     def write_frame(self, frame: np.ndarray) -> None:
         """Write an (H, W, 3) uint8 SDR frame."""
@@ -352,7 +362,8 @@ class Hdr10Writer:
                 "-shortest",
                 str(self.path),
             ]
-            result = subprocess.run(cmd, capture_output=True)
+            result = subprocess.run(cmd, capture_output=True,
+                                    creationflags=_NO_WINDOW)
             if result.returncode == 0:
                 self.tmp_path.unlink(missing_ok=True)
             else:

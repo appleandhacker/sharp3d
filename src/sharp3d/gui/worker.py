@@ -335,7 +335,8 @@ class _PipelineWorker:
             cmd = [FFMPEG, *reader._hwaccel(),
                    "-i", reader.path, *vf,
                    "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
-            proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.DEVNULL)
+            proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.DEVNULL,
+                             creationflags=0x08000000)
             try:
                 while True:
                     if self._cancel_event.is_set():
