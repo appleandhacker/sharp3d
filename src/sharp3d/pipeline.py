@@ -35,13 +35,12 @@ class Sharp3DPipeline:
         self.decompose_method = decompose_method
         self.ipd = ipd
 
-        # Load model
-        self.predictor = SharpPredictor(
-            device=device,
-            use_compile=use_compile,
-            use_fp16=use_fp16,
-        )
-        self._warmed_up = False
+        # Load model (torch.compile handled internally with auto-fallback)
+        import os
+        if not use_compile:
+            os.environ["SHARP3D_NO_COMPILE"] = "1"
+        self.predictor = SharpPredictor(device=device)
+        self._warmed_up = True  # SharpPredictor does warmup in __init__
 
     def _ensure_warmup(self, img_resized, disparity_factor):
         """Warmup on first call (triggers torch.compile)."""
