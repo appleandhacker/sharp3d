@@ -52,6 +52,16 @@ datas += [(str(ML_SHARP_SRC / "sharp"), "sharp")]
 # Assets (icon)
 datas += [(str(ROOT / "assets" / "sharp3d_icon.ico"), "assets")]
 
+# Pre-exported ONNX models + FP16 weights (skip download/export at runtime)
+_cache = ROOT / ".cache"
+if (_cache / "onnx" / "patch_encoder.onnx").exists():
+    datas += [(str(_cache / "onnx" / "patch_encoder.onnx"), "models")]
+    datas += [(str(_cache / "onnx" / "patch_encoder.onnx.data"), "models")]
+    datas += [(str(_cache / "onnx" / "image_encoder.onnx"), "models")]
+    datas += [(str(_cache / "onnx" / "image_encoder.onnx.data"), "models")]
+if (_cache / "sharp_fp16.pt").exists():
+    datas += [(str(_cache / "sharp_fp16.pt"), "models")]
+
 # PySide6 Qt plugins
 datas += collect_data_files("PySide6", subdir="Qt")
 

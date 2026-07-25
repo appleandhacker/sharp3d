@@ -367,7 +367,17 @@ def create_ort_patch_encoder(
         _log_ort_error(f"onnxruntime import failed: {e}")
         return None
 
-    onnx_path = onnx_dir / "patch_encoder.onnx"
+    # Frozen: use bundled ONNX if available
+    import sys as _sys
+    if getattr(_sys, "frozen", False):
+        bundled = Path(_sys._MEIPASS) / "models" / "patch_encoder.onnx"
+        if bundled.exists():
+            onnx_path = bundled
+        else:
+            onnx_path = onnx_dir / "patch_encoder.onnx"
+    else:
+        onnx_path = onnx_dir / "patch_encoder.onnx"
+
     if not onnx_path.exists():
         try:
             export_patch_encoder(predictor, onnx_path, device)
@@ -398,7 +408,16 @@ def create_ort_image_encoder(
     except ImportError:
         return None
 
-    onnx_path = onnx_dir / "image_encoder.onnx"
+    # Frozen: use bundled ONNX if available
+    import sys as _sys
+    if getattr(_sys, "frozen", False):
+        bundled = Path(_sys._MEIPASS) / "models" / "image_encoder.onnx"
+        if bundled.exists():
+            onnx_path = bundled
+        else:
+            onnx_path = onnx_dir / "image_encoder.onnx"
+    else:
+        onnx_path = onnx_dir / "image_encoder.onnx"
     # Re-export if the model doesn't have all 5 outputs
     need_export = not onnx_path.exists()
     if not need_export:

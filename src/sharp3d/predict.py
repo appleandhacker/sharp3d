@@ -73,7 +73,13 @@ class SharpPredictor:
         if perf_mode == "speed":
             params.monodepth.use_patch_overlap = False
 
+        # Frozen: check bundled weights first
+        import sys as _sys
         fp16_ckpt = cache_dir / "sharp_fp16.pt"
+        if getattr(_sys, "frozen", False):
+            bundled = Path(_sys._MEIPASS) / "models" / "sharp_fp16.pt"
+            if bundled.exists():
+                fp16_ckpt = bundled
         if fp16_ckpt.exists():
             state_dict = torch.load(str(fp16_ckpt), map_location="cpu",
                                     mmap=True, weights_only=True)
