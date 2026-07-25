@@ -11,11 +11,11 @@ BUG#6 FIX: camera_model.compute() creates look_at/world_up on CPU internally.
     eye_pos must be a CPU tensor (no device= argument).
 
 Optimization: Replace GSplatRenderer's Python for-loop (renders L/R separately)
-with a single gsplat.rendering.rasterization() call using stacked viewmats [2, 4, 4].
+with a single rasterization() call using stacked viewmats [2, 4, 4].
 """
 
 import torch
-import gsplat
+from gsplat.rendering import rasterization
 
 from sharp.utils.gaussians import Gaussians3D
 
@@ -179,7 +179,7 @@ def render_sbs(
     Ks = K.unsqueeze(0).expand(2, -1, -1)  # (2, 3, 3)
 
     # Single batched rasterization call for both eyes
-    rendered_colors, rendered_alphas, meta = gsplat.rendering.rasterization(
+    rendered_colors, rendered_alphas, meta = rasterization(
         means=means,
         quats=quats,
         scales=scales,
@@ -276,7 +276,7 @@ def render_single(
     ], dtype=torch.float32, device=device)
     Ks = K[None]  # (1, 3, 3)
 
-    rendered_colors, rendered_alphas, meta = gsplat.rendering.rasterization(
+    rendered_colors, rendered_alphas, meta = rasterization(
         means=means,
         quats=quats,
         scales=scales,
@@ -342,7 +342,7 @@ def render_depth_map(
     ], dtype=torch.float32, device=device)
     Ks = K[None]  # (1, 3, 3)
 
-    rendered_colors, rendered_alphas, meta = gsplat.rendering.rasterization(
+    rendered_colors, rendered_alphas, meta = rasterization(
         means=means,
         quats=quats,
         scales=scales,

@@ -12,7 +12,7 @@ Modes:
 """
 
 import torch
-import torch.nn.functional as F
+from torch.nn.functional import grid_sample, interpolate
 
 
 class KalmanScalar:
@@ -278,7 +278,7 @@ class TemporalStabilizer:
         N = z.numel()
 
         # Prepare current frame at flow resolution.
-        curr_img = F.interpolate(img, size=(self.flow_resolution,
+        curr_img = interpolate(img, size=(self.flow_resolution,
                                             self.flow_resolution),
                                  mode="bilinear", align_corners=False)
 
@@ -316,12 +316,12 @@ class TemporalStabilizer:
         scale_w = W / self.flow_resolution
 
         # Scale flow values to full resolution.
-        flow_full = F.interpolate(flow_fwd, size=(H, W), mode="bilinear",
+        flow_full = interpolate(flow_fwd, size=(H, W), mode="bilinear",
                                   align_corners=False)
         flow_full[:, 0] *= scale_w  # x displacement
         flow_full[:, 1] *= scale_h  # y displacement
 
-        occ_full = F.interpolate(occ_mask.float(), size=(H, W),
+        occ_full = interpolate(occ_mask.float(), size=(H, W),
                                  mode="nearest").bool()  # (1, 1, H, W)
 
         # ── Warp previous z using flow ───────────────────────────────────
@@ -347,7 +347,7 @@ class TemporalStabilizer:
         warped_z = torch.empty_like(z_spatial)
         for layer in range(L):
             src = prev_z_spatial[layer].unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-            warped = F.grid_sample(src, grid, mode="bilinear",
+            warped = grid_sample(src, grid, mode="bilinear",
                                    padding_mode="border", align_corners=True)
             warped_z[layer] = warped.squeeze(0).squeeze(0)
 
@@ -428,7 +428,7 @@ class TemporalStabilizer:
         sample_x = 2.0 * sample_x / (W - 1) - 1.0
         sample_y = 2.0 * sample_y / (H - 1) - 1.0
         grid = torch.stack([sample_x, sample_y], dim=-1)  # (1, H, W, 2)
-        warped = F.grid_sample(flow, grid, mode="bilinear",
+        warped = grid_sample(flow, grid, mode="bilinear",
                                padding_mode="border", align_corners=True)
         return warped
 

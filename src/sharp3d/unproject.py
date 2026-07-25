@@ -11,7 +11,7 @@ tensor → "Input type (double) and bias type (Half)" error under FP16 autocast.
 
 import numpy as np
 import torch
-import torch.nn.functional as F
+from torch.nn.functional import interpolate
 
 from sharp.utils.gaussians import (
     Gaussians3D,
@@ -58,7 +58,7 @@ def prepare_input(image_np, f_px: float, device: torch.device,
     # BUG#5 FIX: explicit dtype=float32 (Python float → f64 → FP16 autocast error)
     disparity_factor = torch.tensor([f_px / w], device=device, dtype=torch.float32)
 
-    img_resized = F.interpolate(
+    img_resized = interpolate(
         img[None], size=INTERNAL_SHAPE, mode="bilinear", align_corners=True
     )
 
