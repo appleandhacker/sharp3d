@@ -28,6 +28,18 @@ import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
+
+def _log_ort_error(msg: str) -> None:
+    """Write ORT error to log file (visible even without logging handler)."""
+    logger.warning(msg)
+    try:
+        log = Path(os.environ.get("LOCALAPPDATA", ".")) / "sharp3d" / "ort_error.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        with open(log, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+
 # Default cache directories (relative to project root)
 _CACHE_DIR = Path(__file__).resolve().parent.parent.parent / ".cache"
 _ONNX_DIR = _CACHE_DIR / "onnx"
@@ -49,7 +61,7 @@ def _ensure_cudnn_path():
 
 def _export_onnx_model(module, onnx_path: Path, device: torch.device,
                       dummy_input: torch.Tensor, input_name: str = "patches",
-                      output_names=None, dynamo=True):
+                      output_names=None, dynamo=None):
     """Export a PyTorch module to ONNX format.
 
     Args:
@@ -59,9 +71,11 @@ def _export_onnx_model(module, onnx_path: Path, device: torch.device,
         dummy_input: Example input tensor for tracing.
         input_name: Name for the input.
         output_names: List of output names (auto-detected if None).
-        dynamo: Use dynamo-based export (default True). The dynamo exporter
-                properly unrolls dict returns into separate ONNX outputs.
+        dynamo: Use dynamo-based export. None = auto (False in frozen builds).
     """
+    import sys as _sys
+    if dynamo is None:
+        dynamo = not getattr(_sys, "frozen", False)
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
     module.eval()
 
@@ -349,8 +363,8 @@ def create_ort_patch_encoder(
     """Create an ORT-accelerated patch_encoder, exporting ONNX if needed."""
     try:
         import onnxruntime  # noqa: F401
-    except ImportError:
-        logger.warning("onnxruntime not installed, skipping ORT acceleration")
+    except ImportError as e:
+        _log_ort_error(f"onnxruntime import failed: {e}")
         return None
 
     onnx_path = onnx_dir / "patch_encoder.onnx"
@@ -358,14 +372,16 @@ def create_ort_patch_encoder(
         try:
             export_patch_encoder(predictor, onnx_path, device)
         except Exception as e:
-            logger.warning("ONNX export failed: %s", e)
+            import traceback
+            _log_ort_error(f"ONNX export failed:\n{traceback.format_exc()}")
             return None
 
     try:
         return ORTEncoder(onnx_path, trt_cache_dir, device,
                           label="patch_encoder", int8_enable=int8_enable)
     except Exception as e:
-        logger.warning("ORT session creation failed: %s", e)
+        import traceback
+        _log_ort_error(f"ORT session creation failed:\n{traceback.format_exc()}")
         return None
 
 

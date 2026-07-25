@@ -120,8 +120,15 @@ class SharpPredictor:
             ort_img = create_ort_image_encoder(predictor, device, int8_enable=use_int8)
             if ort_img is not None:
                 spn.image_encoder = ort_img
-        except Exception:
-            pass
+        except Exception as e:
+            import traceback, os as _os2
+            logger.warning("ORT TensorRT 引擎构建失败: %s", e)
+            try:
+                Path(_os2.environ.get("LOCALAPPDATA", ".")).joinpath(
+                    "sharp3d", "ort_error.log").write_text(
+                    traceback.format_exc(), encoding="utf-8")
+            except Exception:
+                pass
 
         # ── FP16 conversion (after ORT export which needs FP32) ──────────
         if not already_fp16:
