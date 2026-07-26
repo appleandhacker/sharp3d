@@ -347,7 +347,7 @@ class _PipelineWorker:
             face_forwards = [ax[0] for ax in _HEMISPHERE_AXES]
             n_faces = 4
 
-        total_steps = n_faces + 12  # prediction faces + render sub-steps (6 faces × 2 eyes)
+        total_steps = n_faces + 6  # prediction faces + 6 render milestones
 
         # Predict depth + unproject for each face → merge Gaussians
         import torch.nn.functional as F_t
@@ -425,8 +425,9 @@ class _PipelineWorker:
         render_face = _compute_render_face_size(eye_w, output_projection)
 
         def _render_progress(step, total):
+            # Remap render's internal steps (7-12) to consecutive (n_faces+1 .. n_faces+6)
             self._respond("convert_progress",
-                          (n_faces + step, total_steps, 0.0, time.time() - t_start))
+                          (n_faces + step - 6, total_steps, 0.0, time.time() - t_start))
 
         result = render_vr_stereo(
             merged,
