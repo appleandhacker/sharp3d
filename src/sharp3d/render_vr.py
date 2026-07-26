@@ -51,31 +51,40 @@ def render_vr_stereo(
     if device is None:
         device = gaussians.mean_vectors.device
 
+    # For 180° output, skip back face (-Z, index 5) — never sampled
+    skip_back = (output_projection == "equirect180")
+
     # Eye offsets
     left_offset = torch.tensor([-ipd / 2, 0.0, 0.0], device=device)
     right_offset = torch.tensor([ipd / 2, 0.0, 0.0], device=device)
 
     if renderer == "higs":
         try:
-            left_faces = _render_cubemap_higs(gaussians, left_offset, face_size, device)
+            left_faces = _render_cubemap_higs(gaussians, left_offset, face_size,
+                                              device, skip_back=skip_back)
             if progress_cb:
                 progress_cb(7, 12)
-            right_faces = _render_cubemap_higs(gaussians, right_offset, face_size, device)
+            right_faces = _render_cubemap_higs(gaussians, right_offset, face_size,
+                                               device, skip_back=skip_back)
             if progress_cb:
                 progress_cb(8, 12)
         except Exception:
             # HiGS unavailable (JIT build failure) — fallback to standard
-            left_faces = _render_cubemap_standard(gaussians, left_offset, face_size, device)
+            left_faces = _render_cubemap_standard(gaussians, left_offset, face_size,
+                                                  device, skip_back=skip_back)
             if progress_cb:
                 progress_cb(7, 12)
-            right_faces = _render_cubemap_standard(gaussians, right_offset, face_size, device)
+            right_faces = _render_cubemap_standard(gaussians, right_offset, face_size,
+                                                   device, skip_back=skip_back)
             if progress_cb:
                 progress_cb(8, 12)
     else:
-        left_faces = _render_cubemap_standard(gaussians, left_offset, face_size, device)
+        left_faces = _render_cubemap_standard(gaussians, left_offset, face_size,
+                                              device, skip_back=skip_back)
         if progress_cb:
             progress_cb(7, 12)
-        right_faces = _render_cubemap_standard(gaussians, right_offset, face_size, device)
+        right_faces = _render_cubemap_standard(gaussians, right_offset, face_size,
+                                               device, skip_back=skip_back)
         if progress_cb:
             progress_cb(8, 12)
 
@@ -113,6 +122,7 @@ def _render_cubemap_higs(
     eye_offset: Tensor,
     face_size: int,
     device: torch.device,
+    skip_back: bool = False,
 ) -> Tensor:
     """Render 6 cubemap faces using HiGS inference renderer.
 
@@ -151,8 +161,9 @@ def _render_cubemap_higs(
     viewmats, Ks = get_cubemap_cameras(face_size, device, eye_offset)
 
     faces = torch.zeros(6, 3, face_size, face_size, device=device)
+    n_render = 5 if skip_back else 6
     with torch.no_grad():
-        for i in range(6):
+        for i in range(n_render):
             result = rasterize_gaussian_inference_scene(
                 scene,
                 viewmat=viewmats[i],
@@ -171,6 +182,7 @@ def _render_cubemap_standard(
     eye_offset: Tensor,
     face_size: int,
     device: torch.device,
+    skip_back: bool = False,
 ) -> Tensor:
     """Render 6 cubemap faces using standard gsplat batched rasterization.
 
@@ -195,6 +207,8 @@ def _render_cubemap_standard(
 
     viewmats, Ks = get_cubemap_cameras(face_size, device, eye_offset)
 
+    # Skip back face (-Z) for 180° output
+    n_render = 5 if skip_back else 6
     with torch.no_grad():
         rendered, alphas, meta = rasterization(
             means=means,
@@ -202,12 +216,17 @@ def _render_cubemap_standard(
             scales=scales,
             opacities=opacities,
             colors=colors,
-            viewmats=viewmats,
-            Ks=Ks,
+            viewmats=viewmats[:n_render],
+            Ks=Ks[:n_render],
             width=face_size,
             height=face_size,
             render_mode="RGB",
             rasterize_mode="classic",
         )
-    # rendered: [6, H, W, 3]
-    return rendered.permute(0, 3, 1, 2)  # [6, 3, H, W]
+    # rendered: [n_render, H, W, 3]
+    faces = rendered.permute(0, 3, 1, 2)  # [n_render, 3, H, W]
+    if skip_back:
+        # Pad with zero back face
+        zero_face = torch.zeros(1, 3, face_size, face_size, device=device)
+        faces = torch.cat([faces, zero_face], dim=0)  # [6, 3, H, W]
+    return faces
