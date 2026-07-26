@@ -341,7 +341,7 @@ class _PipelineWorker:
             face_forwards = [fd[0] for fd in _FACE_DEFS]
             n_faces = 6
 
-        total_steps = n_faces * 2  # predict + render phases
+        total_steps = n_faces + 12  # prediction faces + render sub-steps (6 faces × 2 eyes)
 
         # Predict depth + unproject for each face → merge Gaussians
         import torch.nn.functional as F_t
