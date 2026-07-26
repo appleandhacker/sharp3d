@@ -398,10 +398,14 @@ class _PipelineWorker:
             face_fwd = face_forwards[i].to(device)
             weight = angular_opacity_weight(means_world, face_fwd)
             keep = weight > 0.01
+            w_keep = weight[keep]
+            opac_keep = opacities[keep]
+            if opac_keep.dim() > w_keep.dim():
+                w_keep = w_keep.unsqueeze(-1)
             all_means.append(means_world[keep])
             all_quats.append(quats_world[keep])
             all_scales.append(scales[keep])
-            all_opacities.append(opacities[keep] * weight[keep].unsqueeze(-1))
+            all_opacities.append(opac_keep * w_keep)
             all_colors.append(colors[keep])
 
             self._respond("convert_progress",
@@ -419,8 +423,16 @@ class _PipelineWorker:
 
         # PLY export (world-space Gaussians)
         if opts.get("ply"):
-            from sharp.utils.gaussians import save_ply
-            save_ply(merged, 1.0, (1, 1), out.with_suffix(".ply"))
+            from sharp.utils.gaussians import save_ply, Gaussians3D as _G3D
+            # save_ply needs CPU tensors for numpy conversion
+            merged_cpu = _G3D(
+                mean_vectors=merged.mean_vectors.cpu(),
+                singular_values=merged.singular_values.cpu(),
+                quaternions=merged.quaternions.cpu(),
+                colors=merged.colors.cpu(),
+                opacities=merged.opacities.cpu(),
+            )
+            save_ply(merged_cpu, 1.0, (1, 1), out.with_suffix(".ply"))
 
         # Render VR stereo (adaptive face size based on output resolution)
         render_face = _compute_render_face_size(eye_w, output_projection)
@@ -718,10 +730,14 @@ class _PipelineWorker:
                 face_fwd = face_forwards[i].to(device)
                 weight = angular_opacity_weight(means_world, face_fwd)
                 keep = weight > 0.01
+                w_keep = weight[keep]
+                opac_keep = opacities[keep]
+                if opac_keep.dim() > w_keep.dim():
+                    w_keep = w_keep.unsqueeze(-1)
                 all_means.append(means_world[keep])
                 all_quats.append(quats_world[keep])
                 all_scales.append(scales[keep])
-                all_opacities.append(opacities[keep] * weight[keep].unsqueeze(-1))
+                all_opacities.append(opac_keep * w_keep)
                 all_colors.append(colors[keep])
 
             if self._cancel_event.is_set():
