@@ -273,14 +273,18 @@ def filter_gaussians_by_angle(
 
 
 # Inner angle: full weight below this (no attenuation in central region)
-_INNER_ANGLE_DEG = 40.0
+_INNER_ANGLE_DEG = 30.0
+# Outer angle for smoothstep: extends beyond prediction limit (56°) to give
+# gradual falloff. No actual Gaussians exist beyond ~56° from face center,
+# so this only controls the curve shape in the 30-56° range.
+_OUTER_ANGLE_DEG = 65.0
 
 
 def angular_opacity_weight(
     means: Tensor,
     face_forward: Tensor,
     inner_deg: float = _INNER_ANGLE_DEG,
-    outer_deg: float = OVERLAP_KEEP_ANGLE_DEG,
+    outer_deg: float = _OUTER_ANGLE_DEG,
 ) -> Tensor:
     """Compute smooth center-weighted opacity falloff per Gaussian.
 
