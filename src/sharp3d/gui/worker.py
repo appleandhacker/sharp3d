@@ -350,7 +350,6 @@ class _PipelineWorker:
 
         # Predict depth + unproject for each face → merge Gaussians
         from sharp3d.quaternion import quat_from_rotmat_gpu
-        from sharp3d.unproject import prepare_input_gpu
 
         all_means = []
         all_quats = []
@@ -368,10 +367,8 @@ class _PipelineWorker:
                 self._respond("convert_done", ({"cancelled": True},))
                 return
 
-            # Face image for prediction
-            face_img = faces[i].permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
-            face_img_u8 = (face_img * 255).clip(0, 255).astype(np.uint8)
-            img_r, df, ir, _ = prepare_input(face_img_u8, f_px, device)
+            # Face image — GPU-direct (prepare_input accepts GPU tensor)
+            img_r, df, ir, _ = prepare_input(faces[i], f_px, device)
 
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
                 g_ndc = self._compiled(img_r, df)
@@ -542,7 +539,6 @@ class _PipelineWorker:
                                         filter_gaussians_by_angle,
                                         angular_opacity_weight)
         from sharp3d.quaternion import quat_from_rotmat_gpu
-        from sharp3d.unproject import prepare_input_gpu
         from sharp.utils.gaussians import Gaussians3D
         import queue as _queue
         import threading
@@ -718,9 +714,8 @@ class _PipelineWorker:
             for i in range(n_faces):
                 if self._cancel_event.is_set():
                     break
-                face_img = faces[i].permute(1, 2, 0).cpu().numpy()
-                face_img_u8 = (face_img * 255).clip(0, 255).astype(np.uint8)
-                img_r, df, ir, _ = prepare_input(face_img_u8, f_px, device)
+                # GPU-direct (prepare_input accepts GPU tensor)
+                img_r, df, ir, _ = prepare_input(faces[i], f_px, device)
 
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
                     g_ndc = self._compiled(img_r, df)

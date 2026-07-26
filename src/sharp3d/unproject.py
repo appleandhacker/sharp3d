@@ -26,41 +26,47 @@ from .eigendecompose import decompose_covariance
 INTERNAL_SHAPE = (1536, 1536)
 
 
-def prepare_input(image_np, f_px: float, device: torch.device,
+def prepare_input(image_input, f_px: float, device: torch.device,
                   async_upload: bool = False):
     """Prepare image for SHARP predictor.
 
     Args:
-        image_np: (H, W, 3) uint8 numpy array.
+        image_input: Either:
+            - (H, W, 3) uint8 numpy array (original path, uploads to GPU)
+            - [3, H, W] float tensor [0, 1] already on device (GPU-direct path)
         f_px: Focal length in pixels.
         device: Target device.
-        async_upload: Pin host memory and copy non-blocking, so the upload
-            can overlap GPU work issued on another stream (the caller is
-            responsible for stream synchronization before consuming the
-            result).
+        async_upload: Pin host memory and copy non-blocking (numpy path only).
 
     Returns:
-        img_resized: (1, 3, 1536, 1536) float tensor [0, 1].
-        disparity_factor: (1,) float32 tensor.  # BUG#5: must be float32!
+        img_resized: (1, 3, 1536, 1536) float tensor [0, 1], contiguous.
+        disparity_factor: (1,) float32 tensor.
         intrinsics_resized: (4, 4) intrinsics scaled to 1536x1536.
         orig_size: (W, H) original image size.
     """
-    # Upload as uint8 (1 byte/px) and convert on the GPU — converting on the
-    # CPU first would push 4x the bytes over PCIe. ascontiguousarray avoids a
-    # copy for frames that are already owned C-contiguous arrays.
-    t = torch.from_numpy(np.ascontiguousarray(image_np))
-    if async_upload:
-        t = t.pin_memory()
-    img = t.to(device, non_blocking=async_upload).permute(2, 0, 1)
-    img = img.float().div_(255.0)
-    _, h, w = img.shape
+    if isinstance(image_input, torch.Tensor):
+        # GPU-direct path: [3, H, W] float [0,1] already on device
+        img = image_input.contiguous()
+        _, h, w = img.shape
+    else:
+        # Original numpy path: upload uint8 → convert on GPU
+        t = torch.from_numpy(np.ascontiguousarray(image_input))
+        if async_upload:
+            t = t.pin_memory()
+        img = t.to(device, non_blocking=async_upload).permute(2, 0, 1)
+        img = img.float().div_(255.0)
+        _, h, w = img.shape
 
     # BUG#5 FIX: explicit dtype=float32 (Python float → f64 → FP16 autocast error)
     disparity_factor = torch.tensor([f_px / w], device=device, dtype=torch.float32)
 
-    img_resized = interpolate(
-        img[None], size=INTERNAL_SHAPE, mode="bilinear", align_corners=True
-    )
+    if (h, w) == tuple(INTERNAL_SHAPE):
+        # Already at target resolution — ensure contiguous [1, 3, H, W]
+        img_resized = img.unsqueeze(0).contiguous()
+    else:
+        img_resized = interpolate(
+            img[None], size=INTERNAL_SHAPE, mode="bilinear", align_corners=True
+        )
 
     intrinsics = torch.tensor([
         [f_px, 0, w / 2, 0],
@@ -70,40 +76,6 @@ def prepare_input(image_np, f_px: float, device: torch.device,
     ], dtype=torch.float32, device=device)
 
     # Scale intrinsics to internal resolution
-    intrinsics_resized = intrinsics.clone()
-    intrinsics_resized[0] *= INTERNAL_SHAPE[0] / w
-    intrinsics_resized[1] *= INTERNAL_SHAPE[1] / h
-
-    return img_resized, disparity_factor, intrinsics_resized, (w, h)
-
-
-def prepare_input_gpu(img_gpu: torch.Tensor, f_px: float, device: torch.device):
-    """Prepare a GPU-resident image for SHARP predictor (zero-copy path).
-
-    Args:
-        img_gpu: [3, H, W] float tensor [0, 1] already on device.
-        f_px: Focal length in pixels (of the input face).
-        device: CUDA device.
-
-    Returns:
-        Same as prepare_input: (img_resized, disparity_factor, intrinsics_resized, (w, h))
-    """
-    _, h, w = img_gpu.shape
-    disparity_factor = torch.tensor([f_px / w], device=device, dtype=torch.float32)
-
-    if (h, w) == tuple(INTERNAL_SHAPE):
-        img_resized = img_gpu[None]  # [1, 3, H, W] — no resize needed
-    else:
-        img_resized = interpolate(
-            img_gpu[None], size=INTERNAL_SHAPE, mode="bilinear", align_corners=True
-        )
-
-    intrinsics = torch.tensor([
-        [f_px, 0, w / 2, 0],
-        [0, f_px, h / 2, 0],
-        [0, 0, 1, 0],
-        [0, 0, 0, 1],
-    ], dtype=torch.float32, device=device)
     intrinsics_resized = intrinsics.clone()
     intrinsics_resized[0] *= INTERNAL_SHAPE[0] / w
     intrinsics_resized[1] *= INTERNAL_SHAPE[1] / h
