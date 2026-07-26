@@ -428,15 +428,17 @@ class _PipelineWorker:
             try:
                 from sharp.utils.gaussians import save_ply
                 # save_ply expects [1, N, C] (batch dim) — it calls .flatten(0,1)
+                # Exception: opacities expects [1, N] (no channel dim) because
+                # save_ply does .flatten(0,1).unsqueeze(-1) on it.
                 opac = merged.opacities
-                if opac.dim() == 1:
-                    opac = opac.unsqueeze(-1)  # [N] → [N,1]
+                if opac.dim() == 2:
+                    opac = opac.squeeze(-1)  # [N,1] → [N]
                 merged_ply = Gaussians3D(
                     mean_vectors=merged.mean_vectors.unsqueeze(0),
                     singular_values=merged.singular_values.unsqueeze(0),
                     quaternions=merged.quaternions.unsqueeze(0),
                     colors=merged.colors.unsqueeze(0),
-                    opacities=opac.unsqueeze(0),
+                    opacities=opac.unsqueeze(0),  # [N] → [1, N]
                 )
                 save_ply(merged_ply, 1.0, (1, 1), out.with_suffix(".ply"))
             except Exception as e:
