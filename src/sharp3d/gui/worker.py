@@ -307,7 +307,8 @@ class _PipelineWorker:
 
         # Extract faces from input (overlapping FOV for seam reduction)
         from sharp3d.projection import (OVERLAP_FOV_SCALE, OVERLAP_KEEP_ANGLE_DEG,
-                                        filter_gaussians_by_angle)
+                                        filter_gaussians_by_angle,
+                                        angular_opacity_weight)
         face_size = 1536  # match SHARP internal resolution
 
         if proj == "equirect360":
@@ -393,15 +394,15 @@ class _PipelineWorker:
             # Quaternion multiplication: q_world = q_rot * q_local
             quats_world = _quat_multiply(q_rot.unsqueeze(0), quats_local)
 
-            # Angular filter: keep only central region (discard low-quality edges)
+            # Center-weighted opacity falloff (smooth seam blending)
             face_fwd = face_forwards[i].to(device)
-            mask = filter_gaussians_by_angle(means_world, face_fwd,
-                                            OVERLAP_KEEP_ANGLE_DEG)
-            all_means.append(means_world[mask])
-            all_quats.append(quats_world[mask])
-            all_scales.append(scales[mask])
-            all_opacities.append(opacities[mask])
-            all_colors.append(colors[mask])
+            weight = angular_opacity_weight(means_world, face_fwd)
+            keep = weight > 0.01
+            all_means.append(means_world[keep])
+            all_quats.append(quats_world[keep])
+            all_scales.append(scales[keep])
+            all_opacities.append(opacities[keep] * weight[keep].unsqueeze(-1))
+            all_colors.append(colors[keep])
 
             self._respond("convert_progress",
                           (i + 1, total_steps, 0.0, time.time() - t_start))
@@ -514,7 +515,8 @@ class _PipelineWorker:
         from sharp3d.video import VideoWriter, resolve_encoder
         from sharp3d.projection import (OVERLAP_FOV_SCALE,
                                         OVERLAP_KEEP_ANGLE_DEG,
-                                        filter_gaussians_by_angle)
+                                        filter_gaussians_by_angle,
+                                        angular_opacity_weight)
         from sharp3d.quaternion import quat_from_rotmat_gpu
         from sharp3d.unproject import prepare_input_gpu
         from sharp.utils.gaussians import Gaussians3D
@@ -712,15 +714,15 @@ class _PipelineWorker:
                 q_rot = quat_from_rotmat_gpu(R_inv.unsqueeze(0))[0]
                 quats_world = _quat_multiply(q_rot.unsqueeze(0), quats_local)
 
-                # Angular filter: keep central region only
+                # Center-weighted opacity falloff (smooth seam blending)
                 face_fwd = face_forwards[i].to(device)
-                mask = filter_gaussians_by_angle(means_world, face_fwd,
-                                                OVERLAP_KEEP_ANGLE_DEG)
-                all_means.append(means_world[mask])
-                all_quats.append(quats_world[mask])
-                all_scales.append(scales[mask])
-                all_opacities.append(opacities[mask])
-                all_colors.append(colors[mask])
+                weight = angular_opacity_weight(means_world, face_fwd)
+                keep = weight > 0.01
+                all_means.append(means_world[keep])
+                all_quats.append(quats_world[keep])
+                all_scales.append(scales[keep])
+                all_opacities.append(opacities[keep] * weight[keep].unsqueeze(-1))
+                all_colors.append(colors[keep])
 
             if self._cancel_event.is_set():
                 del faces

@@ -272,6 +272,45 @@ def filter_gaussians_by_angle(
     return cos_angle >= cos_thresh
 
 
+# Inner angle: full weight below this (no attenuation in central region)
+_INNER_ANGLE_DEG = 40.0
+
+
+def angular_opacity_weight(
+    means: Tensor,
+    face_forward: Tensor,
+    inner_deg: float = _INNER_ANGLE_DEG,
+    outer_deg: float = OVERLAP_KEEP_ANGLE_DEG,
+) -> Tensor:
+    """Compute smooth center-weighted opacity falloff per Gaussian.
+
+    Returns weight in [0, 1]:
+      - angle < inner_deg: weight = 1.0 (full contribution)
+      - inner_deg < angle < outer_deg: smoothstep 1→0 (feather zone)
+      - angle > outer_deg: weight = 0.0 (discard)
+
+    Args:
+        means: [N, 3] world-space Gaussian positions.
+        face_forward: [3] unit vector — face's forward direction.
+        inner_deg: angle below which weight is 1.0.
+        outer_deg: angle above which weight is 0.0.
+
+    Returns:
+        weight: [N] float tensor [0, 1].
+    """
+    dirs = F.normalize(means, dim=-1)
+    fwd = F.normalize(face_forward, dim=0)
+    cos_angle = (dirs * fwd.unsqueeze(0)).sum(dim=-1).clamp(-1, 1)
+    angle_deg = torch.degrees(torch.acos(cos_angle))
+
+    # Smoothstep: 1 at inner_deg, 0 at outer_deg
+    t = (angle_deg - inner_deg) / (outer_deg - inner_deg)
+    t = t.clamp(0, 1)
+    # Hermite smoothstep: 3t² - 2t³ (inverted: 1 at t=0, 0 at t=1)
+    weight = 1.0 - t * t * (3.0 - 2.0 * t)
+    return weight
+
+
 # ─── Input: Equirectangular → Cubemap faces ──────────────────────────────────
 
 def _cubemap_face_rays(face_size: int, device: torch.device,
