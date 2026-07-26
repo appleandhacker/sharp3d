@@ -296,6 +296,7 @@ class SbsTab(QWidget):
         engine.model_loading.connect(self._on_model_loading)
         engine.model_load_progress.connect(self._on_model_load_progress)
         engine.model_ready.connect(self._on_model_ready)
+        engine.model_accel.connect(self._on_model_accel)
         engine.convert_progress.connect(self._on_convert_progress)
         engine.convert_done.connect(self._on_convert_done)
         engine.error.connect(self._on_error)
@@ -322,6 +323,12 @@ class SbsTab(QWidget):
         self._progress.set_busy(False)
         self._pct_label.setText("100%")
         self._prog_label.setText("模型就绪")
+
+    def _on_model_accel(self, status: list) -> None:
+        parts = [f"{name}{'✓' if ok else '✗'}" for name, ok in status]
+        self._prog_label.setText("模型就绪 · " + " · ".join(parts))
+        self._prog_label.setToolTip("\n".join(
+            f"{'✓' if ok else '✗'} {name}" for name, ok in status))
 
     def _on_res_changed(self, idx: int) -> None:
         # Last item ("自定义宽度") reveals the custom width spinbox.

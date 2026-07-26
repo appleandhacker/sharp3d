@@ -58,6 +58,8 @@ class SharpPredictor:
         self.device = device
         self.perf_mode = perf_mode
         self._progress = progress_cb or (lambda s, p: None)
+        # Track acceleration methods: list of (name, enabled)
+        self.accel_status: list[tuple[str, bool]] = []
 
         if cache_dir is None:
             import sys as _sys, os as _os
@@ -103,18 +105,23 @@ class SharpPredictor:
                            str(fp16_ckpt))
             except Exception:
                 pass
+        self.accel_status.append(("FP16 权重", True))
 
         # ── channels_last (lossless Conv2d speedup) ──────────────────────
+        _cl_ok = False
         try:
             for mod in predictor.modules():
                 if isinstance(mod, (torch.nn.Conv2d, torch.nn.ConvTranspose2d)):
                     mod.weight.data = mod.weight.data.to(
                         memory_format=torch.channels_last)
+            _cl_ok = True
         except Exception:
             pass
+        self.accel_status.append(("channels_last", _cl_ok))
 
         # ── ORT TensorRT acceleration ────────────────────────────────────
         use_int8 = (perf_mode == "speed")
+        _ort_ok = False
         try:
             from .ort_engine import create_ort_patch_encoder, create_ort_image_encoder
             spn = predictor.monodepth_model.monodepth_predictor.encoder
@@ -126,6 +133,8 @@ class SharpPredictor:
             ort_img = create_ort_image_encoder(predictor, device, int8_enable=use_int8)
             if ort_img is not None:
                 spn.image_encoder = ort_img
+
+            _ort_ok = (ort_enc is not None or ort_img is not None)
         except Exception as e:
             import traceback, os as _os2
             logger.warning("ORT TensorRT 引擎构建失败: %s", e)
@@ -135,6 +144,8 @@ class SharpPredictor:
                     traceback.format_exc(), encoding="utf-8")
             except Exception:
                 pass
+        _ort_label = "ORT TensorRT" + (" INT8" if use_int8 else "")
+        self.accel_status.append((_ort_label, _ort_ok))
 
         # ── FP16 conversion (after ORT export which needs FP32) ──────────
         if not already_fp16:
@@ -196,6 +207,7 @@ class SharpPredictor:
         _is_compiled = hasattr(self._compiled, "_orig_mod")
         _mode = "torch.compile 已启用" if _is_compiled else "eager 模式（未编译）"
         logger.info("torch.compile 状态: %s", _mode)
+        self.accel_status.append(("torch.compile", _is_compiled))
         self._progress(_mode, 60)
 
         # ── Warmup inference ─────────────────────────────────────────────

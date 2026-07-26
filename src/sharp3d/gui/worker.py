@@ -133,6 +133,7 @@ class _PipelineWorker:
         self._pipeline = sp.predictor
         self._compiled = sp  # SharpPredictor is callable (predict_fn)
         self._respond("model_ready", ())
+        self._respond("model_accel", (sp.accel_status,))
         self._respond("status", ("模型就绪",))
 
     # ---- prepare: predict + unproject -> cache gaussians ----------------
@@ -1419,6 +1420,7 @@ class EngineProcess(QObject):
     model_loading = Signal()
     model_load_progress = Signal(str, int)   # (stage name, percent 0-100)
     model_ready = Signal()
+    model_accel = Signal(list)  # [(name, enabled), ...]
     prepared = Signal(dict)
     preview_ready = Signal(object)
     convert_progress = Signal(int, int, float, float)  # done, total, avg_fps, elapsed_s
