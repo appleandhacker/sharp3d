@@ -60,12 +60,34 @@ def render_vr_stereo(
 
     if renderer == "higs":
         try:
+            # Build scene once, reuse for both eyes (avoid redundant fp16 packing)
+            from gsplat.scene import GaussianInferenceScene
+            means = gaussians.mean_vectors
+            quats = gaussians.quaternions
+            scales = gaussians.singular_values
+            opacities = gaussians.opacities
+            colors = gaussians.colors
+            if means.dim() == 3:
+                means = means.squeeze(0)
+                quats = quats.squeeze(0)
+                scales = scales.squeeze(0)
+                colors = colors.squeeze(0)
+            if opacities.dim() == 2:
+                opacities = opacities.squeeze(0) if opacities.shape[0] == 1 else opacities.squeeze(-1)
+            import torch.nn.functional as _F
+            higs_scene = GaussianInferenceScene.from_gaussian_tensors(
+                means=means, quats=_F.normalize(quats, dim=-1),
+                scales=scales, opacities=opacities, colors=colors,
+                sh_degree=None, sh_compression="none", id="vr_render",
+            )
             left_faces = _render_cubemap_higs(gaussians, left_offset, face_size,
-                                              device, skip_back=skip_back)
+                                              device, skip_back=skip_back,
+                                              scene=higs_scene)
             if progress_cb:
                 progress_cb(1, 6)
             right_faces = _render_cubemap_higs(gaussians, right_offset, face_size,
-                                               device, skip_back=skip_back)
+                                               device, skip_back=skip_back,
+                                               scene=higs_scene)
             if progress_cb:
                 progress_cb(2, 6)
         except (ImportError, RuntimeError, OSError):
@@ -123,31 +145,36 @@ def _render_cubemap_higs(
     face_size: int,
     device: torch.device,
     skip_back: bool = False,
+    scene=None,
 ) -> Tensor:
     """Render 6 cubemap faces using HiGS inference renderer.
+
+    Args:
+        scene: Pre-built GaussianInferenceScene (skip packing if provided).
 
     Returns: [6, 3, face_size, face_size] linearRGB.
     """
     from gsplat.scene import GaussianInferenceScene
     from gsplat.experimental.render import rasterize_gaussian_inference_scene
 
-    # Pack scene (fp16)
-    means = gaussians.mean_vectors
-    quats = gaussians.quaternions
-    scales = gaussians.singular_values
-    opacities = gaussians.opacities
-    colors = gaussians.colors  # [N, 3] linearRGB
+    if scene is None:
+        # Pack scene (fp16)
+        means = gaussians.mean_vectors
+        quats = gaussians.quaternions
+        scales = gaussians.singular_values
+        opacities = gaussians.opacities
+        colors = gaussians.colors  # [N, 3] linearRGB
 
-    # Squeeze batch dim if present ([1, N, ...] → [N, ...])
-    if means.dim() == 3:
-        means = means.squeeze(0)
-        quats = quats.squeeze(0)
-        scales = scales.squeeze(0)
-        colors = colors.squeeze(0)
-    if opacities.dim() == 2:
-        opacities = opacities.squeeze(0) if opacities.shape[0] == 1 else opacities.squeeze(-1)
+        # Squeeze batch dim if present ([1, N, ...] → [N, ...])
+        if means.dim() == 3:
+            means = means.squeeze(0)
+            quats = quats.squeeze(0)
+            scales = scales.squeeze(0)
+            colors = colors.squeeze(0)
+        if opacities.dim() == 2:
+            opacities = opacities.squeeze(0) if opacities.shape[0] == 1 else opacities.squeeze(-1)
 
-    scene = GaussianInferenceScene.from_gaussian_tensors(
+        scene = GaussianInferenceScene.from_gaussian_tensors(
         means=means,
         quats=torch.nn.functional.normalize(quats, dim=-1),
         scales=scales,

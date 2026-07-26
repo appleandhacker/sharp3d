@@ -77,6 +77,40 @@ def prepare_input(image_np, f_px: float, device: torch.device,
     return img_resized, disparity_factor, intrinsics_resized, (w, h)
 
 
+def prepare_input_gpu(img_gpu: torch.Tensor, f_px: float, device: torch.device):
+    """Prepare a GPU-resident image for SHARP predictor (zero-copy path).
+
+    Args:
+        img_gpu: [3, H, W] float tensor [0, 1] already on device.
+        f_px: Focal length in pixels (of the input face).
+        device: CUDA device.
+
+    Returns:
+        Same as prepare_input: (img_resized, disparity_factor, intrinsics_resized, (w, h))
+    """
+    _, h, w = img_gpu.shape
+    disparity_factor = torch.tensor([f_px / w], device=device, dtype=torch.float32)
+
+    if (h, w) == tuple(INTERNAL_SHAPE):
+        img_resized = img_gpu[None]  # [1, 3, H, W] — no resize needed
+    else:
+        img_resized = interpolate(
+            img_gpu[None], size=INTERNAL_SHAPE, mode="bilinear", align_corners=True
+        )
+
+    intrinsics = torch.tensor([
+        [f_px, 0, w / 2, 0],
+        [0, f_px, h / 2, 0],
+        [0, 0, 1, 0],
+        [0, 0, 0, 1],
+    ], dtype=torch.float32, device=device)
+    intrinsics_resized = intrinsics.clone()
+    intrinsics_resized[0] *= INTERNAL_SHAPE[0] / w
+    intrinsics_resized[1] *= INTERNAL_SHAPE[1] / h
+
+    return img_resized, disparity_factor, intrinsics_resized, (w, h)
+
+
 def fast_unproject(
     g_ndc: Gaussians3D,
     extrinsics: torch.Tensor,
