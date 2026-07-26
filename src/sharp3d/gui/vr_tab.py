@@ -401,6 +401,8 @@ class VrTab(QWidget):
 
     def _auto_resolution(self) -> None:
         """Auto-switch resolution preset based on output angle."""
+        if not hasattr(self, '_res_preset'):
+            return  # not yet constructed
         if self._is_output_360():
             self._res_preset.setCurrentIndex(1)  # 4096×2048 (2:1)
         else:
