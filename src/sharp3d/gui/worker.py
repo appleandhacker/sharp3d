@@ -419,6 +419,11 @@ class _PipelineWorker:
             opacities=torch.cat(all_opacities, dim=0),
         )
 
+        # PLY export (world-space Gaussians)
+        if opts.get("ply"):
+            from sharp.utils.gaussians import save_ply
+            save_ply(merged, 1.0, (1, 1), out.with_suffix(".ply"))
+
         # Render VR stereo (adaptive face size based on output resolution)
         render_face = _compute_render_face_size(eye_w, output_projection)
 

@@ -318,6 +318,9 @@ class VrTab(QWidget):
         self._chk_depth = QCheckBox("同时输出深度全景图")
         adv_card.add_widget(self._chk_depth)
 
+        self._chk_ply = QCheckBox("导出PLY高斯文件")
+        adv_card.add_widget(self._chk_ply)
+
         right.addWidget(adv_card)
         right.addStretch(1)
 
@@ -521,6 +524,7 @@ class VrTab(QWidget):
             "temporal_stabilize": ["off", "global", "adaptive"][
                 self._stabilize.currentIndex()],
             "depth": self._chk_depth.isChecked(),
+            "ply": self._chk_ply.isChecked(),
         }
 
     def _on_cancel(self) -> None:
