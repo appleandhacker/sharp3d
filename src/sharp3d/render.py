@@ -363,9 +363,15 @@ def render_depth_map(
     alpha = rendered_alphas[0, :, :, 0]  # (H, W)
     depth = depth / alpha.clamp(min=1e-8)
 
-    # Colorize depth (near=warm, far=cool)
-    depth_norm = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
-    depth_norm = depth_norm.clamp(0, 1)
+    # Colorize depth (near=warm, far=cool) with log-scale normalization
+    d_min = depth[depth > 0].min() if (depth > 0).any() else depth.min()
+    d_max = depth.max()
+    if d_max > d_min:
+        depth_log = torch.log(depth.clamp(min=d_min) / d_min + 1e-6)
+        log_max = torch.log(d_max / d_min + 1e-6)
+        depth_norm = (depth_log / log_max).clamp(0, 1)
+    else:
+        depth_norm = torch.zeros_like(depth)
 
     # Simple turbo-like colormap via interpolation
     r = (1.0 - depth_norm).clamp(0, 1)
