@@ -49,6 +49,26 @@ def _quat_multiply(q1, q2):
     ], dim=-1)
 
 
+def _compute_render_face_size(eye_w: int, output_projection: str) -> int:
+    """Compute adaptive cubemap render face size from output resolution.
+
+    Each cubemap face covers 90° FOV. The number of output pixels spanning
+    one face determines the ideal render resolution:
+      - 180° output: face covers 90/180 = 1/2 of width → eye_w / 2
+      - 360° output: face covers 90/360 = 1/4 of width → eye_w / 4
+
+    Capped at 2048 (SHARP prediction at 1536 limits real detail),
+    floored at 1024, rounded to multiple of 256 for GPU efficiency.
+    """
+    if output_projection == "equirect180":
+        ideal = eye_w // 2
+    else:  # equirect360
+        ideal = eye_w // 4
+    # Clamp and round to multiple of 256
+    clamped = max(1024, min(2048, ideal))
+    return (clamped + 128) // 256 * 256
+
+
 # ===========================================================================
 # Child-process side (no Qt)
 # ===========================================================================
@@ -373,14 +393,16 @@ class _PipelineWorker:
             opacities=torch.cat(all_opacities, dim=0),
         )
 
-        # Render VR stereo
+        # Render VR stereo (adaptive face size based on output resolution)
+        render_face = _compute_render_face_size(eye_w, output_projection)
+
         def _render_progress(step, total):
             self._respond("convert_progress", (step, total, 0.0, time.time()))
 
         result = render_vr_stereo(
             merged,
             ipd=ipd_scene,
-            face_size=1024,
+            face_size=render_face,
             out_w=eye_w,
             out_h=eye_h,
             output_projection=output_projection,
@@ -400,7 +422,7 @@ class _PipelineWorker:
             from sharp3d.projection import get_cubemap_cameras as _gcc
 
             depth_map_fn = cubemap_to_equirect180 if output_projection == "equirect180" else cubemap_to_equirect
-            viewmats_d, Ks_d = _gcc(1024, device)
+            viewmats_d, Ks_d = _gcc(render_face, device)
             # Render depth from left eye (no stereo offset for depth)
             with torch.no_grad():
                 rendered_d, _, meta_d = _rast(
@@ -411,7 +433,7 @@ class _PipelineWorker:
                     colors=merged.colors,
                     viewmats=viewmats_d,
                     Ks=Ks_d,
-                    width=1024, height=1024,
+                    width=render_face, height=render_face,
                     render_mode="RGB+D",
                 )
             # RGB+D mode: rendered_d shape [6, H, W, 4] (RGB + depth)
@@ -455,9 +477,288 @@ class _PipelineWorker:
                           prepare_input, fast_unproject,
                           equirect_to_cubemap, fisheye_to_cubemap,
                           render_vr_stereo, INTERNAL_SHAPE):
-        """Video VR conversion — placeholder for initial implementation."""
-        # TODO: implement frame-by-frame video VR conversion
-        self._respond("error", ("VR 视频转换尚未实现，请使用图片输入",))
+        """Video VR conversion — frame-by-frame cubemap predict + render."""
+        from sharp3d.hdr import FrameReader, FFMPEG, hdr_to_sdr_filter
+        from sharp3d.video import VideoWriter, resolve_encoder
+        from sharp3d.projection import get_cubemap_cameras, _look_at_rotation, _FACE_DEFS
+        from sharp3d.quaternion import quat_from_rotmat_gpu
+        from sharp.utils.gaussians import Gaussians3D
+        import queue as _queue
+        import threading
+        import subprocess as _sp
+
+        reader = FrameReader(path)
+        n = reader.n_frames
+        device = self._device
+
+        # Auto-detect input projection
+        proj = input_projection
+        if proj == "auto":
+            aspect = reader.width / reader.height
+            if 1.9 < aspect < 2.1:
+                proj = "equirect360"
+            elif 0.9 < aspect < 1.1:
+                proj = "equirect180"
+            else:
+                proj = "equirect360"
+
+        # Output video dimensions (packed stereo)
+        if stereo_layout == "sbs":
+            vid_w, vid_h = eye_w * 2, eye_h
+        else:  # tb
+            vid_w, vid_h = eye_w, eye_h * 2
+
+        # Encoder setup
+        codec = opts.get("codec", "av1")
+        crf = opts.get("crf", 20)
+        out_fps = opts.get("out_fps") or reader.fps
+        enc = resolve_encoder(codec, vid_w, vid_h)
+        is_gpu = "nvenc" in enc
+        label = "GPU" if is_gpu else "CPU"
+        self._respond("status", (
+            f"编码器: {enc} ({label}) · 输出 {vid_w}×{vid_h}",))
+
+        writer = VideoWriter(out, fps=out_fps, width=vid_w, height=vid_h,
+                             codec=codec, crf=crf)
+
+        # Cubemap prediction setup (fixed across frames)
+        pred_face_size = 1536  # SHARP internal resolution
+        viewmats, _ = get_cubemap_cameras(pred_face_size, device)
+        render_face = _compute_render_face_size(eye_w, output_projection)
+
+        # Decode prefetch thread
+        frame_q: _queue.Queue = _queue.Queue(maxsize=4)
+        frame_size = reader.width * reader.height * 3
+
+        def _decode():
+            vf_parts = []
+            if reader.is_hdr:
+                vf_parts.append(hdr_to_sdr_filter())
+            vf = ["-vf", ",".join(vf_parts)] if vf_parts else []
+            cmd = [FFMPEG, *reader._hwaccel(),
+                   "-i", reader.path, *vf,
+                   "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+            proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.DEVNULL,
+                             creationflags=0x08000000)
+            try:
+                while True:
+                    if self._cancel_event.is_set():
+                        break
+                    raw = proc.stdout.read(frame_size)
+                    if len(raw) < frame_size:
+                        break
+                    frame_q.put(
+                        np.frombuffer(raw, dtype=np.uint8).reshape(
+                            reader.height, reader.width, 3).copy())
+            finally:
+                proc.stdout.close()
+                proc.wait()
+                frame_q.put(None)
+
+        decoder = threading.Thread(target=_decode, daemon=True)
+        decoder.start()
+
+        # Encode thread (overlaps encoding with GPU compute)
+        encode_q: _queue.Queue = _queue.Queue(maxsize=3)
+
+        def _encode_loop():
+            while True:
+                item = encode_q.get()
+                if item is None:
+                    break
+                writer.append_frame(item)
+
+        encode_thread = threading.Thread(target=_encode_loop, daemon=True)
+        encode_thread.start()
+
+        # Depth video (optional)
+        want_depth = opts.get("depth", False)
+        depth_writer = None
+        if want_depth:
+            from sharp3d.projection import cubemap_to_equirect, cubemap_to_equirect180
+            from gsplat.rendering import rasterization as _rast
+            depth_path = out.with_stem(out.stem + "_depth")
+            depth_writer = VideoWriter(str(depth_path), fps=out_fps,
+                                       width=eye_w, height=eye_h,
+                                       codec="h264", crf=18)
+
+        # Main conversion loop
+        n_done = 0
+        t_start = time.time()
+
+        while True:
+            frm = frame_q.get()
+            if frm is None or self._cancel_event.is_set():
+                break
+
+            # Convert frame to tensor [H, W, 3] float [0, 1]
+            img_t = torch.from_numpy(frm).float().to(device) / 255.0
+            del frm
+
+            # Extract 6 cubemap faces
+            if proj.startswith("equirect"):
+                faces = equirect_to_cubemap(img_t, pred_face_size)
+            else:
+                model_map = {
+                    "fisheye_equidistant": "equidistant",
+                    "fisheye_equisolid": "equisolid",
+                    "fisheye_orthographic": "orthographic",
+                    "fisheye_stereographic": "stereographic",
+                    "fisheye_ftheta": "ftheta",
+                }
+                model = model_map.get(proj, "equidistant")
+                faces = fisheye_to_cubemap(img_t, pred_face_size, model=model,
+                                           coeffs=ftheta_coeffs)
+            del img_t
+
+            # Predict + unproject each face → merge Gaussians
+            all_means = []
+            all_quats = []
+            all_scales = []
+            all_opacities = []
+            all_colors = []
+
+            f_px = pred_face_size / 2.0
+
+            for i in range(6):
+                if self._cancel_event.is_set():
+                    break
+                face_img = faces[i].permute(1, 2, 0).cpu().numpy()
+                face_img_u8 = (face_img * 255).clip(0, 255).astype(np.uint8)
+
+                img_r, df, ir, _ = prepare_input(face_img_u8, f_px, device)
+
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+                    g_ndc = self._compiled(img_r, df)
+
+                g = fast_unproject(g_ndc, torch.eye(4, device=device), ir,
+                                   INTERNAL_SHAPE, decompose_method="analytical")
+
+                means = g.mean_vectors.squeeze(0).clone()
+                quats_local = g.quaternions.squeeze(0).clone()
+                scales = g.singular_values.squeeze(0).clone()
+                opacities = (g.opacities.squeeze(0) if g.opacities.dim() == 2
+                             else g.opacities).clone()
+                colors = g.colors.squeeze(0).clone()
+
+                R = viewmats[i, :3, :3]
+                R_inv = R.T
+                means_world = means @ R_inv.T
+                q_rot = quat_from_rotmat_gpu(R_inv.unsqueeze(0))[0]
+                quats_world = _quat_multiply(q_rot.unsqueeze(0), quats_local)
+
+                all_means.append(means_world)
+                all_quats.append(quats_world)
+                all_scales.append(scales)
+                all_opacities.append(opacities)
+                all_colors.append(colors)
+
+            if self._cancel_event.is_set():
+                del faces
+                break
+
+            merged = Gaussians3D(
+                mean_vectors=torch.cat(all_means, dim=0),
+                singular_values=torch.cat(all_scales, dim=0),
+                quaternions=torch.cat(all_quats, dim=0),
+                colors=torch.cat(all_colors, dim=0),
+                opacities=torch.cat(all_opacities, dim=0),
+            )
+            del faces, all_means, all_quats, all_scales, all_opacities, all_colors
+
+            # Render stereo VR frame
+            result = render_vr_stereo(
+                merged,
+                ipd=ipd_scene,
+                face_size=render_face,
+                out_w=eye_w,
+                out_h=eye_h,
+                output_projection=output_projection,
+                stereo_layout=stereo_layout,
+                renderer=renderer,
+                device=device,
+            )
+
+            # Encode (async)
+            encode_q.put(result.cpu().numpy())
+            del result
+
+            # Depth output (optional)
+            if depth_writer is not None:
+                from sharp3d.projection import (cubemap_to_equirect as _c2e,
+                                               cubemap_to_equirect180 as _c2e180)
+                from gsplat.rendering import rasterization as _rast
+                depth_map_fn = _c2e180 if output_projection == "equirect180" else _c2e
+                viewmats_d, Ks_d = get_cubemap_cameras(render_face, device)
+                with torch.no_grad():
+                    rendered_d, _, _ = _rast(
+                        means=merged.mean_vectors,
+                        quats=merged.quaternions,
+                        scales=merged.singular_values,
+                        opacities=merged.opacities,
+                        colors=merged.colors,
+                        viewmats=viewmats_d,
+                        Ks=Ks_d,
+                        width=render_face, height=render_face,
+                        render_mode="RGB+D",
+                    )
+                depths = rendered_d[:, :, :, 3:4].permute(0, 3, 1, 2)
+                depths_3ch = depths.expand(-1, 3, -1, -1)
+                depth_equirect = depth_map_fn(depths_3ch, eye_w, eye_h)
+                d_valid = depth_equirect[depth_equirect > 0]
+                if d_valid.numel() > 0:
+                    d_min = d_valid.min()
+                    d_max = d_valid.max()
+                    if d_max > d_min:
+                        depth_log = torch.log(
+                            depth_equirect.clamp(min=d_min) / d_min + 1e-6)
+                        log_max = torch.log(d_max / d_min + 1e-6)
+                        depth_vis = ((1.0 - depth_log / log_max) * 255
+                                     ).clamp(0, 255).to(torch.uint8)
+                    else:
+                        depth_vis = torch.full_like(depth_equirect, 128,
+                                                    dtype=torch.uint8)
+                else:
+                    depth_vis = torch.zeros_like(depth_equirect, dtype=torch.uint8)
+                depth_vis[depth_equirect <= 0] = 0
+                depth_writer.append_frame(depth_vis.cpu().numpy())
+                del rendered_d, depths, depth_equirect, depth_vis
+
+            del merged
+            torch.cuda.empty_cache()
+
+            n_done += 1
+            elapsed = time.time() - t_start
+            avg_fps = n_done / elapsed if elapsed > 0 else 0.0
+            self._respond("convert_progress", (n_done, n, avg_fps, elapsed))
+
+            if n_done % 30 == 0:
+                gc.collect()
+
+        # Cleanup
+        encode_q.put(None)
+        encode_thread.join(timeout=60)
+        while True:
+            try:
+                frame_q.get_nowait()
+            except _queue.Empty:
+                break
+        decoder.join(timeout=5)
+
+        keep_audio = opts.get("audio", True) and reader.has_audio
+        source = path if keep_audio else None
+        writer.close(source_video=source)
+        if depth_writer is not None:
+            depth_writer.close()
+
+        total_elapsed = time.time() - t_start
+        avg = n_done / total_elapsed if total_elapsed > 0 else 0.0
+        self._respond("convert_done", ({
+            "output": str(out), "elapsed": total_elapsed,
+            "fps": avg, "n_frames": n_done,
+            "size": (vid_w, vid_h),
+            "cancelled": self._cancel_event.is_set(),
+        },))
 
     def _convert_image(self, path, out, opts, ipd_scene, conv_q, method,
                        prepare_input, fast_unproject, render_sbs,
