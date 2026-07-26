@@ -366,8 +366,10 @@ class _PipelineWorker:
                 self._respond("convert_done", ({"cancelled": True},))
                 return
 
-            # Face image — GPU-direct (no PCIe roundtrip)
-            img_r, df, ir, _ = prepare_input_gpu(faces[i], f_px, device)
+            # Face image for prediction
+            face_img = faces[i].permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
+            face_img_u8 = (face_img * 255).clip(0, 255).astype(np.uint8)
+            img_r, df, ir, _ = prepare_input(face_img_u8, f_px, device)
 
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
                 g_ndc = self._compiled(img_r, df)
@@ -699,8 +701,9 @@ class _PipelineWorker:
             for i in range(n_faces):
                 if self._cancel_event.is_set():
                     break
-                # GPU-direct (no PCIe roundtrip)
-                img_r, df, ir, _ = prepare_input_gpu(faces[i], f_px, device)
+                face_img = faces[i].permute(1, 2, 0).cpu().numpy()
+                face_img_u8 = (face_img * 255).clip(0, 255).astype(np.uint8)
+                img_r, df, ir, _ = prepare_input(face_img_u8, f_px, device)
 
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
                     g_ndc = self._compiled(img_r, df)
