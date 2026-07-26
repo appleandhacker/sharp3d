@@ -560,7 +560,13 @@ class VrTab(QWidget):
         self._prog_label.setText("模型就绪")
 
     def _on_model_accel(self, status: list) -> None:
-        parts = [f"{name}{'✓' if ok else '✗'}" for name, ok in status]
+        parts = []
+        for name, ok in status:
+            if ok:
+                parts.append(f'{name}<span style="color:#4caf50;">✓</span>')
+            else:
+                parts.append(f'{name}<span style="color:#f44336;">✗</span>')
+        self._prog_label.setTextFormat(Qt.RichText)
         self._prog_label.setText("模型就绪 · " + " · ".join(parts))
         self._prog_label.setToolTip("\n".join(
             f"{'✓' if ok else '✗'} {name}" for name, ok in status))
