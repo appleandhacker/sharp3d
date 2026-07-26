@@ -421,18 +421,13 @@ class _PipelineWorker:
             opacities=torch.cat(all_opacities, dim=0),
         )
 
-        # PLY export (world-space Gaussians)
+        # PLY export (world-space Gaussians) — non-fatal if it fails
         if opts.get("ply"):
-            from sharp.utils.gaussians import save_ply, Gaussians3D as _G3D
-            # save_ply needs CPU tensors for numpy conversion
-            merged_cpu = _G3D(
-                mean_vectors=merged.mean_vectors.cpu(),
-                singular_values=merged.singular_values.cpu(),
-                quaternions=merged.quaternions.cpu(),
-                colors=merged.colors.cpu(),
-                opacities=merged.opacities.cpu(),
-            )
-            save_ply(merged_cpu, 1.0, (1, 1), out.with_suffix(".ply"))
+            try:
+                from sharp.utils.gaussians import save_ply
+                save_ply(merged, 1.0, (1, 1), out.with_suffix(".ply"))
+            except Exception as e:
+                self._respond("status", (f"PLY导出失败(不影响转换): {e}",))
 
         # Render VR stereo (adaptive face size based on output resolution)
         render_face = _compute_render_face_size(eye_w, output_projection)
