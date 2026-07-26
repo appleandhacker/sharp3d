@@ -455,7 +455,7 @@ class VrTab(QWidget):
 
         # NVENC resolution warning
         opts = self._build_opts(inp, out)
-        ew, eh = opts["eye_w"], opts["eye_h"]
+        ew, eh = opts["eye_width"], opts["eye_height"]
         layout = opts["stereo_layout"]
         packed_w = ew * 2 if layout == "sbs" else ew
         packed_h = eh if layout == "sbs" else eh * 2
