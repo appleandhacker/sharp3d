@@ -52,21 +52,19 @@ def _quat_multiply(q1, q2):
 def _compute_render_face_size(eye_w: int, output_projection: str) -> int:
     """Compute adaptive cubemap render face size from output resolution.
 
-    Each cubemap face covers 90° FOV. The number of output pixels spanning
-    one face determines the ideal render resolution:
-      - 180° output: face covers 90/180 = 1/2 of width → eye_w / 2
-      - 360° output: face covers 90/360 = 1/4 of width → eye_w / 4
+    Each cubemap face covers 90° FOV:
+      - 180° output: face covers 90/180 = 1/2 of width → eye_w
+      - 360° output: face covers 90/360 = 1/4 of width → eye_w / 2
 
-    Capped at 2048 (SHARP prediction at 1536 limits real detail),
-    floored at 1024, rounded to multiple of 256 for GPU efficiency.
+    Minimum 2048, rounded up to multiple of 256 for GPU efficiency.
     """
     if output_projection == "equirect180":
-        ideal = eye_w // 2
+        ideal = eye_w
     else:  # equirect360
-        ideal = eye_w // 4
-    # Clamp and round to multiple of 256
-    clamped = max(1024, min(2048, ideal))
-    return (clamped + 128) // 256 * 256
+        ideal = eye_w // 2
+    # Floor at 2048, round UP to multiple of 256
+    clamped = max(2048, ideal)
+    return (clamped + 255) // 256 * 256
 
 
 # ===========================================================================
