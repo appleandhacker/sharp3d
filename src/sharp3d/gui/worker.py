@@ -307,15 +307,16 @@ class _PipelineWorker:
             else:
                 proj = "equirect360"  # default fallback
 
-        # Extract 6 cubemap faces from input (overlapping FOV for seam reduction)
+        # Extract faces from input (overlapping FOV for seam reduction)
         from sharp3d.projection import (OVERLAP_FOV_SCALE, OVERLAP_KEEP_ANGLE_DEG,
                                         filter_gaussians_by_angle)
         face_size = 1536  # match SHARP internal resolution
-        if proj.startswith("equirect"):
-            faces = equirect_to_cubemap(img_t, face_size,
-                                        fov_scale=OVERLAP_FOV_SCALE)
-        else:
-            # Fisheye
+
+        if proj.startswith("fisheye"):
+            # Optimal 3-axis hemisphere coverage for fisheye
+            from sharp3d.projection import (fisheye_to_hemisphere,
+                                            get_hemisphere_cameras,
+                                            _HEMISPHERE_AXES)
             model_map = {
                 "fisheye_equidistant": "equidistant",
                 "fisheye_equisolid": "equisolid",
@@ -324,21 +325,26 @@ class _PipelineWorker:
                 "fisheye_ftheta": "ftheta",
             }
             model = model_map.get(proj, "equidistant")
-            faces = fisheye_to_cubemap(img_t, face_size, model=model,
-                                       coeffs=ftheta_coeffs,
-                                       fov_scale=OVERLAP_FOV_SCALE)
+            faces = fisheye_to_hemisphere(img_t, face_size, model=model,
+                                          coeffs=ftheta_coeffs,
+                                          fov_scale=OVERLAP_FOV_SCALE)
+            viewmats, _ = get_hemisphere_cameras(face_size, device)
+            face_forwards = [ax[0] for ax in _HEMISPHERE_AXES]
+            n_faces = 4
+        else:
+            # Full 6-face cubemap for equirectangular
+            from sharp3d.projection import (get_cubemap_cameras,
+                                            _look_at_rotation, _FACE_DEFS)
+            faces = equirect_to_cubemap(img_t, face_size,
+                                        fov_scale=OVERLAP_FOV_SCALE)
+            viewmats, _ = get_cubemap_cameras(face_size, device)
+            face_forwards = [fd[0] for fd in _FACE_DEFS]
+            n_faces = 6
+
+        total_steps = n_faces * 2  # predict + render phases
 
         # Predict depth + unproject for each face → merge Gaussians
-        from sharp3d.projection import get_cubemap_cameras, _look_at_rotation, _FACE_DEFS
         import torch.nn.functional as F_t
-
-        # 180° fisheye only covers front hemisphere: skip -Z(5), +Y(2), -Y(3)
-        if proj.startswith("fisheye"):
-            active_faces = [0, 1, 4]  # +X, -X, +Z
-        else:
-            active_faces = list(range(6))
-        n_faces = len(active_faces)
-        total_steps = n_faces * 2  # predict + render phases
 
         all_means = []
         all_quats = []
@@ -346,9 +352,7 @@ class _PipelineWorker:
         all_opacities = []
         all_colors = []
 
-        viewmats, _ = get_cubemap_cameras(face_size, device)
-
-        for idx, i in enumerate(active_faces):
+        for i in range(n_faces):
             if self._cancel_event.is_set():
                 self._respond("convert_done", ({"cancelled": True},))
                 return
@@ -389,7 +393,7 @@ class _PipelineWorker:
             quats_world = _quat_multiply(q_rot.unsqueeze(0), quats_local)
 
             # Angular filter: keep only central region (discard low-quality edges)
-            face_fwd = _FACE_DEFS[i][0].to(device)
+            face_fwd = face_forwards[i].to(device)
             mask = filter_gaussians_by_angle(means_world, face_fwd,
                                             OVERLAP_KEEP_ANGLE_DEG)
             all_means.append(means_world[mask])
@@ -399,7 +403,7 @@ class _PipelineWorker:
             all_colors.append(colors[mask])
 
             self._respond("convert_progress",
-                          (idx + 1, total_steps, 0.0, time.time() - t_start))
+                          (i + 1, total_steps, 0.0, time.time() - t_start))
 
         # Merge all Gaussians
         from sharp.utils.gaussians import Gaussians3D

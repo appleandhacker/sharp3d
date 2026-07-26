@@ -84,6 +84,161 @@ def get_cubemap_cameras(
     return viewmats, Ks
 
 
+# ─── Optimal hemisphere coverage (4 axes) ────────────────────────────────────
+
+# 4 axes at equal tilt arctan(√2) ≈ 54.74° from +Z, spaced 90° in azimuth.
+# This is the minimax-optimal arrangement: covering radius = 54.74° < 56°
+# (our half-angle), giving strict full hemisphere coverage with 1.26° margin.
+# Directions are the 4 body diagonals of a cube pointing into +Z hemisphere.
+_HEMI_TILT = math.atan(math.sqrt(2))  # ≈ 54.74°
+_HEMISPHERE_AXES = []
+for k in range(4):
+    az = math.radians(90.0 * k)  # 0°, 90°, 180°, 270°
+    fwd = torch.tensor([
+        math.sin(_HEMI_TILT) * math.cos(az),
+        math.sin(_HEMI_TILT) * math.sin(az),
+        math.cos(_HEMI_TILT),
+    ])
+    # Up vector: project +Z onto plane perpendicular to fwd
+    up = torch.tensor([0.0, 0.0, 1.0])
+    up = up - (up @ fwd) * fwd
+    if up.norm() < 1e-6:
+        up = torch.tensor([0.0, -1.0, 0.0])
+    up = up / up.norm()
+    _HEMISPHERE_AXES.append((fwd, up))
+
+_N_HEMI_FACES = len(_HEMISPHERE_AXES)  # 4
+
+
+def get_hemisphere_cameras(
+    face_size: int,
+    device: torch.device,
+) -> tuple[Tensor, Tensor]:
+    """Generate 4 camera matrices for optimal hemisphere coverage.
+
+    Returns:
+        viewmats: [4, 4, 4] world-to-camera extrinsics.
+        Ks: [4, 3, 3] pinhole intrinsics.
+    """
+    f = face_size / 2.0
+    K = torch.tensor([
+        [f, 0, (face_size - 1) / 2.0],
+        [0, f, (face_size - 1) / 2.0],
+        [0, 0, 1],
+    ], device=device, dtype=torch.float32)
+    Ks = K.unsqueeze(0).expand(_N_HEMI_FACES, -1, -1).contiguous()
+
+    viewmats = torch.zeros(_N_HEMI_FACES, 4, 4, device=device, dtype=torch.float32)
+    for i, (fwd, up) in enumerate(_HEMISPHERE_AXES):
+        fwd = fwd.to(device)
+        up = up.to(device)
+        R = _look_at_rotation(fwd, up)
+        viewmats[i, :3, :3] = R
+        viewmats[i, 3, 3] = 1.0
+
+    return viewmats, Ks
+
+
+def _hemisphere_face_rays(face_size: int, device: torch.device,
+                          fov_scale: float = 1.0) -> Tensor:
+    """Generate rays for 4 hemisphere faces.
+
+    Returns: [4, face_size, face_size, 3] world-space ray directions.
+    """
+    coords = torch.linspace(-fov_scale, fov_scale, face_size, device=device)
+    gy, gx = torch.meshgrid(coords, coords, indexing="ij")
+    local = torch.stack([gx, gy, torch.ones_like(gx)], dim=-1)
+    local = F.normalize(local, dim=-1)
+
+    all_rays = []
+    for fwd, up in _HEMISPHERE_AXES:
+        fwd = fwd.to(device)
+        up = up.to(device)
+        R = _look_at_rotation(fwd, up)
+        R_inv = R.T
+        rays_world = (R_inv @ local.reshape(-1, 3).T).T
+        rays_world = rays_world.reshape(face_size, face_size, 3)
+        all_rays.append(rays_world)
+
+    return torch.stack(all_rays, dim=0)
+
+
+def equirect_to_hemisphere(
+    image: Tensor,
+    face_size: int,
+    fov_scale: float = 1.0,
+) -> Tensor:
+    """Sample equirectangular image into 4 optimal hemisphere faces.
+
+    Returns: [4, 3, face_size, face_size]
+    """
+    if image.dim() == 3:
+        image = image.permute(2, 0, 1).unsqueeze(0)
+    device = image.device
+
+    rays = _hemisphere_face_rays(face_size, device, fov_scale)
+    rays_flat = rays.reshape(_N_HEMI_FACES, -1, 3)
+
+    x, y, z = rays_flat[..., 0], rays_flat[..., 1], rays_flat[..., 2]
+    lon = torch.atan2(x, z)
+    lat = torch.asin(y.clamp(-1, 1))
+
+    u = lon / math.pi
+    v = -lat / (math.pi / 2)
+
+    grid = torch.stack([u, v], dim=-1).reshape(_N_HEMI_FACES, face_size, face_size, 2)
+    img_expanded = image.expand(_N_HEMI_FACES, -1, -1, -1)
+    faces = F.grid_sample(img_expanded, grid, mode="bilinear",
+                          padding_mode="border", align_corners=True)
+    return faces
+
+
+def fisheye_to_hemisphere(
+    image: Tensor,
+    face_size: int,
+    model: str = "equidistant",
+    coeffs: list[float] | None = None,
+    fisheye_fov: float = 180.0,
+    fov_scale: float = 1.0,
+) -> Tensor:
+    """Sample fisheye image into 4 optimal hemisphere faces.
+
+    Returns: [4, 3, face_size, face_size]
+    """
+    if image.dim() == 3:
+        image = image.permute(2, 0, 1).unsqueeze(0)
+    device = image.device
+    _, C, H, W = image.shape
+
+    rays = _hemisphere_face_rays(face_size, device, fov_scale)
+    rays_flat = rays.reshape(_N_HEMI_FACES, -1, 3)
+
+    # Fisheye camera looks along +Z
+    x, y, z = rays_flat[..., 0], rays_flat[..., 1], rays_flat[..., 2]
+    theta = torch.acos(z.clamp(-1, 1))
+
+    r_norm = _fisheye_theta_to_r(theta, model, coeffs)
+    max_theta = math.radians(fisheye_fov / 2.0)
+    max_r = _fisheye_theta_to_r(
+        torch.tensor(max_theta, device=device), model, coeffs)
+
+    phi = torch.atan2(y, x)
+    r_px = r_norm / max_r
+    u = r_px * torch.cos(phi)
+    v = -r_px * torch.sin(phi)
+
+    valid = theta <= max_theta
+    grid = torch.stack([u, v], dim=-1).reshape(3, face_size, face_size, 2)
+
+    img_expanded = image.expand(3, -1, -1, -1)
+    faces = F.grid_sample(img_expanded, grid, mode="bilinear",
+                          padding_mode="zeros", align_corners=True)
+    # Zero out invalid pixels
+    valid_mask = valid.reshape(3, 1, face_size, face_size)
+    faces = faces * valid_mask.float()
+    return faces
+
+
 # ─── Overlap filtering ───────────────────────────────────────────────────────
 
 # FOV scale for overlapping prediction: tan(56.3°) ≈ 1.5 → ~112° FOV
