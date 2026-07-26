@@ -278,7 +278,7 @@ def fisheye_to_cubemap(
     # Image coordinates (normalized to [-1, 1] for grid_sample)
     r_px = r_norm / max_r  # normalize to [0, 1] at edge of fisheye
     u = r_px * torch.cos(phi)
-    v = r_px * torch.sin(phi)
+    v = -r_px * torch.sin(phi)  # negate: scene up → image top (v=-1)
 
     # Mask: pixels beyond fisheye FOV are invalid
     valid = theta <= max_theta
