@@ -32,13 +32,16 @@ _FACE_DEFS = [
 
 
 def _look_at_rotation(forward: Tensor, up: Tensor) -> Tensor:
-    """Build a 3x3 rotation matrix (world-to-camera) from forward/up."""
+    """Build a 3x3 rotation matrix (world-to-camera) from forward/up.
+
+    Uses OpenCV convention: X-right, Y-down, Z-forward.
+    Camera looks along +Z in its local frame.
+    """
     f = F.normalize(forward, dim=0)
     r = F.normalize(torch.cross(f, up, dim=0), dim=0)
-    u = torch.cross(r, f, dim=0)
-    # Camera looks along -Z in its local frame, X right, Y down
-    # R rows = [right, up, -forward] → transforms world dir to camera dir
-    return torch.stack([r, u, -f], dim=0)  # [3, 3]
+    d = torch.cross(f, r, dim=0)  # down = fwd × right
+    # R rows = [right, down, forward] — OpenCV convention
+    return torch.stack([r, d, f], dim=0)  # [3, 3]
 
 
 def get_cubemap_cameras(
@@ -91,9 +94,9 @@ def _cubemap_face_rays(face_size: int, device: torch.device) -> Tensor:
     # Pixel grid in [-1, 1]
     coords = torch.linspace(-1, 1, face_size, device=device)
     gy, gx = torch.meshgrid(coords, coords, indexing="ij")
-    # Local ray: camera looks along -Z (OpenGL convention from _look_at_rotation)
-    # X right, Y down, -Z forward
-    local = torch.stack([gx, gy, -torch.ones_like(gx)], dim=-1)  # [H, W, 3]
+    # Local ray: camera looks along +Z (OpenCV convention)
+    # X right, Y down, Z forward
+    local = torch.stack([gx, gy, torch.ones_like(gx)], dim=-1)  # [H, W, 3]
     local = F.normalize(local, dim=-1)
 
     all_rays = []
@@ -309,35 +312,35 @@ def cubemap_to_equirect(
     u = torch.zeros(out_h, out_w, device=device)
     v = torch.zeros(out_h, out_w, device=device)
 
-    # +X face: u = -z/x, v = -y/x (mapped to [-1,1])
+    # +X face: u = -z/x, v = y/x (OpenCV: Y-down)
     mask = face_idx == 0
     u[mask] = -z[mask] / abs_x[mask]
-    v[mask] = -y[mask] / abs_x[mask]
+    v[mask] = y[mask] / abs_x[mask]
 
-    # -X face: u = z/x, v = -y/x → but x<0 so use abs
+    # -X face: u = z/|x|, v = y/|x|
     mask = face_idx == 1
     u[mask] = z[mask] / abs_x[mask]
-    v[mask] = -y[mask] / abs_x[mask]
+    v[mask] = y[mask] / abs_x[mask]
 
-    # +Y face: u = x/y, v = z/y
+    # +Y face: u = x/y, v = -z/y
     mask = face_idx == 2
-    u[mask] = x[mask] / abs_y[mask]
-    v[mask] = z[mask] / abs_y[mask]
-
-    # -Y face: u = x/y, v = -z/y
-    mask = face_idx == 3
     u[mask] = x[mask] / abs_y[mask]
     v[mask] = -z[mask] / abs_y[mask]
 
-    # +Z face: u = x/z, v = -y/z
+    # -Y face: u = x/|y|, v = z/|y|
+    mask = face_idx == 3
+    u[mask] = x[mask] / abs_y[mask]
+    v[mask] = z[mask] / abs_y[mask]
+
+    # +Z face: u = x/z, v = y/z
     mask = face_idx == 4
     u[mask] = x[mask] / abs_z[mask]
-    v[mask] = -y[mask] / abs_z[mask]
+    v[mask] = y[mask] / abs_z[mask]
 
-    # -Z face: u = -x/z, v = -y/z
+    # -Z face: u = -x/|z|, v = y/|z|
     mask = face_idx == 5
     u[mask] = -x[mask] / abs_z[mask]
-    v[mask] = -y[mask] / abs_z[mask]
+    v[mask] = y[mask] / abs_z[mask]
 
     # Clamp to [-1, 1]
     u = u.clamp(-1, 1)
@@ -417,27 +420,27 @@ def cubemap_to_equirect180(
 
     mask = face_idx == 0
     u[mask] = -z[mask] / abs_x[mask]
-    v[mask] = -y[mask] / abs_x[mask]
+    v[mask] = y[mask] / abs_x[mask]
 
     mask = face_idx == 1
     u[mask] = z[mask] / abs_x[mask]
-    v[mask] = -y[mask] / abs_x[mask]
+    v[mask] = y[mask] / abs_x[mask]
 
     mask = face_idx == 2
     u[mask] = x[mask] / abs_y[mask]
-    v[mask] = z[mask] / abs_y[mask]
+    v[mask] = -z[mask] / abs_y[mask]
 
     mask = face_idx == 3
     u[mask] = x[mask] / abs_y[mask]
-    v[mask] = -z[mask] / abs_y[mask]
+    v[mask] = z[mask] / abs_y[mask]
 
     mask = face_idx == 4
     u[mask] = x[mask] / abs_z[mask]
-    v[mask] = -y[mask] / abs_z[mask]
+    v[mask] = y[mask] / abs_z[mask]
 
     mask = face_idx == 5
     u[mask] = -x[mask] / abs_z[mask]
-    v[mask] = -y[mask] / abs_z[mask]
+    v[mask] = y[mask] / abs_z[mask]
 
     u = u.clamp(-1, 1)
     v = v.clamp(-1, 1)
