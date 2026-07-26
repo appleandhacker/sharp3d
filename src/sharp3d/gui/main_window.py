@@ -97,7 +97,7 @@ class MainWindow(QMainWindow):
         self._anim = AnimTab(self._theme, self._engine)
         self._vr = VrTab(self._theme, self._engine)
         self._tabs.addTab(self._sbs, "平面立体转换")
-        self._tabs.addTab(self._vr, "全景视频")
+        self._tabs.addTab(self._vr, "全景转换")
         self._tabs.addTab(self._anim, "2.5D 视差动画")
 
         # Gaussian viewer button in tab bar corner
