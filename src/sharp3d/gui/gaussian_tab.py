@@ -31,6 +31,8 @@ class OrbitView(QWidget):
 
     view_changed = Signal(float, float, float)  # d_azimuth, d_elevation, d_distance
     file_dropped = Signal(str)  # path to dropped .ply file
+    drag_started = Signal()
+    drag_ended = Signal()
 
     def __init__(self, colors: Colors, parent=None) -> None:
         super().__init__(parent)
@@ -71,6 +73,7 @@ class OrbitView(QWidget):
             self._dragging = True
             self._last_pos = e.pos()
             self.setCursor(Qt.ClosedHandCursor)
+            self.drag_started.emit()
 
     def mouseMoveEvent(self, e: QMouseEvent) -> None:
         if not self._dragging:
@@ -83,6 +86,7 @@ class OrbitView(QWidget):
         if e.button() == Qt.LeftButton:
             self._dragging = False
             self.setCursor(Qt.OpenHandCursor)
+            self.drag_ended.emit()
 
     def wheelEvent(self, e: QWheelEvent) -> None:
         delta = -e.angleDelta().y() / 120.0 * 0.5
@@ -158,6 +162,8 @@ class GaussianViewerWindow(QMainWindow):
         self._view = OrbitView(colors)
         self._view.view_changed.connect(self._on_view_changed)
         self._view.file_dropped.connect(self._on_file_dropped)
+        self._view.drag_started.connect(self._on_drag_started)
+        self._view.drag_ended.connect(self._on_drag_ended)
         self.setCentralWidget(self._view)
 
         # Toolbar
@@ -173,11 +179,12 @@ class GaussianViewerWindow(QMainWindow):
         self._info = QLabel("  未加载")
         tb.addWidget(self._info)
 
-        # Render throttle: accumulate deltas, render at most ~30fps
+        # Render throttle: continuous during drag, single-shot for wheel
         from PySide6.QtCore import QTimer
         self._render_timer = QTimer(self)
         self._render_timer.timeout.connect(self._do_render)
         self._render_timer.setInterval(33)
+        self._dragging = False
 
         # Engine signals
         engine.ply_loaded.connect(self._on_ply_loaded)
@@ -206,13 +213,23 @@ class GaussianViewerWindow(QMainWindow):
         self._azimuth += d_azimuth
         self._elevation = max(-80.0, min(80.0, self._elevation + d_elevation))
         self._distance = max(1.0, min(30.0, self._distance + d_distance))
-        # Throttle: start timer if not already running
-        if not self._render_timer.isActive():
+        # For wheel events (not dragging): single-shot render
+        if not self._dragging and not self._render_timer.isActive():
             self._render_timer.start()
 
+    def _on_drag_started(self) -> None:
+        self._dragging = True
+        if self._loaded:
+            self._render_timer.start()  # continuous 30fps during drag
+
+    def _on_drag_ended(self) -> None:
+        self._dragging = False
+        # One final render to capture last position, then stop
+        self._do_render()
+        self._render_timer.stop()
+
     def _do_render(self) -> None:
-        """Called by throttle timer. Renders current view and stops timer
-        if no more pending changes (single-shot per drag burst)."""
+        """Render current orbit state. Timer keeps running during drag."""
         if not self._loaded:
             self._render_timer.stop()
             return
@@ -222,10 +239,8 @@ class GaussianViewerWindow(QMainWindow):
             "distance": self._distance,
             "render_width": 960,
         })
-        # Keep timer running during active drag; it will be stopped
-        # when no new view_changed signals arrive within one interval.
-        # Use single-shot style: stop and let next view_changed restart it.
-        self._render_timer.stop()
+        if not self._dragging:
+            self._render_timer.stop()
 
     # ---- engine callbacks -----------------------------------------------
     def _on_ply_loaded(self, info: dict) -> None:
