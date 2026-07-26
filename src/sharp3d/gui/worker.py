@@ -503,23 +503,31 @@ class _PipelineWorker:
             depths = rendered_d[:, :, :, 3:4].permute(0, 3, 1, 2)  # [6, 1, H, W]
             depths_3ch = depths.expand(-1, 3, -1, -1)  # [6, 3, H, W] for assembly
             depth_equirect = depth_map_fn(depths_3ch, eye_w, eye_h)  # [H, W, 3]
-            # Normalize depth: near=bright, far=dark, log scale for contrast
+            # Normalize depth with turbo-like pseudo-color (near=warm, far=cool)
             d_valid = depth_equirect[depth_equirect > 0]
             if d_valid.numel() > 0:
                 d_min = d_valid.min()
                 d_max = d_valid.max()
                 if d_max > d_min:
-                    # Log-scale mapping for better near-range contrast
                     depth_log = torch.log(depth_equirect.clamp(min=d_min) / d_min + 1e-6)
                     log_max = torch.log(d_max / d_min + 1e-6)
-                    # Invert: near (small depth) → bright (255), far → dark (0)
-                    depth_vis = ((1.0 - depth_log / log_max) * 255).clamp(0, 255).to(torch.uint8)
+                    depth_norm = (depth_log / log_max).clamp(0, 1)
+                    # Take one channel (all 3 are identical after expand)
+                    dn = depth_norm[..., 0]
+                    r = (1.0 - dn).clamp(0, 1)
+                    g = (1.0 - (dn - 0.5).abs() * 2).clamp(0, 1)
+                    b = dn.clamp(0, 1)
+                    depth_vis = (torch.stack([r, g, b], dim=-1) * 255).to(torch.uint8)
                 else:
-                    depth_vis = torch.full_like(depth_equirect, 128, dtype=torch.uint8)
+                    depth_vis = torch.full((*depth_equirect.shape[:2], 3),
+                                           128, dtype=torch.uint8,
+                                           device=depth_equirect.device)
             else:
-                depth_vis = torch.zeros_like(depth_equirect, dtype=torch.uint8)
+                depth_vis = torch.zeros((*depth_equirect.shape[:2], 3),
+                                        dtype=torch.uint8,
+                                        device=depth_equirect.device)
             # Zero-depth pixels (no coverage) → black
-            depth_vis[depth_equirect <= 0] = 0
+            depth_vis[depth_equirect[..., 0] <= 0] = 0
             depth_out = out.with_stem(out.stem + "_depth")
             Image.fromarray(depth_vis.cpu().numpy()).save(depth_out)
 
@@ -733,6 +741,7 @@ class _PipelineWorker:
 
                 g = fast_unproject(g_ndc, eye4, ir,
                                    INTERNAL_SHAPE, decompose_method="analytical")
+                del img_r, g_ndc  # free model output early
 
                 means = g.mean_vectors.squeeze(0).clone()
                 quats_local = g.quaternions.squeeze(0).clone()
@@ -740,12 +749,14 @@ class _PipelineWorker:
                 opacities = (g.opacities.squeeze(0) if g.opacities.dim() == 2
                              else g.opacities).clone()
                 colors = g.colors.squeeze(0).clone()
+                del g  # free NDC Gaussians
 
                 R = viewmats[i, :3, :3]
                 R_inv = R.T
                 means_world = means @ R_inv.T
                 q_rot = quat_from_rotmat_gpu(R_inv.unsqueeze(0))[0]
                 quats_world = _quat_multiply(q_rot.unsqueeze(0), quats_local)
+                del means, quats_local  # local-space no longer needed
 
                 # Seam handling: optional angular opacity attenuation
                 face_fwd = face_forwards[i].to(device)
@@ -769,6 +780,7 @@ class _PipelineWorker:
                     all_scales.append(scales[keep])
                     all_opacities.append(opacities[keep])
                     all_colors.append(colors[keep])
+                del means_world, quats_world, scales, opacities, colors
 
             if self._cancel_event.is_set():
                 del faces
@@ -830,14 +842,22 @@ class _PipelineWorker:
                         depth_log = torch.log(
                             depth_equirect.clamp(min=d_min) / d_min + 1e-6)
                         log_max = torch.log(d_max / d_min + 1e-6)
-                        depth_vis = ((1.0 - depth_log / log_max) * 255
-                                     ).clamp(0, 255).to(torch.uint8)
+                        depth_norm = (depth_log / log_max).clamp(0, 1)
+                        dn = depth_norm[..., 0]
+                        r = (1.0 - dn).clamp(0, 1)
+                        g = (1.0 - (dn - 0.5).abs() * 2).clamp(0, 1)
+                        b = dn.clamp(0, 1)
+                        depth_vis = (torch.stack([r, g, b], dim=-1) * 255
+                                     ).to(torch.uint8)
                     else:
-                        depth_vis = torch.full_like(depth_equirect, 128,
-                                                    dtype=torch.uint8)
+                        depth_vis = torch.full(
+                            (*depth_equirect.shape[:2], 3), 128,
+                            dtype=torch.uint8, device=depth_equirect.device)
                 else:
-                    depth_vis = torch.zeros_like(depth_equirect, dtype=torch.uint8)
-                depth_vis[depth_equirect <= 0] = 0
+                    depth_vis = torch.zeros(
+                        (*depth_equirect.shape[:2], 3),
+                        dtype=torch.uint8, device=depth_equirect.device)
+                depth_vis[depth_equirect[..., 0] <= 0] = 0
                 depth_writer.append_frame(depth_vis.cpu().numpy())
                 del rendered_d, depths, depth_equirect, depth_vis
 
