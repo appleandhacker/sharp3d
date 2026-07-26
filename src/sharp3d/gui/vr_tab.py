@@ -563,13 +563,13 @@ class VrTab(QWidget):
         parts = []
         for name, ok in status:
             if ok:
-                parts.append(f'{name}<span style="color:#4caf50;">✓</span>')
+                parts.append(f'{name}<b style="color:#4caf50;">✔</b>')
             else:
-                parts.append(f'{name}<span style="color:#f44336;">✗</span>')
+                parts.append(f'{name}<b style="color:#f44336;">✘</b>')
         self._prog_label.setTextFormat(Qt.RichText)
         self._prog_label.setText("模型就绪 · " + " · ".join(parts))
         self._prog_label.setToolTip("\n".join(
-            f"{'✓' if ok else '✗'} {name}" for name, ok in status))
+            f"{'✔' if ok else '✘'} {name}" for name, ok in status))
 
     def _on_convert_progress(self, frame: int, total: int, fps: float,
                              elapsed: float) -> None:
