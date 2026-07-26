@@ -285,6 +285,8 @@ class _PipelineWorker:
         from PIL import Image
         import numpy as np
 
+        t_start = time.time()
+
         # Load input image
         img = Image.open(path).convert("RGB")
         img_np = np.array(img)
@@ -389,7 +391,7 @@ class _PipelineWorker:
             all_colors.append(colors[mask])
 
             self._respond("convert_progress",
-                          (i + 1, 12, 0.0, time.time()))
+                          (i + 1, 12, 0.0, time.time() - t_start))
 
         # Merge all Gaussians
         from sharp.utils.gaussians import Gaussians3D
@@ -405,7 +407,7 @@ class _PipelineWorker:
         render_face = _compute_render_face_size(eye_w, output_projection)
 
         def _render_progress(step, total):
-            self._respond("convert_progress", (step, total, 0.0, time.time()))
+            self._respond("convert_progress", (step, total, 0.0, time.time() - t_start))
 
         result = render_vr_stereo(
             merged,
@@ -472,9 +474,10 @@ class _PipelineWorker:
         torch.cuda.empty_cache()
         gc.collect()
 
-        self._respond("convert_progress", (12, 12, 1.0, time.time()))
+        self._respond("convert_progress", (12, 12, 1.0, time.time() - t_start))
+        elapsed = time.time() - t_start
         self._respond("convert_done", ({
-            "output": str(out), "elapsed": 0, "fps": 0,
+            "output": str(out), "elapsed": elapsed, "fps": 1.0 / elapsed,
             "n_frames": 1,
         },))
 
