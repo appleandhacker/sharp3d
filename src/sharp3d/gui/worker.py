@@ -430,7 +430,19 @@ class _PipelineWorker:
         if opts.get("ply"):
             try:
                 from sharp.utils.gaussians import save_ply
-                save_ply(merged, 1.0, (1, 1), out.with_suffix(".ply"))
+                # save_ply expects opacities as [N, 1] (calls .flatten(0,1))
+                opac_for_ply = merged.opacities
+                if opac_for_ply.dim() == 1:
+                    opac_for_ply = opac_for_ply.unsqueeze(-1)
+                from sharp.utils.gaussians import Gaussians3D as _G3D
+                merged_for_ply = _G3D(
+                    mean_vectors=merged.mean_vectors,
+                    singular_values=merged.singular_values,
+                    quaternions=merged.quaternions,
+                    colors=merged.colors,
+                    opacities=opac_for_ply,
+                )
+                save_ply(merged_for_ply, 1.0, (1, 1), out.with_suffix(".ply"))
             except Exception as e:
                 self._respond("status", (f"PLY导出失败(不影响转换): {e}",))
 
