@@ -170,5 +170,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="sharp3d-v1.0.0-win64",
+    name="sharp3d-v2.0.0-beta-win64",
 )

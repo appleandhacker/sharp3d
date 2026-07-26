@@ -1,12 +1,14 @@
 # sharp3d
 
-**平面照片 / 视频 → 立体 3D 桌面转换工具**
+**平面照片/视频 → 立体3D · 全景/鱼眼 → VR 立体3D 转换工具**
 
-基于 Apple [SHARP](https://github.com/apple/ml-sharp) 单图 3D 高斯泼溅模型，将任意 2D 图片或视频转换为立体 3D 输出。支持 SBS 左右并排、2.5D 视差动画、批量处理，提供 PySide6 图形界面与命令行两种使用方式。
+基于 Apple [SHARP](https://github.com/apple/ml-sharp) 单图 3D 高斯泼溅模型，将任意 2D 图片或视频转换为立体 3D 输出。v2.0 新增全景 VR 管线：180°/360° 等距柱状投影或鱼眼输入 → 立体 3D VR 等距柱状投影输出，支持 VR 头显直接播放。
 
 ---
 
 ## 工作原理
+
+### SBS 立体管线
 
 ```
 输入 (图片/视频)
@@ -34,9 +36,57 @@
 输出 (SBS 图片/视频/深度图/PLY)
 ```
 
+### VR 全景管线 (v2.0)
+
+```
+输入 (180°/360° 等距柱状 或 鱼眼)
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│  面提取 (重叠 112° FOV)                                  │
+│  360° → 6 面 cubemap · 180° → 4 轴最优半球               │
+│  FOV_SCALE=1.5 确保相邻面重叠覆盖                         │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│  逐面 SHARP 推理 (GPU-direct, 无 PCIe 往返)              │
+│  每面 → 118万高斯 → 世界坐标变换 → 角度裁剪/权重衰减      │
+│  合并为全局高斯场景                                       │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────────────────────────────────┐
+│  VR 立体渲染                                             │
+│  平行相机 ±IPD/2 · cubemap 6面×2眼 · HiGS/标准光栅化     │
+│  180° 跳过 -Z 面 (5面×2眼) · 球面映射 → 等距柱状         │
+└─────────────────────────────────────────────────────────┘
+    │
+    ▼
+输出 (VR180/VR360 SBS/TB 等距柱状视频 + 深度 + PLY)
+```
+
 ---
 
 ## 功能特性
+
+### VR 全景转换 (v2.0)
+
+| 功能 | 说明 |
+|------|------|
+| 输入投影 | 等距柱状 360°/180°、鱼眼 (等距/等立体角/正交/体视/FTheta) |
+| 输出投影 | 自动匹配输入角度 (360°→360°, 180°/鱼眼→180°) |
+| 立体布局 | SBS 左右 / TB 上下 |
+| 瞳距 IPD | 50–80mm，默认 63mm |
+| 立体强度 | 0.2–2.5× |
+| 输出分辨率 | 4096×4096 (180°) / 4096×2048 (360°) / 8K / 自定义 |
+| 面覆盖策略 | 360°: 6面cubemap (轴间90°) · 180°: 4轴最优半球 (倾斜54.74°, 轴间70.5°) |
+| 重叠预测 | 112° FOV (FOV_SCALE=1.5)，预测极限56°，确保无缝覆盖 |
+| 拼接缝平滑 | 可选，中心权重 smoothstep 衰减 (floor=0.3 防空洞) |
+| 渲染器 | HiGS 推理渲染 (推荐) / 标准 gsplat 光栅化 |
+| 渲染面分辨率 | 自适应: 180°→eye_w, 360°→eye_w/2, 最低2048, 对齐256 |
+| 导出 | PLY 高斯文件 / 深度全景图 |
+| 视频编码 | H.264 / H.265 / AV1 (NVENC GPU 优先) |
 
 ### SBS 立体转换
 
@@ -81,20 +131,22 @@
 
 ### 高斯查看器
 
-独立窗口交互式 3D 查看器：鼠标拖拽旋转、滚轮缩放、拖入 PLY 文件加载、~30fps 实时渲染。
+独立窗口交互式 3D 查看器：鼠标拖拽旋转（连续30fps渲染）、滚轮缩放、拖入 PLY 文件加载。
 
 ### 导出选项
 
 | 选项 | 说明 |
 |------|------|
 | 深度图 | 伪彩色可视化（近=暖色，远=冷色）；视频输出为独立 H.264 文件 |
-| PLY 高斯 | 逐帧导出编号序列 `{stem}_{00000}.ply`，兼容内置查看器 |
+| PLY 高斯 | 逐帧导出编号序列 `{stem}_{00000}.ply`，兼容内置查看器及公开渲染器 |
 
 ---
 
 ## 性能
 
-测试环境：i9-13900HX + RTX 5070 Ti Laptop 12GB，4K 输入 → 7680×2160 SBS 输出
+测试环境：i9-13900HX + RTX 5070 Ti Laptop 12GB
+
+### SBS 管线 (4K 输入 → 7680×2160 SBS 输出)
 
 | 指标 | 数值 |
 |------|------|
@@ -105,16 +157,27 @@
 | GPU 计算利用率 | ~83% |
 | VRAM 占用 | ~4.3GB |
 
+### VR 管线 (4K 等距柱状 → 4096×4096 VR180 SBS)
+
+| 指标 | 数值 |
+|------|------|
+| 单帧 (4面预测+渲染) | ~3.5s |
+| 180° 输出 | 5面×2眼渲染 (跳过-Z) |
+| 360° 输出 | 6面×2眼渲染 |
+| VRAM 占用 | ~6–8GB |
+
 ### 优化技术栈
 
 | 优化 | 加速比 | 说明 |
 |------|--------|------|
 | ORT TensorRT FP16 | 1.74× | DINOv2 双编码器 (418ms → 240ms) |
 | torch.compile max-autotune | 1.16× | 持久缓存，热启动 10.8s |
+| GPU-direct prepare_input | — | VR面提取结果直传模型，消除PCIe往返 |
+| HiGS 场景复用 | — | fp16打包一次，双眼渲染复用 |
+| skip_back 优化 | — | 180°输出跳过-Z面 (6→5面) |
 | GPU 四元数 (Shepperd) | 884× | 替代 scipy CPU 实现 |
 | 解析法特征分解 | 3× | 替代 GPU SVD (省 0.4s/帧) |
 | 3 级流水线 | — | 解码预取 / GPU 计算 / 编码重叠 |
-| 异步 H2D 传输 | — | 侧 CUDA 流，与编码重叠 |
 | NVENC 硬件编码 | — | 独立编码引擎，不占 CUDA 核心 |
 | IO Binding 零拷贝 | — | GPU→ORT→GPU 无 CPU 往返 |
 
@@ -135,6 +198,16 @@
 
 ## 安装
 
+### 预编译包 (推荐)
+
+从 [GitHub Releases](https://github.com/appleandhacker/sharp3d/releases) 下载分卷压缩包，合并解压后运行 `sharp3d.exe`：
+
+```bat
+copy /b sharp3d-v2.0.0-beta-win64.zip.part_* sharp3d-v2.0.0-beta-win64.zip
+```
+
+### 从源码安装
+
 ```bash
 # 1. 创建虚拟环境
 python -m venv sharp3d-env
@@ -144,18 +217,14 @@ sharp3d-env\Scripts\activate
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 
 # 3. 安装 gsplat（从 GitHub Releases 下载预编译 whl）
-#    支持 SM 8.0 / 8.9 / 12.0 三种架构
 pip install gsplat-*.whl
-# 或从源码编译：
-pip install git+https://github.com/nerfstudio-project/gsplat.git
 
 # 4. 安装 SHARP 模型（editable）
 git clone https://github.com/apple/ml-sharp
 pip install -e ml-sharp
 
 # 5. 安装其余依赖
-pip install PySide6 onnxruntime-gpu pynvml imageio imageio-ffmpeg \
-    pillow numpy plyfile triton-windows tensorrt
+pip install -r requirements.txt
 ```
 
 完整依赖清单见 [requirements.txt](requirements.txt)。
@@ -171,15 +240,9 @@ set PYTHONPATH=<path-to>\sharp3d\src
 python -m sharp3d.gui
 ```
 
-如需 torch.compile 加速（约 16%），可先配置 MSVC 环境：
+三个标签页：全景转换 (VR)、SBS 立体转换、2.5D 视差动画。另有独立高斯查看器窗口。
 
-```bat
-call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" x64
-```
-
-未配置时自动回退 eager 模式，功能不受影响。
-
-首次启动约 90 秒（模型下载 + TensorRT 引擎构建 + torch.compile），后续启动约 15 秒（持久缓存）。
+首次启动约 90 秒（模型下载 + TensorRT 引擎构建 + torch.compile），后续启动约 15 秒（持久缓存）。模型就绪后进度栏显示各加速方案启用状态（绿色✔/红色✘）。
 
 ### 命令行
 
@@ -195,9 +258,6 @@ python -m sharp3d.cli input.mp4 --hdr
 
 # 指定立体格式
 python -m sharp3d.cli input.png --format anaglyph
-
-# 使用 SVD 分解（参考精度）
-python -m sharp3d.cli input.png --decompose svd
 ```
 
 ### INT8 校准（可选，speed 模式）
@@ -213,13 +273,15 @@ python -m sharp3d.calibrate_int8 --video representative.mp4 --frames 50
 ```
 src/sharp3d/
 ├── options.py         转换参数数据类 (ConvertOptions)
-├── predict.py         模型加载 + FP16 + compile + 预热
+├── predict.py         模型加载 + FP16 + compile + 预热 + 加速状态收集
 ├── ort_engine.py      ONNX Runtime TensorRT 加速引擎
 ├── pipeline.py        端到端管线（图片模式）
 ├── conversion.py      视频转换引擎（时域稳定 + 边缘柔化 + 卡尔曼收敛）
 ├── temporal.py        时域稳定器（全局/自适应/光流 + 属性 EMA）
+├── projection.py      投影工具（cubemap/半球面提取 + 球面映射 + 角度权重）
 ├── render.py          gsplat 批量 SBS 渲染 + 单视角 + 深度图
-├── unproject.py       NDC → 世界空间高斯反投影
+├── render_vr.py       VR 立体渲染（cubemap 6面×2眼 + HiGS + 等距柱状组装）
+├── unproject.py       NDC → 世界空间高斯反投影 (GPU-direct)
 ├── quaternion.py      GPU 四元数转换（Shepperd 法）
 ├── eigendecompose.py  3×3 对称矩阵特征分解（解析法 + SVD）
 ├── formats.py         6 种立体格式打包
@@ -229,10 +291,11 @@ src/sharp3d/
 ├── cli.py             命令行入口
 └── gui/
     ├── main_window.py 主窗口（多进程架构，GPU 崩溃隔离）
+    ├── vr_tab.py      全景转换标签页 (VR180/VR360)
     ├── sbs_tab.py     SBS 立体转换标签页
     ├── anim_tab.py    2.5D 视差动画标签页
-    ├── gaussian_tab.py 高斯查看器（独立窗口）
-    ├── worker.py      GPU 工作进程（3 级流水线）
+    ├── gaussian_tab.py 高斯查看器（独立窗口，连续30fps轨道渲染）
+    ├── worker.py      GPU 工作进程（VR/SBS/动画管线 + PLY导出）
     ├── widgets.py     自定义控件（进度条/GPU 监控/预览等）
     └── theme.py       系统主题检测 + 红青配色
 ```
@@ -241,10 +304,11 @@ src/sharp3d/
 
 ## 已知限制
 
-- **HDR 为格式级支持**：SHARP 是 SDR 模型（sRGB 输入），HDR 输入先色调映射为 SDR 再处理。输出的 HDR10 文件能在 HDR 设备正确显示（10-bit PQ BT.2020），但无法还原原片高光与广色域。
+- **HDR 为格式级支持**：SHARP 是 SDR 模型（sRGB 输入），HDR 输入先色调映射为 SDR 再处理。
 - **内部分辨率固定 1536×1536**：SHARP 架构约束（SPN 三级金字塔），与输入分辨率无关。
-- **高斯数量固定 ~118 万**：模型固定输出，不可调节。
+- **高斯数量固定 ~118 万/面**：模型固定输出，不可调节。VR 管线合并多面后总量更大。
 - **首次启动较慢**：TensorRT 引擎构建 + torch.compile 约 90 秒，后续有持久缓存（~15 秒）。
+- **VR 拼接缝**：多面预测在重叠区可能有轻微颜色/深度不连续，可启用"拼接缝平滑"选项缓解。
 
 ---
 
