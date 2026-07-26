@@ -177,17 +177,13 @@ class VrTab(QWidget):
         stereo_card = SectionCard(c, "立体参数")
         self._s_ipd = StereoSlider(c, "瞳距 IPD", 50, 80, 63, fmt="{:.0f}",
                                    unit="mm", stereo=True)
-        self._s_conv = StereoSlider(c, "收敛分位", 0, 100, 0, fmt="{:.0f}",
-                                    unit="%")
-        self._s_conv.setVisible(False)  # VR管线不使用收敛分位
         self._s_strength = StereoSlider(c, "立体强度", 0.2, 2.5, 1.0,
                                         fmt="{:.2f}", unit="x")
-        conv_hint = QLabel("0 = 自动(50%) · 全景场景建议 0.6~1.0x 强度")
-        conv_hint.setProperty("cssClass", "hint")
+        strength_hint = QLabel("全景场景建议 0.6~1.0x 强度")
+        strength_hint.setProperty("cssClass", "hint")
         stereo_card.add_widget(self._s_ipd)
-        stereo_card.add_widget(self._s_conv)
-        stereo_card.add_widget(conv_hint)
         stereo_card.add_widget(self._s_strength)
+        stereo_card.add_widget(strength_hint)
         left.addWidget(stereo_card)
 
         left.addStretch(1)
@@ -537,7 +533,6 @@ class VrTab(QWidget):
             "eye_width": eye_w,
             "eye_height": eye_h,
             "ipd_mm": self._s_ipd.value(),
-            "convergence": self._s_conv.value() / 100.0,
             "strength": self._s_strength.value(),
             "codec": codec_map[self._codec.currentText()],
             "crf": int(self._crf.currentText()),
@@ -620,5 +615,5 @@ class VrTab(QWidget):
     # ------------------------------------------------------------------
     def apply_theme(self, c: Colors) -> None:
         self._progress._colors = c
-        for s in (self._s_ipd, self._s_conv, self._s_strength):
+        for s in (self._s_ipd, self._s_strength):
             s.set_colors(c)
