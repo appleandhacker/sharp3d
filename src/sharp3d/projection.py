@@ -228,13 +228,13 @@ def fisheye_to_hemisphere(
     v = -r_px * torch.sin(phi)
 
     valid = theta <= max_theta
-    grid = torch.stack([u, v], dim=-1).reshape(3, face_size, face_size, 2)
+    grid = torch.stack([u, v], dim=-1).reshape(_N_HEMI_FACES, face_size, face_size, 2)
 
-    img_expanded = image.expand(3, -1, -1, -1)
+    img_expanded = image.expand(_N_HEMI_FACES, -1, -1, -1)
     faces = F.grid_sample(img_expanded, grid, mode="bilinear",
                           padding_mode="zeros", align_corners=True)
     # Zero out invalid pixels
-    valid_mask = valid.reshape(3, 1, face_size, face_size)
+    valid_mask = valid.reshape(_N_HEMI_FACES, 1, face_size, face_size)
     faces = faces * valid_mask.float()
     return faces
 
