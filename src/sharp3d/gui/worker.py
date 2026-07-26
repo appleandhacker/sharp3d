@@ -395,20 +395,29 @@ class _PipelineWorker:
             # Quaternion multiplication: q_world = q_rot * q_local
             quats_world = _quat_multiply(q_rot.unsqueeze(0), quats_local)
 
-            # Center-weighted opacity falloff (smooth seam blending)
+            # Seam handling: optional angular opacity attenuation
             face_fwd = face_forwards[i].to(device)
-            weight = angular_opacity_weight(means_world, face_fwd,
-                                            inner_deg=seam_deg)
-            keep = weight > 0.01
-            w_keep = weight[keep]
-            opac_keep = opacities[keep]
-            if opac_keep.dim() > w_keep.dim():
-                w_keep = w_keep.unsqueeze(-1)
-            all_means.append(means_world[keep])
-            all_quats.append(quats_world[keep])
-            all_scales.append(scales[keep])
-            all_opacities.append(opac_keep * w_keep)
-            all_colors.append(colors[keep])
+            if opts.get("seam_blend"):
+                weight = angular_opacity_weight(means_world, face_fwd,
+                                                inner_deg=seam_deg)
+                keep = weight > 0.01
+                w_keep = weight[keep]
+                opac_keep = opacities[keep]
+                if opac_keep.dim() > w_keep.dim():
+                    w_keep = w_keep.unsqueeze(-1)
+                all_means.append(means_world[keep])
+                all_quats.append(quats_world[keep])
+                all_scales.append(scales[keep])
+                all_opacities.append(opac_keep * w_keep)
+                all_colors.append(colors[keep])
+            else:
+                # No attenuation — just keep Gaussians within prediction limit
+                keep = filter_gaussians_by_angle(means_world, face_fwd)
+                all_means.append(means_world[keep])
+                all_quats.append(quats_world[keep])
+                all_scales.append(scales[keep])
+                all_opacities.append(opacities[keep])
+                all_colors.append(colors[keep])
 
             self._respond("convert_progress",
                           (i + 1, total_steps, 0.0, time.time() - t_start))
@@ -737,20 +746,28 @@ class _PipelineWorker:
                 q_rot = quat_from_rotmat_gpu(R_inv.unsqueeze(0))[0]
                 quats_world = _quat_multiply(q_rot.unsqueeze(0), quats_local)
 
-                # Center-weighted opacity falloff (smooth seam blending)
+                # Seam handling: optional angular opacity attenuation
                 face_fwd = face_forwards[i].to(device)
-                weight = angular_opacity_weight(means_world, face_fwd,
-                                                inner_deg=seam_deg)
-                keep = weight > 0.01
-                w_keep = weight[keep]
-                opac_keep = opacities[keep]
-                if opac_keep.dim() > w_keep.dim():
-                    w_keep = w_keep.unsqueeze(-1)
-                all_means.append(means_world[keep])
-                all_quats.append(quats_world[keep])
-                all_scales.append(scales[keep])
-                all_opacities.append(opac_keep * w_keep)
-                all_colors.append(colors[keep])
+                if opts.get("seam_blend"):
+                    weight = angular_opacity_weight(means_world, face_fwd,
+                                                    inner_deg=seam_deg)
+                    keep = weight > 0.01
+                    w_keep = weight[keep]
+                    opac_keep = opacities[keep]
+                    if opac_keep.dim() > w_keep.dim():
+                        w_keep = w_keep.unsqueeze(-1)
+                    all_means.append(means_world[keep])
+                    all_quats.append(quats_world[keep])
+                    all_scales.append(scales[keep])
+                    all_opacities.append(opac_keep * w_keep)
+                    all_colors.append(colors[keep])
+                else:
+                    keep = filter_gaussians_by_angle(means_world, face_fwd)
+                    all_means.append(means_world[keep])
+                    all_quats.append(quats_world[keep])
+                    all_scales.append(scales[keep])
+                    all_opacities.append(opacities[keep])
+                    all_colors.append(colors[keep])
 
             if self._cancel_event.is_set():
                 del faces

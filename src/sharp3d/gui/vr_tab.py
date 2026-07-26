@@ -327,6 +327,13 @@ class VrTab(QWidget):
         self._chk_ply = QCheckBox("导出PLY高斯文件")
         adv_card.add_widget(self._chk_ply)
 
+        self._chk_seam = QCheckBox("拼接缝平滑（中心权重衰减）")
+        self._chk_seam.setChecked(False)
+        self._chk_seam.setToolTip(
+            "对重叠区高斯施加角度衰减以柔化拼接缝。\n"
+            "关闭时保留全部高斯，可能有轻微接缝但无空洞。")
+        adv_card.add_widget(self._chk_seam)
+
         right.addWidget(adv_card)
         right.addStretch(1)
 
@@ -542,6 +549,7 @@ class VrTab(QWidget):
                 self._stabilize.currentIndex()],
             "depth": self._chk_depth.isChecked(),
             "ply": self._chk_ply.isChecked(),
+            "seam_blend": self._chk_seam.isChecked(),
         }
 
     def _on_cancel(self) -> None:
