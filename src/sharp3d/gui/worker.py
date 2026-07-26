@@ -332,6 +332,14 @@ class _PipelineWorker:
         from sharp3d.projection import get_cubemap_cameras, _look_at_rotation, _FACE_DEFS
         import torch.nn.functional as F_t
 
+        # 180° fisheye only covers front hemisphere: skip -Z(5), +Y(2), -Y(3)
+        if proj.startswith("fisheye"):
+            active_faces = [0, 1, 4]  # +X, -X, +Z
+        else:
+            active_faces = list(range(6))
+        n_faces = len(active_faces)
+        total_steps = n_faces * 2  # predict + render phases
+
         all_means = []
         all_quats = []
         all_scales = []
@@ -340,7 +348,7 @@ class _PipelineWorker:
 
         viewmats, _ = get_cubemap_cameras(face_size, device)
 
-        for i in range(6):
+        for idx, i in enumerate(active_faces):
             if self._cancel_event.is_set():
                 self._respond("convert_done", ({"cancelled": True},))
                 return
@@ -391,7 +399,7 @@ class _PipelineWorker:
             all_colors.append(colors[mask])
 
             self._respond("convert_progress",
-                          (i + 1, 12, 0.0, time.time() - t_start))
+                          (idx + 1, total_steps, 0.0, time.time() - t_start))
 
         # Merge all Gaussians
         from sharp.utils.gaussians import Gaussians3D
@@ -407,7 +415,8 @@ class _PipelineWorker:
         render_face = _compute_render_face_size(eye_w, output_projection)
 
         def _render_progress(step, total):
-            self._respond("convert_progress", (step, total, 0.0, time.time() - t_start))
+            self._respond("convert_progress",
+                          (n_faces + step, total_steps, 0.0, time.time() - t_start))
 
         result = render_vr_stereo(
             merged,
@@ -474,7 +483,7 @@ class _PipelineWorker:
         torch.cuda.empty_cache()
         gc.collect()
 
-        self._respond("convert_progress", (12, 12, 1.0, time.time() - t_start))
+        self._respond("convert_progress", (total_steps, total_steps, 1.0, time.time() - t_start))
         elapsed = time.time() - t_start
         self._respond("convert_done", ({
             "output": str(out), "elapsed": elapsed, "fps": 1.0 / elapsed,
