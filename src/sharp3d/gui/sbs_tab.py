@@ -199,6 +199,18 @@ class SbsTab(QWidget):
         perf_row.addWidget(self._perf_mode, 1)
         adv_card.add_layout(perf_row)
 
+        renderer_row = QHBoxLayout()
+        renderer_row.addWidget(QLabel("渲染器"))
+        self._renderer = QComboBox()
+        self._renderer.addItems(["标准光栅化", "HiGS 推理渲染"])
+        self._renderer.setToolTip(
+            "标准光栅化：gsplat rasterization()，支持 batch 多视角、深度输出。\n"
+            "HiGS 推理渲染：fp16 packed + macro-tile fused，速度快 2x+，\n"
+            "  质量无损 (PSNR>63dB)，但不支持深度图输出。"
+        )
+        renderer_row.addWidget(self._renderer, 1)
+        adv_card.add_layout(renderer_row)
+
         dec_row = QHBoxLayout()
         dec_row.addWidget(QLabel("分解方法"))
         self._decompose = QComboBox()
@@ -429,6 +441,7 @@ class SbsTab(QWidget):
             edge_soften=self._chk_edge.isChecked(),
             hdr_output=self._chk_hdr.isChecked(),
             perf_mode="quality" if self._perf_mode.currentIndex() == 0 else "speed",
+            renderer="higs" if self._renderer.currentIndex() == 1 else "standard",
             out_fps=out_fps,
             out_scale=out_scale,
             out_width=out_width,

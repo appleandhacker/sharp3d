@@ -37,6 +37,7 @@ class ConvertOptions:
     # Processing
     decompose: str = "analytical"  # "analytical" | "svd"
     perf_mode: str = "quality"     # "quality" | "speed"
+    renderer: str = "standard"     # "standard" | "higs"
     temporal_stabilize: str = "off"  # "off" | "global" | "adaptive" | "flow"
 
     # Extra outputs
