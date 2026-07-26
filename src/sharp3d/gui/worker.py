@@ -427,14 +427,17 @@ class _PipelineWorker:
         if opts.get("ply"):
             try:
                 from sharp.utils.gaussians import save_ply
-                # save_ply calls .flatten(0,1) on all fields — needs 2D
+                # save_ply expects [1, N, C] (batch dim) — it calls .flatten(0,1)
                 opac = merged.opacities
                 if opac.dim() == 1:
                     opac = opac.unsqueeze(-1)  # [N] → [N,1]
-                # Construct new instance (Gaussians3D is immutable NamedTuple)
-                merged_ply = type(merged)(
-                    merged.mean_vectors, merged.singular_values,
-                    merged.quaternions, merged.colors, opac)
+                merged_ply = Gaussians3D(
+                    mean_vectors=merged.mean_vectors.unsqueeze(0),
+                    singular_values=merged.singular_values.unsqueeze(0),
+                    quaternions=merged.quaternions.unsqueeze(0),
+                    colors=merged.colors.unsqueeze(0),
+                    opacities=opac.unsqueeze(0),
+                )
                 save_ply(merged_ply, 1.0, (1, 1), out.with_suffix(".ply"))
             except Exception as e:
                 self._respond("status", (f"PLY导出失败(不影响转换): {e}",))
