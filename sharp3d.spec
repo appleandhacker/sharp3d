@@ -82,9 +82,11 @@ for pkg in [
     "scipy",
     "plyfile",
     "pynvml",
+    "nvidia-ml-py",
     "PySide6",
     "onnx",
     "onnxscript",
+    "jaxtyping",
 ]:
     try:
         datas += copy_metadata(pkg)
@@ -97,11 +99,15 @@ hiddenimports = [
     *collect_submodules("sharp3d"),
     # sharp (ml-sharp)
     *collect_submodules("sharp"),
+    # scipy (including _external.array_api_compat.*)
+    *collect_submodules("scipy"),
     # PyTorch
     "torch._C",
     "torch.cuda",
     "torch.nn.functional",
     "torch.autograd",
+    # triton (torch.compile backend)
+    *collect_submodules("triton"),
     # gsplat
     "gsplat",
     "gsplat.cuda",
@@ -120,15 +126,10 @@ hiddenimports = [
     "onnxruntime",
     "onnx",
     "onnxscript",
-    "scipy",
-    "scipy.spatial.transform",
-    "scipy._external",
-    "scipy._external.array_api_compat",
-    "scipy._external.array_api_compat.numpy",
-    "scipy._external.array_api_compat.numpy.fft",
     "timm",
     "safetensors",
     "huggingface_hub",
+    "jaxtyping",
 ]
 
 # ---- Excludes ----
