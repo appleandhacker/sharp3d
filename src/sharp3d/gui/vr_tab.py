@@ -96,23 +96,21 @@ class VrTab(QWidget):
         in_proj_row.addWidget(QLabel("输入投影"))
         self._in_proj = QComboBox()
         self._in_proj.addItems([
-            "自动检测",
             "等距柱状投影",
             "鱼眼",
         ])
         self._in_proj.setToolTip(
             "输入视频的投影类型。\n\n"
-            "等距柱状 (Equirectangular)：标准全景格式。\n"
-            "鱼眼：圆形视场嵌在矩形画面中。\n"
-            "自动检测：根据宽高比和元数据推断。"
+            "等距柱状 (Equirectangular)：标准全景格式，支持360°/180°。\n"
+            "鱼眼：圆形视场嵌在矩形画面中，输出固定180°。"
         )
         self._in_proj.currentIndexChanged.connect(self._on_in_proj_changed)
         in_proj_row.addWidget(self._in_proj, 1)
         proj_card.add_layout(in_proj_row)
 
-        # Sub-option row (hidden for 自动检测)
+        # Sub-option row
         self._in_proj_sub_row = QHBoxLayout()
-        self._in_proj_sub_label = QLabel("子类型")
+        self._in_proj_sub_label = QLabel("覆盖范围")
         self._in_proj_sub_row.addWidget(self._in_proj_sub_label)
         self._in_proj_sub = QComboBox()
         self._in_proj_sub.currentIndexChanged.connect(self._on_in_proj_sub_changed)
@@ -149,26 +147,10 @@ class VrTab(QWidget):
         self._ftheta_row.addWidget(self._ftheta_k3)
         proj_card.add_layout(self._ftheta_row)
         self._set_ftheta_visible(False)
-        # Initialize: hide sub-options (自动检测 selected by default)
-        self._set_sub_visible(False)
+        # Initialize sub-options with equirect defaults (first item selected)
+        self._in_proj_sub.addItems(self._equirect_subs)
 
-        out_proj_row = QHBoxLayout()
-        out_proj_row.addWidget(QLabel("输出投影"))
-        self._out_proj = QComboBox()
-        self._out_proj.addItems([
-            "等距柱状 180°",
-            "等距柱状 360°",
-        ])
-        self._out_proj.setToolTip(
-            "输出立体视频的投影格式。\n"
-            "180°：仅前半球，VR180 标准，文件更小。\n"
-            "360°：完整球面，适用于所有 VR 头显。"
-        )
-        self._out_proj.currentIndexChanged.connect(self._on_out_proj_changed)
-        out_proj_row.addWidget(self._out_proj, 1)
-        proj_card.add_layout(out_proj_row)
-
-        fov_hint = QLabel("输出为等距柱状投影 · cubemap 6 面渲染后球面映射")
+        fov_hint = QLabel("输出投影自动匹配输入 · 360°输入→360°输出 · 180°/鱼眼→180°输出")
         fov_hint.setProperty("cssClass", "hint")
         proj_card.add_widget(fov_hint)
 
@@ -377,27 +359,19 @@ class VrTab(QWidget):
         engine.error.connect(self._on_error)
 
     # ------------------------------------------------------------------
-    def _on_out_proj_changed(self, idx: int) -> None:
-        """Auto-switch resolution preset when output projection changes."""
-        if idx == 0:  # 180° → 1:1
-            self._res_preset.setCurrentIndex(0)  # 4096×4096
-        else:  # 360° → 2:1
-            self._res_preset.setCurrentIndex(1)  # 4096×2048
-
     def _on_in_proj_changed(self, idx: int) -> None:
-        """Show/hide sub-option combo based on input projection type."""
-        if idx == 0:  # 自动检测
-            self._set_sub_visible(False)
-        elif idx == 1:  # 等距柱状投影
+        """Update sub-options and auto-switch resolution when input projection changes."""
+        if idx == 0:  # 等距柱状投影
             self._in_proj_sub.clear()
             self._in_proj_sub.addItems(self._equirect_subs)
             self._in_proj_sub_label.setText("覆盖范围")
             self._set_sub_visible(True)
-        elif idx == 2:  # 鱼眼
+        elif idx == 1:  # 鱼眼
             self._in_proj_sub.clear()
             self._in_proj_sub.addItems(self._fisheye_subs)
             self._in_proj_sub_label.setText("投影模型")
             self._set_sub_visible(True)
+        self._auto_resolution()
 
     def _set_sub_visible(self, visible: bool) -> None:
         for i in range(self._in_proj_sub_row.count()):
@@ -410,14 +384,27 @@ class VrTab(QWidget):
     def _on_in_proj_sub_changed(self, idx: int) -> None:
         """Show FTheta coefficients only when FTheta model is selected."""
         # FTheta is the last item in fisheye subs (index 4)
-        is_ftheta = (self._in_proj.currentIndex() == 2 and idx == 4)
+        is_ftheta = (self._in_proj.currentIndex() == 1 and idx == 4)
         self._set_ftheta_visible(is_ftheta)
+        self._auto_resolution()
 
     def _set_ftheta_visible(self, visible: bool) -> None:
         for i in range(self._ftheta_row.count()):
             item = self._ftheta_row.itemAt(i)
             if item.widget():
                 item.widget().setVisible(visible)
+
+    def _is_output_360(self) -> bool:
+        """Output is 360° only when input is equirect 360°."""
+        return (self._in_proj.currentIndex() == 0
+                and self._in_proj_sub.currentIndex() == 0)
+
+    def _auto_resolution(self) -> None:
+        """Auto-switch resolution preset based on output angle."""
+        if self._is_output_360():
+            self._res_preset.setCurrentIndex(1)  # 4096×2048 (2:1)
+        else:
+            self._res_preset.setCurrentIndex(0)  # 4096×4096 (1:1)
 
     def _on_res_changed(self, idx: int) -> None:
         custom = (self._res_preset.currentIndex() == len(RES_PRESETS) - 1)
@@ -483,10 +470,10 @@ class VrTab(QWidget):
         else:
             eye_w = self._res_width.value()
             # 180° → 1:1, 360° → 2:1
-            if self._out_proj.currentIndex() == 0:  # 180°
-                eye_h = eye_w
-            else:  # 360°
+            if self._is_output_360():
                 eye_h = eye_w // 2
+            else:
+                eye_h = eye_w
 
         codec_map = {"H.264": "h264", "H.265": "h265", "AV1": "av1"}
         fps_text = self._fps.currentText()
@@ -494,9 +481,7 @@ class VrTab(QWidget):
 
         # Input projection: main type + sub-option
         main_idx = self._in_proj.currentIndex()
-        if main_idx == 0:
-            input_projection = "auto"
-        elif main_idx == 1:  # 等距柱状
+        if main_idx == 0:  # 等距柱状
             sub_idx = self._in_proj_sub.currentIndex()
             input_projection = "equirect360" if sub_idx == 0 else "equirect180"
         else:  # 鱼眼
@@ -519,7 +504,8 @@ class VrTab(QWidget):
                 self._ftheta_k3.value(),
             ]
 
-        out_proj_map = {0: "equirect180", 1: "equirect360"}
+        # Output projection auto-matches input angle
+        output_projection = "equirect360" if self._is_output_360() else "equirect180"
         layout_map = {0: "sbs", 1: "tb"}
 
         return {
@@ -528,7 +514,7 @@ class VrTab(QWidget):
             "output": out,
             "input_projection": input_projection,
             "ftheta_coeffs": ftheta_coeffs,
-            "output_projection": out_proj_map[self._out_proj.currentIndex()],
+            "output_projection": output_projection,
             "stereo_layout": layout_map[self._stereo_layout.currentIndex()],
             "eye_width": eye_w,
             "eye_height": eye_h,
