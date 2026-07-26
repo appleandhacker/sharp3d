@@ -348,13 +348,16 @@ class _PipelineWorker:
         total_steps = n_faces + 6  # prediction faces + 6 render milestones
 
         # Predict depth + unproject for each face → merge Gaussians
-        import torch.nn.functional as F_t
+        from sharp3d.quaternion import quat_from_rotmat_gpu
 
         all_means = []
         all_quats = []
         all_scales = []
         all_opacities = []
         all_colors = []
+
+        eye4 = torch.eye(4, device=device)
+        f_px = face_size / (2.0 * OVERLAP_FOV_SCALE)
 
         for i in range(n_faces):
             if self._cancel_event.is_set():
@@ -365,15 +368,12 @@ class _PipelineWorker:
             face_img = faces[i].permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
             face_img_u8 = (face_img * 255).clip(0, 255).astype(np.uint8)
 
-            # Focal length for overlapping FOV: f = size / (2 * fov_scale)
-            f_px = face_size / (2.0 * OVERLAP_FOV_SCALE)
-
             img_r, df, ir, _ = prepare_input(face_img_u8, f_px, device)
 
             with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
                 g_ndc = self._compiled(img_r, df)
 
-            g = fast_unproject(g_ndc, torch.eye(4, device=device), ir,
+            g = fast_unproject(g_ndc, eye4, ir,
                                INTERNAL_SHAPE, decompose_method="analytical")
 
             # Squeeze batch dim: [1, N, ...] → [N, ...]
@@ -390,7 +390,6 @@ class _PipelineWorker:
 
             means_world = means @ R_inv.T
             # Rotate quaternions: q_world = q_rot * q_local
-            from sharp3d.quaternion import quat_from_rotmat_gpu
             q_rot = quat_from_rotmat_gpu(R_inv.unsqueeze(0))[0]  # [4]
 
             # Quaternion multiplication: q_world = q_rot * q_local
@@ -428,9 +427,9 @@ class _PipelineWorker:
         render_face = _compute_render_face_size(eye_w, output_projection)
 
         def _render_progress(step, total):
-            # Remap render's internal steps (7-12) to consecutive (n_faces+1 .. n_faces+6)
+            # Render reports 1-6, map to consecutive steps after prediction
             self._respond("convert_progress",
-                          (n_faces + step - 6, total_steps, 0.0, time.time() - t_start))
+                          (n_faces + step, total_steps, 0.0, time.time() - t_start))
 
         result = render_vr_stereo(
             merged,
@@ -500,7 +499,8 @@ class _PipelineWorker:
         self._respond("convert_progress", (total_steps, total_steps, 1.0, time.time() - t_start))
         elapsed = time.time() - t_start
         self._respond("convert_done", ({
-            "output": str(out), "elapsed": elapsed, "fps": 1.0 / elapsed,
+            "output": str(out), "elapsed": elapsed,
+            "fps": 1.0 / max(elapsed, 1e-6),
             "n_frames": 1,
         },))
 

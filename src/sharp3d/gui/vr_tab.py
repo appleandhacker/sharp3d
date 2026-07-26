@@ -179,6 +179,7 @@ class VrTab(QWidget):
                                    unit="mm", stereo=True)
         self._s_conv = StereoSlider(c, "收敛分位", 0, 100, 0, fmt="{:.0f}",
                                     unit="%")
+        self._s_conv.setVisible(False)  # VR管线不使用收敛分位
         self._s_strength = StereoSlider(c, "立体强度", 0.2, 2.5, 1.0,
                                         fmt="{:.2f}", unit="x")
         conv_hint = QLabel("0 = 自动(50%) · 全景场景建议 0.6~1.0x 强度")
@@ -314,6 +315,11 @@ class VrTab(QWidget):
         )
         stab_row.addWidget(self._stabilize, 1)
         adv_card.add_layout(stab_row)
+        # Hide: VR视频管线尚未实现时域稳定
+        for idx in range(stab_row.count()):
+            w = stab_row.itemAt(idx).widget()
+            if w:
+                w.setVisible(False)
 
         self._chk_depth = QCheckBox("同时输出深度全景图")
         adv_card.add_widget(self._chk_depth)

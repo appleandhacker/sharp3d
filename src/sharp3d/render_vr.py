@@ -63,49 +63,49 @@ def render_vr_stereo(
             left_faces = _render_cubemap_higs(gaussians, left_offset, face_size,
                                               device, skip_back=skip_back)
             if progress_cb:
-                progress_cb(7, 12)
+                progress_cb(1, 6)
             right_faces = _render_cubemap_higs(gaussians, right_offset, face_size,
                                                device, skip_back=skip_back)
             if progress_cb:
-                progress_cb(8, 12)
-        except Exception:
-            # HiGS unavailable (JIT build failure) — fallback to standard
+                progress_cb(2, 6)
+        except (ImportError, RuntimeError, OSError):
+            # HiGS unavailable (JIT build failure / missing library) — fallback
             left_faces = _render_cubemap_standard(gaussians, left_offset, face_size,
                                                   device, skip_back=skip_back)
             if progress_cb:
-                progress_cb(7, 12)
+                progress_cb(1, 6)
             right_faces = _render_cubemap_standard(gaussians, right_offset, face_size,
                                                    device, skip_back=skip_back)
             if progress_cb:
-                progress_cb(8, 12)
+                progress_cb(2, 6)
     else:
         left_faces = _render_cubemap_standard(gaussians, left_offset, face_size,
                                               device, skip_back=skip_back)
         if progress_cb:
-            progress_cb(7, 12)
+            progress_cb(1, 6)
         right_faces = _render_cubemap_standard(gaussians, right_offset, face_size,
                                                device, skip_back=skip_back)
         if progress_cb:
-            progress_cb(8, 12)
+            progress_cb(2, 6)
 
     # Assemble equirectangular
     map_fn = cubemap_to_equirect180 if output_projection == "equirect180" else cubemap_to_equirect
     left_equirect = map_fn(left_faces, out_w, out_h)   # [H, W, 3] linearRGB
     if progress_cb:
-        progress_cb(9, 12)
+        progress_cb(3, 6)
     right_equirect = map_fn(right_faces, out_w, out_h)
     if progress_cb:
-        progress_cb(10, 12)
+        progress_cb(4, 6)
 
-    # Gamma correction
-    left_srgb = linearRGB2sRGB(left_equirect)
-    right_srgb = linearRGB2sRGB(right_equirect)
+    # Gamma correction (clamp negatives from rasterizer numerical error)
+    left_srgb = linearRGB2sRGB(left_equirect.clamp(min=0))
+    right_srgb = linearRGB2sRGB(right_equirect.clamp(min=0))
 
     # Quantize to uint8
     left_u8 = (left_srgb * 255).clamp(0, 255).to(torch.uint8)
     right_u8 = (right_srgb * 255).clamp(0, 255).to(torch.uint8)
     if progress_cb:
-        progress_cb(11, 12)
+        progress_cb(5, 6)
 
     # Pack stereo layout
     if stereo_layout == "sbs":
@@ -113,7 +113,7 @@ def render_vr_stereo(
     else:  # tb
         result = torch.cat([left_u8, right_u8], dim=0)  # [H*2, W, 3]
     if progress_cb:
-        progress_cb(12, 12)
+        progress_cb(6, 6)
     return result
 
 

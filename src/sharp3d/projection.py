@@ -368,6 +368,8 @@ def _fisheye_theta_to_r(theta: Tensor, model: str, coeffs: list[float] | None) -
         stereographic:   r = 2·tan(θ/2)
         ftheta:          r = θ + k1·θ³ + k2·θ⁵ + k3·θ⁷
     """
+    # Clamp to avoid inf/NaN (stereographic tan→∞ at θ→π)
+    theta = theta.clamp(max=math.pi * 0.99)
     if model == "equidistant":
         return theta
     elif model == "equisolid":
@@ -460,6 +462,7 @@ def cubemap_to_equirect(
     faces: Tensor,
     out_w: int,
     out_h: int,
+    half_sphere: bool = False,
 ) -> Tensor:
     """Assemble 6 cubemap faces into an equirectangular image.
 
@@ -475,8 +478,9 @@ def cubemap_to_equirect(
     face_size = faces.shape[2]
 
     # Generate equirectangular pixel grid
-    # longitude: [-π, π], latitude: [π/2, -π/2] (top to bottom)
-    lon = torch.linspace(-math.pi, math.pi, out_w, device=device)
+    # longitude: [-π, π] or [-π/2, π/2] for half_sphere
+    lon_max = math.pi / 2 if half_sphere else math.pi
+    lon = torch.linspace(-lon_max, lon_max, out_w, device=device)
     lat = torch.linspace(math.pi / 2, -math.pi / 2, out_h, device=device)
     grid_lat, grid_lon = torch.meshgrid(lat, lon, indexing="ij")
 
@@ -582,83 +586,6 @@ def cubemap_to_equirect180(
 ) -> Tensor:
     """Assemble cubemap faces into a 180° equirectangular (front hemisphere).
 
-    Only longitude [-90°, +90°] is kept (front-facing).
-
-    Args:
-        faces: [6, 3, face_size, face_size] rendered cubemap faces.
-        out_w: output width (covers 180° horizontal).
-        out_h: output height (covers 180° vertical).
-
-    Returns:
-        equirect180: [out_h, out_w, 3] image.
+    Thin wrapper around cubemap_to_equirect(half_sphere=True).
     """
-    device = faces.device
-
-    # longitude: [-π/2, π/2], latitude: [π/2, -π/2]
-    lon = torch.linspace(-math.pi / 2, math.pi / 2, out_w, device=device)
-    lat = torch.linspace(math.pi / 2, -math.pi / 2, out_h, device=device)
-    grid_lat, grid_lon = torch.meshgrid(lat, lon, indexing="ij")
-
-    x = torch.cos(grid_lat) * torch.sin(grid_lon)
-    y = torch.sin(grid_lat)
-    z = torch.cos(grid_lat) * torch.cos(grid_lon)
-
-    abs_x = x.abs()
-    abs_y = y.abs()
-    abs_z = z.abs()
-
-    face_idx = torch.zeros(out_h, out_w, dtype=torch.long, device=device)
-    face_idx[(x > 0) & (abs_x >= abs_y) & (abs_x >= abs_z)] = 0
-    face_idx[(x < 0) & (abs_x >= abs_y) & (abs_x >= abs_z)] = 1
-    face_idx[(y > 0) & (abs_y > abs_x) & (abs_y >= abs_z)] = 2
-    face_idx[(y < 0) & (abs_y > abs_x) & (abs_y >= abs_z)] = 3
-    face_idx[(z > 0) & (abs_z > abs_x) & (abs_z > abs_y)] = 4
-    face_idx[(z < 0) & (abs_z > abs_x) & (abs_z > abs_y)] = 5
-
-    u = torch.zeros(out_h, out_w, device=device)
-    v = torch.zeros(out_h, out_w, device=device)
-
-    mask = face_idx == 0
-    u[mask] = -z[mask] / abs_x[mask]
-    v[mask] = y[mask] / abs_x[mask]
-
-    mask = face_idx == 1
-    u[mask] = z[mask] / abs_x[mask]
-    v[mask] = y[mask] / abs_x[mask]
-
-    mask = face_idx == 2
-    u[mask] = x[mask] / abs_y[mask]
-    v[mask] = -z[mask] / abs_y[mask]
-
-    mask = face_idx == 3
-    u[mask] = x[mask] / abs_y[mask]
-    v[mask] = z[mask] / abs_y[mask]
-
-    mask = face_idx == 4
-    u[mask] = x[mask] / abs_z[mask]
-    v[mask] = y[mask] / abs_z[mask]
-
-    mask = face_idx == 5
-    u[mask] = -x[mask] / abs_z[mask]
-    v[mask] = y[mask] / abs_z[mask]
-
-    u = u.clamp(-1, 1)
-    v = v.clamp(-1, 1)
-
-    equirect = torch.zeros(out_h, out_w, 3, device=device)
-
-    for fi in range(6):
-        mask = (face_idx == fi)
-        if not mask.any():
-            continue
-        face_grid = torch.stack([u[mask], v[mask]], dim=-1)
-        n_pix = face_grid.shape[0]
-        face_grid_4d = face_grid.reshape(1, 1, n_pix, 2)
-        face_img = faces[fi:fi+1]
-        sampled = F.grid_sample(
-            face_img, face_grid_4d, mode="bilinear",
-            padding_mode="border", align_corners=True,
-        )
-        equirect[mask] = sampled[0, :, 0, :].T
-
-    return equirect
+    return cubemap_to_equirect(faces, out_w, out_h, half_sphere=True)
