@@ -86,10 +86,11 @@ def get_cubemap_cameras(
 
 # ─── Overlap filtering ───────────────────────────────────────────────────────
 
-# FOV scale for overlapping prediction: tan(55°)/tan(45°) ≈ 1.43 → 110° FOV
-OVERLAP_FOV_SCALE = 1.43
-# Angular keep radius: 50° from face center (5° overlap beyond standard 45°)
-OVERLAP_KEEP_ANGLE_DEG = 50.0
+# FOV scale for overlapping prediction: tan(56.3°) ≈ 1.5 → ~112° FOV
+OVERLAP_FOV_SCALE = 1.5
+# Angular keep radius: 56° from face center.
+# Cubemap face corners are at arctan(√2) ≈ 54.7° — must cover them fully.
+OVERLAP_KEEP_ANGLE_DEG = 56.0
 
 
 def filter_gaussians_by_angle(
