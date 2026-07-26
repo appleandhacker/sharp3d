@@ -312,27 +312,8 @@ class _PipelineWorker:
                                         filter_gaussians_by_angle)
         face_size = 1536  # match SHARP internal resolution
 
-        if proj.startswith("fisheye"):
-            # Optimal 3-axis hemisphere coverage for fisheye
-            from sharp3d.projection import (fisheye_to_hemisphere,
-                                            get_hemisphere_cameras,
-                                            _HEMISPHERE_AXES)
-            model_map = {
-                "fisheye_equidistant": "equidistant",
-                "fisheye_equisolid": "equisolid",
-                "fisheye_orthographic": "orthographic",
-                "fisheye_stereographic": "stereographic",
-                "fisheye_ftheta": "ftheta",
-            }
-            model = model_map.get(proj, "equidistant")
-            faces = fisheye_to_hemisphere(img_t, face_size, model=model,
-                                          coeffs=ftheta_coeffs,
-                                          fov_scale=OVERLAP_FOV_SCALE)
-            viewmats, _ = get_hemisphere_cameras(face_size, device)
-            face_forwards = [ax[0] for ax in _HEMISPHERE_AXES]
-            n_faces = 4
-        else:
-            # Full 6-face cubemap for equirectangular
+        if proj == "equirect360":
+            # Full 6-face cubemap for 360° equirectangular
             from sharp3d.projection import (get_cubemap_cameras,
                                             _look_at_rotation, _FACE_DEFS)
             faces = equirect_to_cubemap(img_t, face_size,
@@ -340,6 +321,31 @@ class _PipelineWorker:
             viewmats, _ = get_cubemap_cameras(face_size, device)
             face_forwards = [fd[0] for fd in _FACE_DEFS]
             n_faces = 6
+        else:
+            # Optimal 4-axis hemisphere coverage for fisheye / equirect180
+            from sharp3d.projection import (get_hemisphere_cameras,
+                                            _HEMISPHERE_AXES)
+            if proj.startswith("fisheye"):
+                from sharp3d.projection import fisheye_to_hemisphere
+                model_map = {
+                    "fisheye_equidistant": "equidistant",
+                    "fisheye_equisolid": "equisolid",
+                    "fisheye_orthographic": "orthographic",
+                    "fisheye_stereographic": "stereographic",
+                    "fisheye_ftheta": "ftheta",
+                }
+                model = model_map.get(proj, "equidistant")
+                faces = fisheye_to_hemisphere(img_t, face_size, model=model,
+                                              coeffs=ftheta_coeffs,
+                                              fov_scale=OVERLAP_FOV_SCALE)
+            else:
+                # equirect180
+                from sharp3d.projection import equirect_to_hemisphere
+                faces = equirect_to_hemisphere(img_t, face_size,
+                                               fov_scale=OVERLAP_FOV_SCALE)
+            viewmats, _ = get_hemisphere_cameras(face_size, device)
+            face_forwards = [ax[0] for ax in _HEMISPHERE_AXES]
+            n_faces = 4
 
         total_steps = n_faces + 12  # prediction faces + render sub-steps (6 faces × 2 eyes)
 
