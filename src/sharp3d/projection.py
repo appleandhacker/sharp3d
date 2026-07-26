@@ -284,22 +284,28 @@ def angular_opacity_weight(
     face_forward: Tensor,
     inner_deg: float = _INNER_ANGLE_DEG,
     outer_deg: float = _OUTER_ANGLE_DEG,
+    weight_floor: float = 0.3,
 ) -> Tensor:
     """Compute smooth center-weighted opacity falloff per Gaussian.
 
-    Returns weight in [0, 1]:
+    Returns weight in [weight_floor, 1.0]:
       - angle < inner_deg: weight = 1.0 (full contribution)
-      - inner_deg < angle < outer_deg: smoothstep 1→0 (feather zone)
-      - angle > outer_deg: weight = 0.0 (discard)
+      - inner_deg < angle < outer_deg: smoothstep 1→floor (feather zone)
+      - angle > outer_deg: weight = floor (never fully zero)
+
+    The floor prevents holes at multi-face vertices (cubemap corners where
+    3 faces meet at 54.7°, hemisphere pole where 4 axes meet at 54.7°).
+    With floor=0.3: cubemap corner sum ≈ 3×0.32 ≈ 0.97.
 
     Args:
         means: [N, 3] world-space Gaussian positions.
         face_forward: [3] unit vector — face's forward direction.
         inner_deg: angle below which weight is 1.0.
-        outer_deg: angle above which weight is 0.0.
+        outer_deg: angle above which weight is floor.
+        weight_floor: minimum weight (prevents holes at vertices).
 
     Returns:
-        weight: [N] float tensor [0, 1].
+        weight: [N] float tensor [weight_floor, 1.0].
     """
     dirs = F.normalize(means, dim=-1)
     fwd = F.normalize(face_forward, dim=0)
@@ -310,7 +316,9 @@ def angular_opacity_weight(
     t = (angle_deg - inner_deg) / (outer_deg - inner_deg)
     t = t.clamp(0, 1)
     # Hermite smoothstep: 3t² - 2t³ (inverted: 1 at t=0, 0 at t=1)
-    weight = 1.0 - t * t * (3.0 - 2.0 * t)
+    blend = 1.0 - t * t * (3.0 - 2.0 * t)
+    # Apply floor: never go below weight_floor
+    weight = weight_floor + (1.0 - weight_floor) * blend
     return weight
 
 
