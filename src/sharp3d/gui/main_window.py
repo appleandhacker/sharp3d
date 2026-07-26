@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 from .anim_tab import AnimTab
 from .gaussian_tab import GaussianViewerWindow
 from .sbs_tab import SbsTab
+from .vr_tab import VrTab
 from .theme import DISPLAY_FONT, ThemeManager, build_palette, build_qss
 from .widgets import GpuMeter
 from .worker import EngineProcess
@@ -94,7 +95,9 @@ class MainWindow(QMainWindow):
         self._tabs.setDocumentMode(True)
         self._sbs = SbsTab(self._theme, self._engine)
         self._anim = AnimTab(self._theme, self._engine)
+        self._vr = VrTab(self._theme, self._engine)
         self._tabs.addTab(self._sbs, "SBS 立体转换")
+        self._tabs.addTab(self._vr, "全景视频")
         self._tabs.addTab(self._anim, "2.5D 视差动画")
 
         # Gaussian viewer button in tab bar corner
@@ -118,6 +121,7 @@ class MainWindow(QMainWindow):
         self._engine.error.connect(self._status_label.setText)
         self._sbs.status_message.connect(self._status_label.setText)
         self._anim.status_message.connect(self._status_label.setText)
+        self._vr.status_message.connect(self._status_label.setText)
 
         self._apply_theme(self._theme.is_dark)
 
@@ -145,6 +149,7 @@ class MainWindow(QMainWindow):
         self._gpu.set_colors(c)
         self._sbs.apply_theme(c)
         self._anim.apply_theme(c)
+        self._vr.apply_theme(c)
         if self._viewer is not None:
             self._viewer.set_colors(c)
         self._theme_label.setText("暗色模式" if is_dark else "亮色模式")

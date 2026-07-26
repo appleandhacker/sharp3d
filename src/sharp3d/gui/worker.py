@@ -19,6 +19,7 @@ Layout:
 """
 
 import gc
+import math
 import multiprocessing as mp
 import os
 import time
@@ -26,6 +27,26 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal
+
+
+def _quat_multiply(q1, q2):
+    """Quaternion multiplication (wxyz convention), batched.
+
+    Args:
+        q1: [..., 4] (w, x, y, z)
+        q2: [..., 4] (w, x, y, z)
+    Returns:
+        [..., 4] product q1 * q2
+    """
+    w1, x1, y1, z1 = q1.unbind(-1)
+    w2, x2, y2, z2 = q2.unbind(-1)
+    import torch
+    return torch.stack([
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+    ], dim=-1)
 
 
 # ===========================================================================
@@ -160,6 +181,11 @@ class _PipelineWorker:
     # ---- full conversion ------------------------------------------------
     def convert(self, opts):
         try:
+            # VR panoramic mode
+            if opts.get("mode") == "vr":
+                self._convert_vr(opts)
+                return
+
             self._ensure_pipeline(opts.get("perf_mode", "quality"))
             torch = self._torch
             from sharp.utils import io as sharp_io
@@ -185,6 +211,204 @@ class _PipelineWorker:
                                     INTERNAL_SHAPE, torch, sharp_io)
         except Exception as exc:  # noqa: BLE001
             self._respond("error", (f"转换失败: {exc}",))
+
+    def _convert_vr(self, opts):
+        """VR panoramic conversion: equirect/fisheye → stereo 3D VR."""
+        self._ensure_pipeline(opts.get("perf_mode", "quality"))
+        torch = self._torch
+        from PIL import Image
+        from sharp3d.unproject import prepare_input, fast_unproject, INTERNAL_SHAPE
+        from sharp3d.projection import equirect_to_cubemap, fisheye_to_cubemap
+        from sharp3d.render_vr import render_vr_stereo
+
+        self._cancel_event.clear()
+        path = Path(opts["input"])
+        out = Path(opts["output"])
+        ipd_scene = (opts["ipd_mm"] / 1000.0) * opts["strength"]
+        renderer = opts.get("renderer", "higs")
+        output_projection = opts.get("output_projection", "equirect180")
+        stereo_layout = opts.get("stereo_layout", "sbs")
+        eye_w = opts.get("eye_width", 4096)
+        eye_h = opts.get("eye_height", 4096)
+        input_projection = opts.get("input_projection", "auto")
+        ftheta_coeffs = opts.get("ftheta_coeffs")
+
+        # Determine input type
+        video_exts = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+        is_video = path.suffix.lower() in video_exts
+
+        if is_video:
+            self._convert_vr_video(path, out, opts, ipd_scene, renderer,
+                                   output_projection, stereo_layout,
+                                   eye_w, eye_h, input_projection,
+                                   ftheta_coeffs, torch,
+                                   prepare_input, fast_unproject,
+                                   equirect_to_cubemap, fisheye_to_cubemap,
+                                   render_vr_stereo, INTERNAL_SHAPE)
+        else:
+            self._convert_vr_image(path, out, opts, ipd_scene, renderer,
+                                   output_projection, stereo_layout,
+                                   eye_w, eye_h, input_projection,
+                                   ftheta_coeffs, torch,
+                                   prepare_input, fast_unproject,
+                                   equirect_to_cubemap, fisheye_to_cubemap,
+                                   render_vr_stereo, INTERNAL_SHAPE)
+
+    def _convert_vr_image(self, path, out, opts, ipd_scene, renderer,
+                          output_projection, stereo_layout,
+                          eye_w, eye_h, input_projection,
+                          ftheta_coeffs, torch,
+                          prepare_input, fast_unproject,
+                          equirect_to_cubemap, fisheye_to_cubemap,
+                          render_vr_stereo, INTERNAL_SHAPE):
+        """Single-image VR conversion."""
+        from PIL import Image
+        import numpy as np
+
+        # Load input image
+        img = Image.open(path).convert("RGB")
+        img_np = np.array(img)
+        h, w = img_np.shape[:2]
+        device = self._device
+
+        # Convert input to tensor [H, W, 3] float [0, 1]
+        img_t = torch.from_numpy(img_np).float().to(device) / 255.0
+
+        # Auto-detect projection if needed
+        proj = input_projection
+        if proj == "auto":
+            aspect = w / h
+            if 1.9 < aspect < 2.1:
+                proj = "equirect360"
+            elif 0.9 < aspect < 1.1:
+                proj = "equirect180"
+            else:
+                proj = "equirect360"  # default fallback
+
+        # Extract 6 cubemap faces from input
+        face_size = 1536  # match SHARP internal resolution
+        if proj.startswith("equirect"):
+            faces = equirect_to_cubemap(img_t, face_size)  # [6, 3, H, W]
+        else:
+            # Fisheye
+            model_map = {
+                "fisheye_equidistant": "equidistant",
+                "fisheye_equisolid": "equisolid",
+                "fisheye_orthographic": "orthographic",
+                "fisheye_stereographic": "stereographic",
+                "fisheye_ftheta": "ftheta",
+            }
+            model = model_map.get(proj, "equidistant")
+            faces = fisheye_to_cubemap(img_t, face_size, model=model,
+                                       coeffs=ftheta_coeffs)
+
+        # Predict depth + unproject for each face → merge Gaussians
+        from sharp3d.projection import get_cubemap_cameras, _look_at_rotation, _FACE_DEFS
+        import torch.nn.functional as F_t
+
+        all_means = []
+        all_quats = []
+        all_scales = []
+        all_opacities = []
+        all_colors = []
+
+        viewmats, _ = get_cubemap_cameras(face_size, device)
+
+        for i in range(6):
+            if self._cancel_event.is_set():
+                self._respond("convert_done", ({"cancelled": True},))
+                return
+
+            # Face image as numpy for prepare_input
+            face_img = faces[i].permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
+            face_img_u8 = (face_img * 255).clip(0, 255).astype(np.uint8)
+
+            # Focal length for cubemap face (90° FOV)
+            f_px = face_size / 2.0
+
+            img_r, df, ir, _ = prepare_input(face_img_u8, f_px, device)
+
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+                g_ndc = self._compiled(img_r, df)
+
+            g = fast_unproject(g_ndc, torch.eye(4, device=device), ir,
+                               INTERNAL_SHAPE, decompose_method="analytical")
+
+            # Squeeze batch dim: [1, N, ...] → [N, ...]
+            # Clone to detach from CUDA Graphs output buffers (reused across runs)
+            means = g.mean_vectors.squeeze(0).clone()
+            quats_local = g.quaternions.squeeze(0).clone()
+            scales = g.singular_values.squeeze(0).clone()
+            opacities = (g.opacities.squeeze(0) if g.opacities.dim() == 2 else g.opacities).clone()
+            colors = g.colors.squeeze(0).clone()
+
+            # Transform Gaussians from face-local to world space
+            R = viewmats[i, :3, :3]  # world-to-camera rotation
+            R_inv = R.T  # camera-to-world
+
+            means_world = means @ R_inv.T
+            # Rotate quaternions: q_world = q_rot * q_local
+            from sharp3d.quaternion import quat_from_rotmat_gpu
+            q_rot = quat_from_rotmat_gpu(R_inv.unsqueeze(0))[0]  # [4]
+
+            # Quaternion multiplication: q_world = q_rot * q_local
+            quats_world = _quat_multiply(q_rot.unsqueeze(0), quats_local)
+
+            all_means.append(means_world)
+            all_quats.append(quats_world)
+            all_scales.append(scales)
+            all_opacities.append(opacities)
+            all_colors.append(colors)
+
+            self._respond("convert_progress",
+                          (i + 1, 12, 0.0, time.time()))
+
+        # Merge all Gaussians
+        from sharp.utils.gaussians import Gaussians3D
+        merged = Gaussians3D(
+            mean_vectors=torch.cat(all_means, dim=0),
+            singular_values=torch.cat(all_scales, dim=0),
+            quaternions=torch.cat(all_quats, dim=0),
+            colors=torch.cat(all_colors, dim=0),
+            opacities=torch.cat(all_opacities, dim=0),
+        )
+
+        # Render VR stereo
+        result = render_vr_stereo(
+            merged,
+            ipd=ipd_scene,
+            face_size=1024,
+            out_w=eye_w,
+            out_h=eye_h,
+            output_projection=output_projection,
+            stereo_layout=stereo_layout,
+            renderer=renderer,
+            device=device,
+        )
+
+        # Save
+        Image.fromarray(result.cpu().numpy()).save(out)
+
+        del merged, faces, result
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        self._respond("convert_progress", (12, 12, 1.0, time.time()))
+        self._respond("convert_done", ({
+            "output": str(out), "elapsed": 0, "fps": 0,
+            "n_frames": 1,
+        },))
+
+    def _convert_vr_video(self, path, out, opts, ipd_scene, renderer,
+                          output_projection, stereo_layout,
+                          eye_w, eye_h, input_projection,
+                          ftheta_coeffs, torch,
+                          prepare_input, fast_unproject,
+                          equirect_to_cubemap, fisheye_to_cubemap,
+                          render_vr_stereo, INTERNAL_SHAPE):
+        """Video VR conversion — placeholder for initial implementation."""
+        # TODO: implement frame-by-frame video VR conversion
+        self._respond("error", ("VR 视频转换尚未实现，请使用图片输入",))
 
     def _convert_image(self, path, out, opts, ipd_scene, conv_q, method,
                        prepare_input, fast_unproject, render_sbs,
@@ -684,8 +908,7 @@ def _child_main_inner(req_q, resp_q, cancel_event):
     # ---- persistent compile cache: compile once, reuse forever ----
     # Must be set before torch is imported in this process.
     if getattr(_sys, "frozen", False):
-        # PyInstaller: use persistent AppData cache
-        _cache_dir = Path(_os.environ.get("LOCALAPPDATA", "~")) / "sharp3d" / ".cache"
+        _cache_dir = Path(_sys.executable).parent / ".cache"
     else:
         _project_root = Path(__file__).resolve().parents[3]
         _cache_dir = _project_root / ".cache"
