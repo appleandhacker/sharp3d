@@ -453,12 +453,23 @@ class VrTab(QWidget):
             self.status_message.emit("请先选择输出路径")
             return
 
+        # NVENC resolution warning
+        opts = self._build_opts(inp, out)
+        ew, eh = opts["eye_w"], opts["eye_h"]
+        layout = opts["stereo_layout"]
+        packed_w = ew * 2 if layout == "sbs" else ew
+        packed_h = eh if layout == "sbs" else eh * 2
+        if packed_w > 8192 or packed_h > 8192:
+            self.status_message.emit(
+                f"⚠ 输出 {packed_w}×{packed_h} 超过NVENC 8192px上限，"
+                f"将使用CPU编码（速度较慢）")
+
         self._converting = True
         self._btn_start.setEnabled(False)
         self._btn_cancel.setEnabled(True)
         self._progress.set_busy(False)
         self._progress.set_value(0.0)
-        self.request_convert.emit(self._build_opts(inp, out))
+        self.request_convert.emit(opts)
 
     def _build_opts(self, inp: str, out: str) -> dict:
         """Build VR conversion options."""
