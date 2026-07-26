@@ -272,12 +272,11 @@ def filter_gaussians_by_angle(
     return cos_angle >= cos_thresh
 
 
-# Inner angle: full weight below this (no attenuation in central region)
-_INNER_ANGLE_DEG = 30.0
-# Outer angle for smoothstep: extends beyond prediction limit (56°) to give
-# gradual falloff. No actual Gaussians exist beyond ~56° from face center,
-# so this only controls the curve shape in the 30-56° range.
-_OUTER_ANGLE_DEG = 65.0
+# Inner angle: full weight below this (no attenuation before the seam)
+# Default = cubemap boundary (45°). Hemisphere worker passes 35.3°.
+_INNER_ANGLE_DEG = 45.0
+# Outer angle: weight reaches 0 here (= prediction limit)
+_OUTER_ANGLE_DEG = 56.0
 
 
 def angular_opacity_weight(

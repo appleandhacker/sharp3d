@@ -360,6 +360,8 @@ class _PipelineWorker:
 
         eye4 = torch.eye(4, device=device)
         f_px = face_size / (2.0 * OVERLAP_FOV_SCALE)
+        # Seam angle: boundary between adjacent faces
+        seam_deg = 45.0 if n_faces == 6 else 35.3  # cubemap vs hemisphere
 
         for i in range(n_faces):
             if self._cancel_event.is_set():
@@ -398,7 +400,8 @@ class _PipelineWorker:
 
             # Center-weighted opacity falloff (smooth seam blending)
             face_fwd = face_forwards[i].to(device)
-            weight = angular_opacity_weight(means_world, face_fwd)
+            weight = angular_opacity_weight(means_world, face_fwd,
+                                            inner_deg=seam_deg)
             keep = weight > 0.01
             w_keep = weight[keep]
             opac_keep = opacities[keep]
@@ -572,6 +575,7 @@ class _PipelineWorker:
         render_face = _compute_render_face_size(eye_w, output_projection)
         f_px = pred_face_size / (2.0 * OVERLAP_FOV_SCALE)
         eye4 = torch.eye(4, device=device)
+        seam_deg = 45.0  # updated below based on face layout
 
         # Determine face layout based on input projection
         if proj == "equirect360":
@@ -587,6 +591,7 @@ class _PipelineWorker:
             face_forwards = [ax[0] for ax in _HEMISPHERE_AXES]
             n_faces = 4
             use_hemisphere = True
+            seam_deg = 35.3
 
         # Fisheye model map (invariant)
         model_map = {
@@ -726,7 +731,8 @@ class _PipelineWorker:
 
                 # Center-weighted opacity falloff (smooth seam blending)
                 face_fwd = face_forwards[i].to(device)
-                weight = angular_opacity_weight(means_world, face_fwd)
+                weight = angular_opacity_weight(means_world, face_fwd,
+                                                inner_deg=seam_deg)
                 keep = weight > 0.01
                 w_keep = weight[keep]
                 opac_keep = opacities[keep]
