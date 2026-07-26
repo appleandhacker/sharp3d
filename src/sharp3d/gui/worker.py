@@ -514,8 +514,7 @@ class _PipelineWorker:
         """Video VR conversion — frame-by-frame cubemap predict + render."""
         from sharp3d.hdr import FrameReader, FFMPEG, hdr_to_sdr_filter
         from sharp3d.video import VideoWriter, resolve_encoder
-        from sharp3d.projection import (get_cubemap_cameras, _look_at_rotation,
-                                        _FACE_DEFS, OVERLAP_FOV_SCALE,
+        from sharp3d.projection import (OVERLAP_FOV_SCALE,
                                         OVERLAP_KEEP_ANGLE_DEG,
                                         filter_gaussians_by_angle)
         from sharp3d.quaternion import quat_from_rotmat_gpu
@@ -560,8 +559,33 @@ class _PipelineWorker:
 
         # Cubemap prediction setup (fixed across frames)
         pred_face_size = 1536  # SHARP internal resolution
-        viewmats, _ = get_cubemap_cameras(pred_face_size, device)
         render_face = _compute_render_face_size(eye_w, output_projection)
+        f_px = pred_face_size / (2.0 * OVERLAP_FOV_SCALE)
+        eye4 = torch.eye(4, device=device)
+
+        # Determine face layout based on input projection
+        if proj == "equirect360":
+            from sharp3d.projection import get_cubemap_cameras, _FACE_DEFS
+            viewmats, _ = get_cubemap_cameras(pred_face_size, device)
+            face_forwards = [fd[0] for fd in _FACE_DEFS]
+            n_faces = 6
+            use_hemisphere = False
+        else:
+            from sharp3d.projection import (get_hemisphere_cameras,
+                                            _HEMISPHERE_AXES)
+            viewmats, _ = get_hemisphere_cameras(pred_face_size, device)
+            face_forwards = [ax[0] for ax in _HEMISPHERE_AXES]
+            n_faces = 4
+            use_hemisphere = True
+
+        # Fisheye model map (invariant)
+        model_map = {
+            "fisheye_equidistant": "equidistant",
+            "fisheye_equisolid": "equisolid",
+            "fisheye_orthographic": "orthographic",
+            "fisheye_stereographic": "stereographic",
+            "fisheye_ftheta": "ftheta",
+        }
 
         # Decode prefetch thread
         frame_q: _queue.Queue = _queue.Queue(maxsize=4)
@@ -632,22 +656,29 @@ class _PipelineWorker:
             img_t = torch.from_numpy(frm).float().to(device) / 255.0
             del frm
 
-            # Extract 6 cubemap faces (overlapping FOV)
-            if proj.startswith("equirect"):
-                faces = equirect_to_cubemap(img_t, pred_face_size,
-                                            fov_scale=OVERLAP_FOV_SCALE)
+            # Extract faces (overlapping FOV)
+            if use_hemisphere:
+                from sharp3d.projection import (equirect_to_hemisphere,
+                                                fisheye_to_hemisphere)
+                if proj.startswith("fisheye"):
+                    model = model_map.get(proj, "equidistant")
+                    faces = fisheye_to_hemisphere(img_t, pred_face_size,
+                                                  model=model,
+                                                  coeffs=ftheta_coeffs,
+                                                  fov_scale=OVERLAP_FOV_SCALE)
+                else:
+                    faces = equirect_to_hemisphere(img_t, pred_face_size,
+                                                   fov_scale=OVERLAP_FOV_SCALE)
             else:
-                model_map = {
-                    "fisheye_equidistant": "equidistant",
-                    "fisheye_equisolid": "equisolid",
-                    "fisheye_orthographic": "orthographic",
-                    "fisheye_stereographic": "stereographic",
-                    "fisheye_ftheta": "ftheta",
-                }
-                model = model_map.get(proj, "equidistant")
-                faces = fisheye_to_cubemap(img_t, pred_face_size, model=model,
-                                           coeffs=ftheta_coeffs,
-                                           fov_scale=OVERLAP_FOV_SCALE)
+                if proj.startswith("equirect"):
+                    faces = equirect_to_cubemap(img_t, pred_face_size,
+                                                fov_scale=OVERLAP_FOV_SCALE)
+                else:
+                    model = model_map.get(proj, "equidistant")
+                    faces = fisheye_to_cubemap(img_t, pred_face_size,
+                                               model=model,
+                                               coeffs=ftheta_coeffs,
+                                               fov_scale=OVERLAP_FOV_SCALE)
             del img_t
 
             # Predict + unproject each face → merge Gaussians
@@ -657,9 +688,7 @@ class _PipelineWorker:
             all_opacities = []
             all_colors = []
 
-            f_px = pred_face_size / (2.0 * OVERLAP_FOV_SCALE)
-
-            for i in range(6):
+            for i in range(n_faces):
                 if self._cancel_event.is_set():
                     break
                 face_img = faces[i].permute(1, 2, 0).cpu().numpy()
@@ -670,7 +699,7 @@ class _PipelineWorker:
                 with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
                     g_ndc = self._compiled(img_r, df)
 
-                g = fast_unproject(g_ndc, torch.eye(4, device=device), ir,
+                g = fast_unproject(g_ndc, eye4, ir,
                                    INTERNAL_SHAPE, decompose_method="analytical")
 
                 means = g.mean_vectors.squeeze(0).clone()
@@ -687,7 +716,7 @@ class _PipelineWorker:
                 quats_world = _quat_multiply(q_rot.unsqueeze(0), quats_local)
 
                 # Angular filter: keep central region only
-                face_fwd = _FACE_DEFS[i][0].to(device)
+                face_fwd = face_forwards[i].to(device)
                 mask = filter_gaussians_by_angle(means_world, face_fwd,
                                                 OVERLAP_KEEP_ANGLE_DEG)
                 all_means.append(means_world[mask])
