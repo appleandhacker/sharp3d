@@ -65,6 +65,15 @@ if (_cache / "sharp_fp16.pt").exists():
 # PySide6 Qt plugins
 datas += collect_data_files("PySide6", subdir="Qt")
 
+# scipy._external is a namespace package (no __init__.py at top level) —
+# collect_submodules("scipy") cannot traverse it. Manually walk it.
+import pkgutil
+_scipy_ext_path = str(SITE_PACKAGES / "scipy" / "_external")
+_scipy_ext_mods = []
+for importer, modname, ispkg in pkgutil.walk_packages(
+        [_scipy_ext_path], prefix="scipy._external."):
+    _scipy_ext_mods.append(modname)
+
 # ---- Package metadata (importlib.metadata / pkg_resources) ----
 # These packages query their own version or discover plugins at runtime.
 for pkg in [
@@ -101,6 +110,7 @@ hiddenimports = [
     *collect_submodules("sharp"),
     # scipy (including _external.array_api_compat.*)
     *collect_submodules("scipy"),
+    *_scipy_ext_mods,  # namespace package missed by collect_submodules
     # PyTorch
     "torch._C",
     "torch.cuda",
