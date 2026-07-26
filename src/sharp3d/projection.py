@@ -84,15 +84,55 @@ def get_cubemap_cameras(
     return viewmats, Ks
 
 
+# ─── Overlap filtering ───────────────────────────────────────────────────────
+
+# FOV scale for overlapping prediction: tan(55°)/tan(45°) ≈ 1.43 → 110° FOV
+OVERLAP_FOV_SCALE = 1.43
+# Angular keep radius: 50° from face center (5° overlap beyond standard 45°)
+OVERLAP_KEEP_ANGLE_DEG = 50.0
+
+
+def filter_gaussians_by_angle(
+    means: Tensor,
+    face_forward: Tensor,
+    max_angle_deg: float = OVERLAP_KEEP_ANGLE_DEG,
+) -> Tensor:
+    """Return boolean mask: True for Gaussians within angular radius of face center.
+
+    Args:
+        means: [N, 3] world-space Gaussian positions.
+        face_forward: [3] unit vector — face's forward direction in world space.
+        max_angle_deg: maximum angular distance from face center to keep.
+
+    Returns:
+        mask: [N] boolean tensor.
+    """
+    # Direction from origin to each Gaussian
+    dirs = F.normalize(means, dim=-1)  # [N, 3]
+    fwd = F.normalize(face_forward, dim=0)  # [3]
+    # Cosine of angle between direction and face forward
+    cos_angle = (dirs * fwd.unsqueeze(0)).sum(dim=-1)  # [N]
+    cos_thresh = math.cos(math.radians(max_angle_deg))
+    return cos_angle >= cos_thresh
+
+
 # ─── Input: Equirectangular → Cubemap faces ──────────────────────────────────
 
-def _cubemap_face_rays(face_size: int, device: torch.device) -> Tensor:
+def _cubemap_face_rays(face_size: int, device: torch.device,
+                       fov_scale: float = 1.0) -> Tensor:
     """Generate unit ray directions for each pixel of a cubemap face.
+
+    Args:
+        face_size: pixel resolution of each square face.
+        device: CUDA device.
+        fov_scale: FOV multiplier. 1.0 = standard 90° FOV.
+                   >1.0 widens FOV for overlapping prediction
+                   (e.g. 1.43 ≈ 110° FOV).
 
     Returns: [6, face_size, face_size, 3] world-space ray directions.
     """
-    # Pixel grid in [-1, 1]
-    coords = torch.linspace(-1, 1, face_size, device=device)
+    # Pixel grid in [-fov_scale, fov_scale]
+    coords = torch.linspace(-fov_scale, fov_scale, face_size, device=device)
     gy, gx = torch.meshgrid(coords, coords, indexing="ij")
     # Local ray: camera looks along +Z (OpenCV convention)
     # X right, Y down, Z forward
@@ -116,12 +156,14 @@ def _cubemap_face_rays(face_size: int, device: torch.device) -> Tensor:
 def equirect_to_cubemap(
     image: Tensor,
     face_size: int,
+    fov_scale: float = 1.0,
 ) -> Tensor:
     """Sample an equirectangular image into 6 cubemap faces.
 
     Args:
         image: [H, W, 3] or [1, 3, H, W] equirectangular image (float, any range).
         face_size: output cubemap face resolution.
+        fov_scale: FOV multiplier (1.0 = 90°, >1.0 = wider for overlap).
 
     Returns:
         faces: [6, 3, face_size, face_size] cubemap face images.
@@ -131,7 +173,7 @@ def equirect_to_cubemap(
     device = image.device
     _, C, H, W = image.shape
 
-    rays = _cubemap_face_rays(face_size, device)  # [6, fh, fw, 3]
+    rays = _cubemap_face_rays(face_size, device, fov_scale)  # [6, fh, fw, 3]
     rays_flat = rays.reshape(6, -1, 3)  # [6, N, 3]
 
     # Convert ray directions to equirectangular UV
@@ -191,6 +233,7 @@ def fisheye_to_cubemap(
     model: str = "equidistant",
     coeffs: list[float] | None = None,
     fisheye_fov: float = 180.0,
+    fov_scale: float = 1.0,
 ) -> Tensor:
     """Sample a circular fisheye image into 6 cubemap faces.
 
@@ -200,6 +243,7 @@ def fisheye_to_cubemap(
         model: fisheye projection model name.
         coeffs: FTheta polynomial coefficients [k1, k2, k3].
         fisheye_fov: full field-of-view of the fisheye in degrees.
+        fov_scale: FOV multiplier (1.0 = 90°, >1.0 = wider for overlap).
 
     Returns:
         faces: [6, 3, face_size, face_size] cubemap faces.
@@ -210,7 +254,7 @@ def fisheye_to_cubemap(
     device = image.device
     _, C, H, W = image.shape
 
-    rays = _cubemap_face_rays(face_size, device)  # [6, fh, fw, 3]
+    rays = _cubemap_face_rays(face_size, device, fov_scale)  # [6, fh, fw, 3]
     rays_flat = rays.reshape(6, -1, 3)
 
     # Fisheye camera looks along +Z, image plane is XY

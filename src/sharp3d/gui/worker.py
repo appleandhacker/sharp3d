@@ -305,10 +305,13 @@ class _PipelineWorker:
             else:
                 proj = "equirect360"  # default fallback
 
-        # Extract 6 cubemap faces from input
+        # Extract 6 cubemap faces from input (overlapping FOV for seam reduction)
+        from sharp3d.projection import (OVERLAP_FOV_SCALE, OVERLAP_KEEP_ANGLE_DEG,
+                                        filter_gaussians_by_angle)
         face_size = 1536  # match SHARP internal resolution
         if proj.startswith("equirect"):
-            faces = equirect_to_cubemap(img_t, face_size)  # [6, 3, H, W]
+            faces = equirect_to_cubemap(img_t, face_size,
+                                        fov_scale=OVERLAP_FOV_SCALE)
         else:
             # Fisheye
             model_map = {
@@ -320,7 +323,8 @@ class _PipelineWorker:
             }
             model = model_map.get(proj, "equidistant")
             faces = fisheye_to_cubemap(img_t, face_size, model=model,
-                                       coeffs=ftheta_coeffs)
+                                       coeffs=ftheta_coeffs,
+                                       fov_scale=OVERLAP_FOV_SCALE)
 
         # Predict depth + unproject for each face → merge Gaussians
         from sharp3d.projection import get_cubemap_cameras, _look_at_rotation, _FACE_DEFS
@@ -343,8 +347,8 @@ class _PipelineWorker:
             face_img = faces[i].permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
             face_img_u8 = (face_img * 255).clip(0, 255).astype(np.uint8)
 
-            # Focal length for cubemap face (90° FOV)
-            f_px = face_size / 2.0
+            # Focal length for overlapping FOV: f = size / (2 * fov_scale)
+            f_px = face_size / (2.0 * OVERLAP_FOV_SCALE)
 
             img_r, df, ir, _ = prepare_input(face_img_u8, f_px, device)
 
@@ -374,11 +378,15 @@ class _PipelineWorker:
             # Quaternion multiplication: q_world = q_rot * q_local
             quats_world = _quat_multiply(q_rot.unsqueeze(0), quats_local)
 
-            all_means.append(means_world)
-            all_quats.append(quats_world)
-            all_scales.append(scales)
-            all_opacities.append(opacities)
-            all_colors.append(colors)
+            # Angular filter: keep only central region (discard low-quality edges)
+            face_fwd = _FACE_DEFS[i][0].to(device)
+            mask = filter_gaussians_by_angle(means_world, face_fwd,
+                                            OVERLAP_KEEP_ANGLE_DEG)
+            all_means.append(means_world[mask])
+            all_quats.append(quats_world[mask])
+            all_scales.append(scales[mask])
+            all_opacities.append(opacities[mask])
+            all_colors.append(colors[mask])
 
             self._respond("convert_progress",
                           (i + 1, 12, 0.0, time.time()))
@@ -480,7 +488,10 @@ class _PipelineWorker:
         """Video VR conversion — frame-by-frame cubemap predict + render."""
         from sharp3d.hdr import FrameReader, FFMPEG, hdr_to_sdr_filter
         from sharp3d.video import VideoWriter, resolve_encoder
-        from sharp3d.projection import get_cubemap_cameras, _look_at_rotation, _FACE_DEFS
+        from sharp3d.projection import (get_cubemap_cameras, _look_at_rotation,
+                                        _FACE_DEFS, OVERLAP_FOV_SCALE,
+                                        OVERLAP_KEEP_ANGLE_DEG,
+                                        filter_gaussians_by_angle)
         from sharp3d.quaternion import quat_from_rotmat_gpu
         from sharp.utils.gaussians import Gaussians3D
         import queue as _queue
@@ -595,9 +606,10 @@ class _PipelineWorker:
             img_t = torch.from_numpy(frm).float().to(device) / 255.0
             del frm
 
-            # Extract 6 cubemap faces
+            # Extract 6 cubemap faces (overlapping FOV)
             if proj.startswith("equirect"):
-                faces = equirect_to_cubemap(img_t, pred_face_size)
+                faces = equirect_to_cubemap(img_t, pred_face_size,
+                                            fov_scale=OVERLAP_FOV_SCALE)
             else:
                 model_map = {
                     "fisheye_equidistant": "equidistant",
@@ -608,7 +620,8 @@ class _PipelineWorker:
                 }
                 model = model_map.get(proj, "equidistant")
                 faces = fisheye_to_cubemap(img_t, pred_face_size, model=model,
-                                           coeffs=ftheta_coeffs)
+                                           coeffs=ftheta_coeffs,
+                                           fov_scale=OVERLAP_FOV_SCALE)
             del img_t
 
             # Predict + unproject each face → merge Gaussians
@@ -618,7 +631,7 @@ class _PipelineWorker:
             all_opacities = []
             all_colors = []
 
-            f_px = pred_face_size / 2.0
+            f_px = pred_face_size / (2.0 * OVERLAP_FOV_SCALE)
 
             for i in range(6):
                 if self._cancel_event.is_set():
@@ -647,11 +660,15 @@ class _PipelineWorker:
                 q_rot = quat_from_rotmat_gpu(R_inv.unsqueeze(0))[0]
                 quats_world = _quat_multiply(q_rot.unsqueeze(0), quats_local)
 
-                all_means.append(means_world)
-                all_quats.append(quats_world)
-                all_scales.append(scales)
-                all_opacities.append(opacities)
-                all_colors.append(colors)
+                # Angular filter: keep central region only
+                face_fwd = _FACE_DEFS[i][0].to(device)
+                mask = filter_gaussians_by_angle(means_world, face_fwd,
+                                                OVERLAP_KEEP_ANGLE_DEG)
+                all_means.append(means_world[mask])
+                all_quats.append(quats_world[mask])
+                all_scales.append(scales[mask])
+                all_opacities.append(opacities[mask])
+                all_colors.append(colors[mask])
 
             if self._cancel_event.is_set():
                 del faces
