@@ -301,7 +301,7 @@ def angular_opacity_weight(
     dirs = F.normalize(means, dim=-1)
     fwd = F.normalize(face_forward, dim=0)
     cos_angle = (dirs * fwd.unsqueeze(0)).sum(dim=-1).clamp(-1, 1)
-    angle_deg = torch.degrees(torch.acos(cos_angle))
+    angle_deg = torch.acos(cos_angle) * (180.0 / math.pi)
 
     # Smoothstep: 1 at inner_deg, 0 at outer_deg
     t = (angle_deg - inner_deg) / (outer_deg - inner_deg)
