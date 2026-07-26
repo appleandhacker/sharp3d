@@ -374,6 +374,9 @@ class _PipelineWorker:
         )
 
         # Render VR stereo
+        def _render_progress(step, total):
+            self._respond("convert_progress", (step, total, 0.0, time.time()))
+
         result = render_vr_stereo(
             merged,
             ipd=ipd_scene,
@@ -384,10 +387,46 @@ class _PipelineWorker:
             stereo_layout=stereo_layout,
             renderer=renderer,
             device=device,
+            progress_cb=_render_progress,
         )
 
         # Save
         Image.fromarray(result.cpu().numpy()).save(out)
+
+        # Depth panorama output
+        if opts.get("depth"):
+            from sharp3d.projection import cubemap_to_equirect, cubemap_to_equirect180
+            from gsplat.rendering import rasterization as _rast
+            from sharp3d.projection import get_cubemap_cameras as _gcc
+
+            depth_map_fn = cubemap_to_equirect180 if output_projection == "equirect180" else cubemap_to_equirect
+            viewmats_d, Ks_d = _gcc(1024, device)
+            # Render depth from left eye (no stereo offset for depth)
+            with torch.no_grad():
+                rendered_d, _, meta_d = _rast(
+                    means=merged.mean_vectors,
+                    quats=merged.quaternions,
+                    scales=merged.singular_values,
+                    opacities=merged.opacities,
+                    colors=merged.colors,
+                    viewmats=viewmats_d,
+                    Ks=Ks_d,
+                    width=1024, height=1024,
+                    render_mode="RGB+D",
+                )
+            # RGB+D mode: rendered_d shape [6, H, W, 4] (RGB + depth)
+            depths = rendered_d[:, :, :, 3:4].permute(0, 3, 1, 2)  # [6, 1, H, W]
+            depths_3ch = depths.expand(-1, 3, -1, -1)  # [6, 3, H, W] for assembly
+            depth_equirect = depth_map_fn(depths_3ch, eye_w, eye_h)  # [H, W, 3]
+            # Normalize depth to 0-255 for visualization
+            d_min = depth_equirect[depth_equirect > 0].min() if (depth_equirect > 0).any() else 0
+            d_max = depth_equirect.max()
+            if d_max > d_min:
+                depth_vis = ((depth_equirect - d_min) / (d_max - d_min) * 255).clamp(0, 255).to(torch.uint8)
+            else:
+                depth_vis = torch.zeros_like(depth_equirect, dtype=torch.uint8)
+            depth_out = out.with_stem(out.stem + "_depth")
+            Image.fromarray(depth_vis.cpu().numpy()).save(depth_out)
 
         del merged, faces, result
         torch.cuda.empty_cache()

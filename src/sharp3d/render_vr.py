@@ -28,6 +28,7 @@ def render_vr_stereo(
     stereo_layout: str = "sbs",
     renderer: str = "higs",
     device: torch.device | None = None,
+    progress_cb=None,  # callable(step, total)
 ) -> Tensor:
     """Render stereo VR equirectangular image from world-space Gaussians.
 
@@ -57,19 +58,35 @@ def render_vr_stereo(
     if renderer == "higs":
         try:
             left_faces = _render_cubemap_higs(gaussians, left_offset, face_size, device)
+            if progress_cb:
+                progress_cb(7, 12)
             right_faces = _render_cubemap_higs(gaussians, right_offset, face_size, device)
+            if progress_cb:
+                progress_cb(8, 12)
         except Exception:
             # HiGS unavailable (JIT build failure) — fallback to standard
             left_faces = _render_cubemap_standard(gaussians, left_offset, face_size, device)
+            if progress_cb:
+                progress_cb(7, 12)
             right_faces = _render_cubemap_standard(gaussians, right_offset, face_size, device)
+            if progress_cb:
+                progress_cb(8, 12)
     else:
         left_faces = _render_cubemap_standard(gaussians, left_offset, face_size, device)
+        if progress_cb:
+            progress_cb(7, 12)
         right_faces = _render_cubemap_standard(gaussians, right_offset, face_size, device)
+        if progress_cb:
+            progress_cb(8, 12)
 
     # Assemble equirectangular
     map_fn = cubemap_to_equirect180 if output_projection == "equirect180" else cubemap_to_equirect
     left_equirect = map_fn(left_faces, out_w, out_h)   # [H, W, 3] linearRGB
+    if progress_cb:
+        progress_cb(9, 12)
     right_equirect = map_fn(right_faces, out_w, out_h)
+    if progress_cb:
+        progress_cb(10, 12)
 
     # Gamma correction
     left_srgb = linearRGB2sRGB(left_equirect)
@@ -78,12 +95,17 @@ def render_vr_stereo(
     # Quantize to uint8
     left_u8 = (left_srgb * 255).clamp(0, 255).to(torch.uint8)
     right_u8 = (right_srgb * 255).clamp(0, 255).to(torch.uint8)
+    if progress_cb:
+        progress_cb(11, 12)
 
     # Pack stereo layout
     if stereo_layout == "sbs":
-        return torch.cat([left_u8, right_u8], dim=1)  # [H, W*2, 3]
+        result = torch.cat([left_u8, right_u8], dim=1)  # [H, W*2, 3]
     else:  # tb
-        return torch.cat([left_u8, right_u8], dim=0)  # [H*2, W, 3]
+        result = torch.cat([left_u8, right_u8], dim=0)  # [H*2, W, 3]
+    if progress_cb:
+        progress_cb(12, 12)
+    return result
 
 
 def _render_cubemap_higs(
