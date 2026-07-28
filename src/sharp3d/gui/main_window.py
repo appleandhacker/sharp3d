@@ -72,17 +72,9 @@ class MainWindow(QMainWindow):
         logo.setStyleSheet(f"color:{self._theme.colors.red};")
         title = QLabel("sharp3d")
         title.setFont(QFont(DISPLAY_FONT, 22, QFont.Weight.Bold))
-        subtitle = QLabel(f"v{__version__}")
-        subtitle.setProperty("cssClass", "hint")
-        subtitle.setStyleSheet("font-size:12px;")
-
-        title_block = QVBoxLayout()
-        title_block.setSpacing(0)
-        title_block.addWidget(title)
-        title_block.addWidget(subtitle)
 
         header_layout.addWidget(logo)
-        header_layout.addLayout(title_block)
+        header_layout.addWidget(title)
         header_layout.addStretch(1)
 
         self._gpu = GpuMeter(self._theme.colors)
