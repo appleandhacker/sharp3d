@@ -97,22 +97,32 @@ class Sharp3DPipeline:
         g_ndc = self.predictor.predict(img_resized, df)
 
         if progress_callback:
-            progress_callback("Unprojecting to world space...")
-
-        g_world = fast_unproject(
-            g_ndc,
-            torch.eye(4, device=self.device),
-            intrinsics_resized,
-            INTERNAL_SHAPE,
-            decompose_method=self.decompose_method,
-        )
-
-        if progress_callback:
             progress_callback("Rendering SBS...")
 
-        sbs_img, (sw, sh) = render_sbs(
-            g_world, f_px, orig_w, orig_h, ipd=self.ipd
-        )
+        if output_depth:
+            # Depth rendering needs world-space gaussians.
+            g_world = fast_unproject(
+                g_ndc,
+                torch.eye(4, device=self.device),
+                intrinsics_resized,
+                INTERNAL_SHAPE,
+                decompose_method=self.decompose_method,
+            )
+            sbs_img, (sw, sh) = render_sbs(
+                g_world, f_px, orig_w, orig_h, ipd=self.ipd
+            )
+        else:
+            # Fast path: fold the unprojection into the view matrices and
+            # render the NDC gaussians directly (skips the per-frame
+            # covariance compose→transform→eigendecompose round-trip).
+            from sharp.utils.gaussians import get_unprojection_matrix
+            U = get_unprojection_matrix(
+                torch.eye(4, device=self.device),
+                intrinsics_resized, INTERNAL_SHAPE,
+            )
+            sbs_img, (sw, sh) = render_sbs(
+                g_ndc, f_px, orig_w, orig_h, ipd=self.ipd, ndc_transform=U
+            )
 
         torch.cuda.synchronize()
         elapsed = time.time() - t0
@@ -137,7 +147,9 @@ class Sharp3DPipeline:
             result["depth_path"] = str(depth_path)
 
         # Cleanup
-        del g_world, g_ndc, sbs_img
+        if output_depth:
+            del g_world
+        del g_ndc, sbs_img
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -222,7 +234,6 @@ class Sharp3DPipeline:
 
         # Temporal stabilization (same as GUI path).
         from .temporal import TemporalStabilizer, KalmanScalar
-        from .render import _compute_focus_depth_gpu
         stab = TemporalStabilizer(mode="adaptive", device=self.device)
         conv_kf = KalmanScalar(q_pos=0.05, q_vel=0.02, r=0.15)
 
@@ -237,13 +248,17 @@ class Sharp3DPipeline:
                 prepared = prepare_input(frm, f_px, self.device,
                                          async_upload=True)
                 upload_done = side_stream.record_event()
-            # CPU-side wait: the pinned host buffer must not be reused (by the
-            # next frame's pin_memory) while the async copy still reads it.
-            # Only the CPU stalls ~10ms; the GPU keeps rendering in parallel.
-            upload_done.synchronize()
+            # No CPU-side event wait here. PyTorch's CachingHostAllocator
+            # records an event on the copy stream when the pinned block is
+            # freed, so a later pin_memory() can only reuse it after the copy
+            # finished — buffer safety does not need a manual synchronize.
+            # Waiting here would stall the CPU *before* the current frame's
+            # GPU work is even submitted (the caller prepares frame N+1 first),
+            # leaving the GPU idle every frame and defeating the prefetch.
             return prepared, upload_done
 
         i = 0
+        unproj = None  # lazily built on frame 0 (intrinsics are constant)
         first = frame_q.get()
         if first is not None:
             prepared, upload_done = _prepare_async(first)
@@ -262,27 +277,35 @@ class Sharp3DPipeline:
 
                 g_ndc = self.predictor.predict(img_resized, df)
                 stab.stabilize(g_ndc, img=img_resized)
-                g_world = fast_unproject(
-                    g_ndc,
-                    torch.eye(4, device=self.device),
-                    intrinsics_resized,
-                    INTERNAL_SHAPE,
-                    decompose_method=self.decompose_method,
-                )
-                # Convergence Kalman smoothing (auto mode).
-                focus = _compute_focus_depth_gpu(g_world.mean_vectors)
+                if unproj is None:
+                    from sharp.utils.gaussians import get_unprojection_matrix
+                    unproj = get_unprojection_matrix(
+                        torch.eye(4, device=self.device),
+                        intrinsics_resized, INTERNAL_SHAPE,
+                    ).detach()
+                # Convergence Kalman smoothing (auto mode). World-space z is
+                # a linear readout of the NDC means (row 2 of U) — cheaper
+                # than unprojecting all gaussians.
+                from .temporal import _mean_view
+                mv = _mean_view(g_ndc).float()
+                z_world = mv @ unproj[2, :3] + unproj[2, 3]
+                z_pos = z_world[z_world > 0]
+                focus = (max(2.0, float(torch.quantile(z_pos, 0.50)))
+                         if z_pos.numel() else 2.0)
                 frame_conv = conv_kf.update(focus)
                 sbs_img, _ = render_sbs(
-                    g_world, f_px, orig_w, orig_h, ipd=self.ipd,
-                    convergence=frame_conv,
+                    g_ndc, f_px, orig_w, orig_h, ipd=self.ipd,
+                    convergence=frame_conv, ndc_transform=unproj,
                 )
 
-                torch.cuda.synchronize()
+                packed = pack_stereo(format, sbs_img)
+                # packed.cpu() is a blocking copy — it implicitly waits for
+                # the render stream, so no torch.cuda.synchronize() is needed
+                # (a device-wide sync would also stall on the next frame's
+                # side-stream upload and break the overlap).
+                sbs_np = packed.cpu().numpy()
                 dt = time.time() - t0
                 frame_times.append(dt)
-
-                packed = pack_stereo(format, sbs_img)
-                sbs_np = packed.cpu().numpy()
                 if want_hdr:
                     writer.write_frame(sbs_np)
                 else:
@@ -292,7 +315,7 @@ class Sharp3DPipeline:
                     progress_callback(i, n_frames, 1.0 / dt)
                 i += 1
 
-                del g_world, g_ndc, sbs_img, img_resized, prepared
+                del g_ndc, sbs_img, img_resized, prepared
                 # No per-frame empty_cache(): constant shapes mean the caching
                 # allocator reuses blocks; empty_cache only adds sync + churn.
 

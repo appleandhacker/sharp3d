@@ -69,12 +69,22 @@ class VideoConversionEngine:
         self._stab = TemporalStabilizer(mode=stabilize_mode, device=device)
         self._conv_kf = KalmanScalar(q_pos=0.05, q_vel=0.02, r=0.15)
         self._eye4 = torch.eye(4, device=device)
+        self._unproj = None  # lazily cached (4, 4) NDC→world matrix
+
+    def _get_unprojection(self, ir) -> torch.Tensor:
+        """(4, 4) NDC→world matrix; cached — intrinsics are fixed per video."""
+        if self._unproj is None:
+            from sharp.utils.gaussians import get_unprojection_matrix
+            self._unproj = get_unprojection_matrix(
+                self._eye4, ir, INTERNAL_SHAPE).detach()
+        return self._unproj
 
     @torch.no_grad()
     def process_frame(self, img_r, df, ir, orig_size: tuple[int, int],
                       return_depth: bool = False,
-                      return_gaussians: bool = False):
-        """Process one prepared frame → stereo-packed numpy array.
+                      return_gaussians: bool = False,
+                      download: bool = True):
+        """Process one prepared frame → stereo-packed frame.
 
         Args:
             img_r: (1, 3, 1536, 1536) float tensor.
@@ -83,9 +93,14 @@ class VideoConversionEngine:
             orig_size: (W, H) of original frame.
             return_depth: Also return a depth map (H, W, 3) uint8 numpy array.
             return_gaussians: Also return the world-space Gaussians3D object.
+            download: True → return a CPU numpy frame (blocking D2H copy).
+                False → return the GPU uint8 tensor instead; the caller owns
+                the D2H copy (e.g. pinned + async) and can overlap it with
+                the next frame's compute.
 
         Returns:
-            packed_np: (H_out, W_out, 3) uint8 numpy array.
+            packed: (H_out, W_out, 3) uint8 numpy array (download=True) or
+                    GPU uint8 tensor (download=False).
             depth_np: (H, W, 3) uint8 depth map (only if return_depth=True).
             gaussians: Gaussians3D (only if return_gaussians=True).
         """
@@ -100,22 +115,42 @@ class VideoConversionEngine:
         if self._edge_soften:
             self._soften_depth_edges(g_ndc)
 
-        # Unproject NDC → world
-        g = fast_unproject(g_ndc, self._eye4, ir,
-                           INTERNAL_SHAPE, decompose_method=self._decompose)
-        del g_ndc
+        # World-space gaussians are only needed for the optional depth/PLY
+        # outputs. The main render folds the unprojection into the view
+        # matrices instead (see render_sbs ndc_transform), skipping the
+        # per-frame compose→transform→eigendecompose round-trip entirely.
+        need_world = return_depth or return_gaussians
+        if need_world:
+            g = fast_unproject(g_ndc, self._eye4, ir,
+                               INTERNAL_SHAPE, decompose_method=self._decompose)
+            focus = _compute_focus_depth_gpu(g.mean_vectors,
+                                             q_focus=self._convergence_q)
+        else:
+            g = None
+            U = self._get_unprojection(ir)
+            from .temporal import _mean_view
+            mv = _mean_view(g_ndc).float()
+            # z_world = row 2 of the unprojection applied to NDC means
+            z_world = mv @ U[2, :3] + U[2, 3]
+            z_pos = z_world[z_world > 0]
+            focus = (max(2.0, float(torch.quantile(z_pos, self._convergence_q)))
+                     if z_pos.numel() else 2.0)
 
-        # Convergence: compute focus depth at specified quantile + Kalman smooth
-        focus = _compute_focus_depth_gpu(g.mean_vectors,
-                                         q_focus=self._convergence_q)
         if scene_cut:
             self._conv_kf.reset()
         frame_conv = self._conv_kf.update(focus)
 
         # Render stereo pair + pack format
-        sbs, _ = render_sbs(g, self._f_px, w, h,
-                            ipd=self._ipd, convergence=frame_conv,
-                            render_width=self._render_width)
+        if g is not None:
+            sbs, _ = render_sbs(g, self._f_px, w, h,
+                                ipd=self._ipd, convergence=frame_conv,
+                                render_width=self._render_width)
+        else:
+            sbs, _ = render_sbs(g_ndc, self._f_px, w, h,
+                                ipd=self._ipd, convergence=frame_conv,
+                                render_width=self._render_width,
+                                ndc_transform=self._unproj)
+            del g_ndc
         packed = pack_stereo(self._fmt, sbs)
 
         # Optional depth map
@@ -125,9 +160,16 @@ class VideoConversionEngine:
             depth = render_depth_map(g, self._f_px, w, h)
             depth_np = depth.cpu().numpy()
 
-        torch.cuda.synchronize()
-        result = packed.cpu().numpy()
-        del sbs, packed
+        if download:
+            # No torch.cuda.synchronize() here: packed.cpu() is a blocking D2H
+            # copy ordered on the current stream, which already guarantees the
+            # render finished. A device-wide sync would additionally wait for
+            # the side-stream prefetch of the next frame and break the overlap.
+            result = packed.cpu().numpy()
+            del packed
+        else:
+            result = packed  # GPU tensor; caller handles the D2H copy
+        del sbs
 
         if return_gaussians:
             return result, depth_np, g
@@ -145,7 +187,9 @@ class VideoConversionEngine:
         """
         import torch.nn.functional as F
 
-        z = g_ndc.mean_vectors[:, 2].float()
+        from .temporal import _mean_view  # BUG#9: squeeze [1, N, 3] batch dim
+        mv = _mean_view(g_ndc)
+        z = mv[:, 2].float()
         N = z.numel()
 
         # Infer spatial layout (L, H, W)
@@ -182,7 +226,7 @@ class VideoConversionEngine:
 
         # Blend: at edges use blurred, elsewhere keep original
         z_out = edge_weight * z_blur + (1.0 - edge_weight) * z_map
-        g_ndc.mean_vectors[:, 2] = z_out.reshape(-1).to(g_ndc.mean_vectors.dtype)
+        mv[:, 2] = z_out.reshape(-1).to(mv.dtype)
 
     def reset(self) -> None:
         """Reset temporal state (call between videos in batch mode)."""

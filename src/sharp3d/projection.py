@@ -10,10 +10,44 @@ All operations are GPU-accelerated via PyTorch (bilinear grid_sample).
 from __future__ import annotations
 
 import math
+from collections import OrderedDict
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+
+
+# ─── Sampling-geometry caches ────────────────────────────────────────────────
+# Video conversion calls the projection functions every frame with identical
+# parameters, but the sampling geometry (rays → UV grids, face assignment)
+# depends only on (resolution, projection, device) — not on frame content.
+# Recomputing it per frame costs several ms and hundreds of MB of traffic
+# (plus GPU→CPU syncs in the old cubemap_to_equirect). Cache it instead.
+
+_CACHE_MAX = 4  # a couple of resolutions per session is typical
+_input_grid_cache: OrderedDict = OrderedDict()    # image → cubemap faces
+_equirect_plan_cache: OrderedDict = OrderedDict()  # faces → equirect
+
+
+def _lru_get(cache: OrderedDict, key):
+    try:
+        val = cache.pop(key)
+    except KeyError:
+        return None
+    cache[key] = val  # reinsert as most-recently-used
+    return val
+
+
+def _lru_put(cache: OrderedDict, key, val) -> None:
+    cache[key] = val
+    while len(cache) > _CACHE_MAX:
+        cache.popitem(last=False)
+
+
+def clear_projection_caches() -> None:
+    """Free all cached sampling grids (e.g. after a conversion finishes)."""
+    _input_grid_cache.clear()
+    _equirect_plan_cache.clear()
 
 
 # ─── Cubemap geometry ────────────────────────────────────────────────────────
@@ -176,17 +210,23 @@ def equirect_to_hemisphere(
         image = image.permute(2, 0, 1).unsqueeze(0)
     device = image.device
 
-    rays = _hemisphere_face_rays(face_size, device, fov_scale)
-    rays_flat = rays.reshape(_N_HEMI_FACES, -1, 3)
+    key = ("eq2hemi", face_size, float(fov_scale), device.index)
+    grid = _lru_get(_input_grid_cache, key)
+    if grid is None:
+        rays = _hemisphere_face_rays(face_size, device, fov_scale)
+        rays_flat = rays.reshape(_N_HEMI_FACES, -1, 3)
 
-    x, y, z = rays_flat[..., 0], rays_flat[..., 1], rays_flat[..., 2]
-    lon = torch.atan2(x, z)
-    lat = torch.asin(y.clamp(-1, 1))
+        x, y, z = rays_flat[..., 0], rays_flat[..., 1], rays_flat[..., 2]
+        lon = torch.atan2(x, z)
+        lat = torch.asin(y.clamp(-1, 1))
 
-    u = lon / math.pi
-    v = -lat / (math.pi / 2)
+        u = lon / math.pi
+        v = -lat / (math.pi / 2)
 
-    grid = torch.stack([u, v], dim=-1).reshape(_N_HEMI_FACES, face_size, face_size, 2)
+        grid = torch.stack([u, v], dim=-1).reshape(
+            _N_HEMI_FACES, face_size, face_size, 2).contiguous()
+        _lru_put(_input_grid_cache, key, grid)
+
     img_expanded = image.expand(_N_HEMI_FACES, -1, -1, -1)
     faces = F.grid_sample(img_expanded, grid, mode="bilinear",
                           padding_mode="border", align_corners=True)
@@ -208,34 +248,41 @@ def fisheye_to_hemisphere(
     if image.dim() == 3:
         image = image.permute(2, 0, 1).unsqueeze(0)
     device = image.device
-    _, C, H, W = image.shape
 
-    rays = _hemisphere_face_rays(face_size, device, fov_scale)
-    rays_flat = rays.reshape(_N_HEMI_FACES, -1, 3)
+    key = ("fish2hemi", face_size, float(fov_scale), model,
+           tuple(coeffs) if coeffs else None, float(fisheye_fov), device.index)
+    cached = _lru_get(_input_grid_cache, key)
+    if cached is None:
+        rays = _hemisphere_face_rays(face_size, device, fov_scale)
+        rays_flat = rays.reshape(_N_HEMI_FACES, -1, 3)
 
-    # Fisheye camera looks along +Z
-    x, y, z = rays_flat[..., 0], rays_flat[..., 1], rays_flat[..., 2]
-    theta = torch.acos(z.clamp(-1, 1))
+        # Fisheye camera looks along +Z
+        x, y, z = rays_flat[..., 0], rays_flat[..., 1], rays_flat[..., 2]
+        theta = torch.acos(z.clamp(-1, 1))
 
-    r_norm = _fisheye_theta_to_r(theta, model, coeffs)
-    max_theta = math.radians(fisheye_fov / 2.0)
-    max_r = _fisheye_theta_to_r(
-        torch.tensor(max_theta, device=device), model, coeffs)
+        r_norm = _fisheye_theta_to_r(theta, model, coeffs)
+        max_theta = math.radians(fisheye_fov / 2.0)
+        max_r = _fisheye_theta_to_r(
+            torch.tensor(max_theta, device=device), model, coeffs)
 
-    phi = torch.atan2(y, x)
-    r_px = r_norm / max_r
-    u = r_px * torch.cos(phi)
-    v = -r_px * torch.sin(phi)
+        phi = torch.atan2(y, x)
+        r_px = r_norm / max_r
+        u = r_px * torch.cos(phi)
+        v = -r_px * torch.sin(phi)
 
-    valid = theta <= max_theta
-    grid = torch.stack([u, v], dim=-1).reshape(_N_HEMI_FACES, face_size, face_size, 2)
+        valid = theta <= max_theta
+        grid = torch.stack([u, v], dim=-1).reshape(
+            _N_HEMI_FACES, face_size, face_size, 2).contiguous()
+        valid_mask = valid.reshape(_N_HEMI_FACES, 1, face_size, face_size).float()
+        cached = (grid, valid_mask)
+        _lru_put(_input_grid_cache, key, cached)
 
+    grid, valid_mask = cached
     img_expanded = image.expand(_N_HEMI_FACES, -1, -1, -1)
     faces = F.grid_sample(img_expanded, grid, mode="bilinear",
                           padding_mode="zeros", align_corners=True)
     # Zero out invalid pixels
-    valid_mask = valid.reshape(_N_HEMI_FACES, 1, face_size, face_size)
-    faces = faces * valid_mask.float()
+    faces = faces * valid_mask
     return faces
 
 
@@ -377,24 +424,27 @@ def equirect_to_cubemap(
     if image.dim() == 3:
         image = image.permute(2, 0, 1).unsqueeze(0)  # [1, 3, H, W]
     device = image.device
-    _, C, H, W = image.shape
 
-    rays = _cubemap_face_rays(face_size, device, fov_scale)  # [6, fh, fw, 3]
-    rays_flat = rays.reshape(6, -1, 3)  # [6, N, 3]
+    key = ("eq2cube", face_size, float(fov_scale), device.index)
+    grid = _lru_get(_input_grid_cache, key)
+    if grid is None:
+        rays = _cubemap_face_rays(face_size, device, fov_scale)  # [6, fh, fw, 3]
+        rays_flat = rays.reshape(6, -1, 3)  # [6, N, 3]
 
-    # Convert ray directions to equirectangular UV
-    x, y, z = rays_flat[..., 0], rays_flat[..., 1], rays_flat[..., 2]
-    # longitude: atan2(x, z) → [-π, π]
-    lon = torch.atan2(x, z)
-    # latitude: asin(y / norm) → [-π/2, π/2]
-    lat = torch.asin(y.clamp(-1, 1))
+        # Convert ray directions to equirectangular UV
+        x, y, z = rays_flat[..., 0], rays_flat[..., 1], rays_flat[..., 2]
+        # longitude: atan2(x, z) → [-π, π]
+        lon = torch.atan2(x, z)
+        # latitude: asin(y / norm) → [-π/2, π/2]
+        lat = torch.asin(y.clamp(-1, 1))
 
-    # Normalize to [-1, 1] for grid_sample
-    u = lon / math.pi        # [-1, 1]
-    v = -lat / (math.pi / 2) # [-1, 1] (flip: top = +90°)
+        # Normalize to [-1, 1] for grid_sample
+        u = lon / math.pi        # [-1, 1]
+        v = -lat / (math.pi / 2) # [-1, 1] (flip: top = +90°)
 
-    grid = torch.stack([u, v], dim=-1)  # [6, N, 2]
-    grid = grid.reshape(6, face_size, face_size, 2)
+        grid = torch.stack([u, v], dim=-1)  # [6, N, 2]
+        grid = grid.reshape(6, face_size, face_size, 2).contiguous()
+        _lru_put(_input_grid_cache, key, grid)
 
     # Sample each face
     img_expanded = image.expand(6, -1, -1, -1)  # [6, 3, H, W]
@@ -460,39 +510,46 @@ def fisheye_to_cubemap(
     if image.dim() == 3:
         image = image.permute(2, 0, 1).unsqueeze(0)
     device = image.device
-    _, C, H, W = image.shape
 
-    rays = _cubemap_face_rays(face_size, device, fov_scale)  # [6, fh, fw, 3]
-    rays_flat = rays.reshape(6, -1, 3)
+    key = ("fish2cube", face_size, float(fov_scale), model,
+           tuple(coeffs) if coeffs else None, float(fisheye_fov), device.index)
+    cached = _lru_get(_input_grid_cache, key)
+    if cached is None:
+        rays = _cubemap_face_rays(face_size, device, fov_scale)  # [6, fh, fw, 3]
+        rays_flat = rays.reshape(6, -1, 3)
 
-    # Fisheye camera looks along +Z, image plane is XY
-    # Incidence angle from optical axis
-    x, y, z = rays_flat[..., 0], rays_flat[..., 1], rays_flat[..., 2]
-    theta = torch.acos(z.clamp(-1, 1))  # angle from +Z axis
+        # Fisheye camera looks along +Z, image plane is XY
+        # Incidence angle from optical axis
+        x, y, z = rays_flat[..., 0], rays_flat[..., 1], rays_flat[..., 2]
+        theta = torch.acos(z.clamp(-1, 1))  # angle from +Z axis
 
-    # Radial distance in image plane (normalized)
-    r_norm = _fisheye_theta_to_r(theta, model, coeffs)
+        # Radial distance in image plane (normalized)
+        r_norm = _fisheye_theta_to_r(theta, model, coeffs)
 
-    # Max theta for the fisheye FOV
-    max_theta = math.radians(fisheye_fov / 2.0)
-    max_r = _fisheye_theta_to_r(
-        torch.tensor(max_theta, device=device), model, coeffs
-    )
+        # Max theta for the fisheye FOV
+        max_theta = math.radians(fisheye_fov / 2.0)
+        max_r = _fisheye_theta_to_r(
+            torch.tensor(max_theta, device=device), model, coeffs
+        )
 
-    # Azimuthal angle in image plane
-    phi = torch.atan2(y, x)
+        # Azimuthal angle in image plane
+        phi = torch.atan2(y, x)
 
-    # Image coordinates (normalized to [-1, 1] for grid_sample)
-    r_px = r_norm / max_r  # normalize to [0, 1] at edge of fisheye
-    u = r_px * torch.cos(phi)
-    v = -r_px * torch.sin(phi)  # negate: scene up → image top (v=-1)
+        # Image coordinates (normalized to [-1, 1] for grid_sample)
+        r_px = r_norm / max_r  # normalize to [0, 1] at edge of fisheye
+        u = r_px * torch.cos(phi)
+        v = -r_px * torch.sin(phi)  # negate: scene up → image top (v=-1)
 
-    # Mask: pixels beyond fisheye FOV are invalid
-    valid = theta <= max_theta
+        # Mask: pixels beyond fisheye FOV are invalid
+        valid = theta <= max_theta
 
-    grid = torch.stack([u, v], dim=-1)  # [6, N, 2]
-    grid = grid.reshape(6, face_size, face_size, 2)
+        grid = torch.stack([u, v], dim=-1)  # [6, N, 2]
+        grid = grid.reshape(6, face_size, face_size, 2).contiguous()
+        valid_mask = valid.reshape(6, 1, face_size, face_size).float()
+        cached = (grid, valid_mask)
+        _lru_put(_input_grid_cache, key, cached)
 
+    grid, valid_mask = cached
     img_expanded = image.expand(6, -1, -1, -1)
     faces = F.grid_sample(
         img_expanded, grid, mode="bilinear",
@@ -500,13 +557,98 @@ def fisheye_to_cubemap(
     )
 
     # Zero out invalid pixels
-    valid_mask = valid.reshape(6, 1, face_size, face_size).float()
     faces = faces * valid_mask
 
     return faces
 
 
 # ─── Output: Cubemap faces → Equirectangular ─────────────────────────────────
+
+def _build_equirect_plan(
+    out_w: int,
+    out_h: int,
+    half_sphere: bool,
+    device: torch.device,
+) -> list[tuple[int, Tensor, Tensor]]:
+    """Precompute per-face (flat pixel indices, sampling grid) for assembly.
+
+    The plan depends only on (out_w, out_h, half_sphere, device), so video
+    loops build it once and reuse it every frame — the old per-frame path
+    recomputed ~25 full-resolution grid kernels and issued 6 GPU→CPU syncs
+    (mask.any()) plus 6 boolean nonzero passes per eye.
+
+    Returns a list of (face_index, flat_indices [M], grid [1, 1, M, 2]),
+    containing only faces that actually receive pixels.
+    """
+    # Generate equirectangular pixel grid
+    # longitude: [-π, π] or [-π/2, π/2] for half_sphere
+    lon_max = math.pi / 2 if half_sphere else math.pi
+    lon = torch.linspace(-lon_max, lon_max, out_w, device=device)
+    lat = torch.linspace(math.pi / 2, -math.pi / 2, out_h, device=device)
+    grid_lat, grid_lon = torch.meshgrid(lat, lon, indexing="ij")
+
+    # Convert to 3D ray directions
+    x = torch.cos(grid_lat) * torch.sin(grid_lon)
+    y = torch.sin(grid_lat)
+    z = torch.cos(grid_lat) * torch.cos(grid_lon)
+
+    abs_x = x.abs()
+    abs_y = y.abs()
+    abs_z = z.abs()
+
+    # Determine dominant axis (face selection)
+    face_idx = torch.zeros(out_h, out_w, dtype=torch.long, device=device)
+    face_idx[(x > 0) & (abs_x >= abs_y) & (abs_x >= abs_z)] = 0   # +X
+    face_idx[(x < 0) & (abs_x >= abs_y) & (abs_x >= abs_z)] = 1   # -X
+    face_idx[(y > 0) & (abs_y > abs_x) & (abs_y >= abs_z)] = 2    # +Y
+    face_idx[(y < 0) & (abs_y > abs_x) & (abs_y >= abs_z)] = 3    # -Y
+    face_idx[(z > 0) & (abs_z > abs_x) & (abs_z > abs_y)] = 4     # +Z
+    face_idx[(z < 0) & (abs_z > abs_x) & (abs_z > abs_y)] = 5     # -Z
+
+    # Compute UV on each face using the face's projection
+    u = torch.zeros(out_h, out_w, device=device)
+    v = torch.zeros(out_h, out_w, device=device)
+
+    mask = face_idx == 0  # +X: u = -z/x, v = y/x (OpenCV: Y-down)
+    u[mask] = -z[mask] / abs_x[mask]
+    v[mask] = y[mask] / abs_x[mask]
+
+    mask = face_idx == 1  # -X: u = z/|x|, v = y/|x|
+    u[mask] = z[mask] / abs_x[mask]
+    v[mask] = y[mask] / abs_x[mask]
+
+    mask = face_idx == 2  # +Y: u = x/y, v = -z/y
+    u[mask] = x[mask] / abs_y[mask]
+    v[mask] = -z[mask] / abs_y[mask]
+
+    mask = face_idx == 3  # -Y: u = x/|y|, v = z/|y|
+    u[mask] = x[mask] / abs_y[mask]
+    v[mask] = z[mask] / abs_y[mask]
+
+    mask = face_idx == 4  # +Z: u = x/z, v = y/z
+    u[mask] = x[mask] / abs_z[mask]
+    v[mask] = y[mask] / abs_z[mask]
+
+    mask = face_idx == 5  # -Z: u = -x/|z|, v = y/|z|
+    u[mask] = -x[mask] / abs_z[mask]
+    v[mask] = y[mask] / abs_z[mask]
+
+    u = u.clamp(-1, 1)
+    v = v.clamp(-1, 1)
+
+    plan = []
+    flat_face_idx = face_idx.reshape(-1)
+    flat_u = u.reshape(-1)
+    flat_v = v.reshape(-1)
+    for fi in range(6):
+        idx = (flat_face_idx == fi).nonzero(as_tuple=True)[0]
+        if idx.numel() == 0:
+            continue
+        grid_f = torch.stack([flat_u[idx], flat_v[idx]], dim=-1)
+        grid_f = grid_f.reshape(1, 1, -1, 2).contiguous()
+        plan.append((fi, idx, grid_f))
+    return plan
+
 
 def cubemap_to_equirect(
     faces: Tensor,
@@ -525,104 +667,21 @@ def cubemap_to_equirect(
         equirect: [out_h, out_w, 3] equirectangular image.
     """
     device = faces.device
-    face_size = faces.shape[2]
 
-    # Generate equirectangular pixel grid
-    # longitude: [-π, π] or [-π/2, π/2] for half_sphere
-    lon_max = math.pi / 2 if half_sphere else math.pi
-    lon = torch.linspace(-lon_max, lon_max, out_w, device=device)
-    lat = torch.linspace(math.pi / 2, -math.pi / 2, out_h, device=device)
-    grid_lat, grid_lon = torch.meshgrid(lat, lon, indexing="ij")
+    key = (out_w, out_h, half_sphere, device.index)
+    plan = _lru_get(_equirect_plan_cache, key)
+    if plan is None:
+        plan = _build_equirect_plan(out_w, out_h, half_sphere, device)
+        _lru_put(_equirect_plan_cache, key, plan)
 
-    # Convert to 3D ray directions
-    x = torch.cos(grid_lat) * torch.sin(grid_lon)
-    y = torch.sin(grid_lat)
-    z = torch.cos(grid_lat) * torch.cos(grid_lon)
-    dirs = torch.stack([x, y, z], dim=-1)  # [out_h, out_w, 3]
-
-    # For each pixel, determine which cubemap face it belongs to
-    # and compute the UV coordinate on that face
-    abs_x = x.abs()
-    abs_y = y.abs()
-    abs_z = z.abs()
-
-    # Determine dominant axis (face selection)
-    # +X: x > 0 and abs_x >= abs_y and abs_x >= abs_z
-    # -X: x < 0 and abs_x >= abs_y and abs_x >= abs_z
-    # +Y: y > 0 and abs_y > abs_x and abs_y >= abs_z
-    # -Y: y < 0 and abs_y > abs_x and abs_y >= abs_z
-    # +Z: z > 0 and abs_z > abs_x and abs_z > abs_y
-    # -Z: z < 0 and abs_z > abs_x and abs_z > abs_y
-    face_idx = torch.zeros(out_h, out_w, dtype=torch.long, device=device)
-    face_idx[(x > 0) & (abs_x >= abs_y) & (abs_x >= abs_z)] = 0   # +X
-    face_idx[(x < 0) & (abs_x >= abs_y) & (abs_x >= abs_z)] = 1   # -X
-    face_idx[(y > 0) & (abs_y > abs_x) & (abs_y >= abs_z)] = 2    # +Y
-    face_idx[(y < 0) & (abs_y > abs_x) & (abs_y >= abs_z)] = 3    # -Y
-    face_idx[(z > 0) & (abs_z > abs_x) & (abs_z > abs_y)] = 4     # +Z
-    face_idx[(z < 0) & (abs_z > abs_x) & (abs_z > abs_y)] = 5     # -Z
-
-    # Compute UV on each face using the face's projection
-    # For each face, project the 3D direction onto the face plane
-    u = torch.zeros(out_h, out_w, device=device)
-    v = torch.zeros(out_h, out_w, device=device)
-
-    # +X face: u = -z/x, v = y/x (OpenCV: Y-down)
-    mask = face_idx == 0
-    u[mask] = -z[mask] / abs_x[mask]
-    v[mask] = y[mask] / abs_x[mask]
-
-    # -X face: u = z/|x|, v = y/|x|
-    mask = face_idx == 1
-    u[mask] = z[mask] / abs_x[mask]
-    v[mask] = y[mask] / abs_x[mask]
-
-    # +Y face: u = x/y, v = -z/y
-    mask = face_idx == 2
-    u[mask] = x[mask] / abs_y[mask]
-    v[mask] = -z[mask] / abs_y[mask]
-
-    # -Y face: u = x/|y|, v = z/|y|
-    mask = face_idx == 3
-    u[mask] = x[mask] / abs_y[mask]
-    v[mask] = z[mask] / abs_y[mask]
-
-    # +Z face: u = x/z, v = y/z
-    mask = face_idx == 4
-    u[mask] = x[mask] / abs_z[mask]
-    v[mask] = y[mask] / abs_z[mask]
-
-    # -Z face: u = -x/|z|, v = y/|z|
-    mask = face_idx == 5
-    u[mask] = -x[mask] / abs_z[mask]
-    v[mask] = y[mask] / abs_z[mask]
-
-    # Clamp to [-1, 1]
-    u = u.clamp(-1, 1)
-    v = v.clamp(-1, 1)
-
-    # Sample from the appropriate face using grid_sample per face
     equirect = torch.zeros(out_h, out_w, 3, device=device)
-
-    for fi in range(6):
-        mask = (face_idx == fi)  # [out_h, out_w]
-        if not mask.any():
-            continue
-
-        # Build grid for this face's pixels
-        face_grid = torch.stack([u[mask], v[mask]], dim=-1)  # [N, 2]
-        n_pix = face_grid.shape[0]
-
-        # Reshape for grid_sample: need [1, 3, H, W] input and [1, H_out, W_out, 2] grid
-        # We'll use a 1×N grid
-        face_grid_4d = face_grid.reshape(1, 1, n_pix, 2)
-        face_img = faces[fi:fi+1]  # [1, 3, face_size, face_size]
-
+    flat = equirect.view(-1, 3)
+    for fi, idx, grid_f in plan:
         sampled = F.grid_sample(
-            face_img, face_grid_4d, mode="bilinear",
+            faces[fi:fi + 1], grid_f, mode="bilinear",
             padding_mode="border", align_corners=True,
-        )  # [1, 3, 1, N]
-
-        equirect[mask] = sampled[0, :, 0, :].T  # [N, 3]
+        )  # [1, 3, 1, M]
+        flat[idx] = sampled[0, :, 0, :].T  # int64-index scatter, no nonzero
 
     return equirect
 

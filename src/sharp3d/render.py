@@ -44,7 +44,14 @@ def _compute_focus_depth_gpu(means: torch.Tensor, min_depth_focus: float = 2.0,
         0.50 = 50% of geometry is in front of the screen (pops out),
         50% is behind. Default 0.50 gives strong foreground pop with
         balanced depth distribution.
+
+    BUG#9 FIX: callers pass the raw Gaussians3D.mean_vectors with the batch
+    dim intact ([1, N, 3]); means[:, 2] on that tensor selects gaussian #2's
+    xyz (shape [1, 3]) instead of every gaussian's z (shape [N]) — the focus
+    depth degenerated to ~min_depth_focus. Squeeze the batch dim first.
     """
+    if means.ndim == 3:
+        means = means[0]
     depth_values = means[:, 2]  # z-coordinate = depth (identity extrinsics)
     depth_values = depth_values[depth_values > 0]
     if depth_values.numel() == 0:
@@ -98,6 +105,7 @@ def render_sbs(
     ipd: float = 0.063,
     convergence: float | None = None,
     render_width: int | None = None,
+    ndc_transform: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, tuple[int, int]]:
     """Render stereoscopic SBS pair using batched gsplat rasterization.
 
@@ -106,7 +114,8 @@ def render_sbs(
     Instead computes focus depth and look-at matrices entirely on GPU (~1ms).
 
     Args:
-        gaussians: World-space Gaussians (unprojected).
+        gaussians: World-space Gaussians (unprojected). If `ndc_transform` is
+            given, these are *NDC-space* Gaussians straight from the predictor.
         f_px: Focal length in pixels (original image space).
         orig_w: Original image width.
         orig_h: Original image height.
@@ -114,6 +123,13 @@ def render_sbs(
         convergence: Convergence distance in scene units (None = auto focus).
         render_width: If set, render each eye at this width (preview mode,
                       faster). None = render at original resolution.
+        ndc_transform: Optional (4, 4) NDC→world unprojection matrix. When
+            provided, it is folded into the view matrices (viewmat' = V @ U)
+            instead of transforming the gaussians — mathematically identical
+            (Σ_cam = (V·U) Σ_ndc (V·U)ᵀ = V Σ_world Vᵀ; matrix multiplication
+            is associative), but skips the per-frame
+            compose-covariance → transform → eigendecompose round-trip over
+            1.18M gaussians (tens of ms per frame).
 
     Returns:
         sbs_image: (H, W*2, 3) uint8 tensor (left | right concatenated).
@@ -154,6 +170,14 @@ def render_sbs(
     # --- GPU-native camera setup (replaces 241ms CPU-bound create_camera_model) ---
     if convergence is not None:
         depth_focus = float(convergence)
+    elif ndc_transform is not None:
+        # World-space z is a linear readout of the NDC means (row 2 of U):
+        # z_world = U[2,:3] @ μ_ndc + U[2,3]. Cheaper than unprojecting.
+        U_f = ndc_transform.to(device=device, dtype=torch.float32)
+        z_world = means @ U_f[2, :3] + U_f[2, 3]
+        z_pos = z_world[z_world > 0]
+        depth_focus = (max(2.0, float(torch.quantile(z_pos, 0.50)))
+                       if z_pos.numel() else 2.0)
     else:
         depth_focus = _compute_focus_depth_gpu(means)
 
@@ -169,6 +193,11 @@ def render_sbs(
     left_ext = _look_at_extrinsics_gpu(left_eye, look_at, world_up)
     right_ext = _look_at_extrinsics_gpu(right_eye, look_at, world_up)
     viewmats = torch.stack([left_ext, right_ext], dim=0)  # (2, 4, 4)
+
+    if ndc_transform is not None:
+        # Fold NDC→world into the view matrices; gaussians stay in NDC space.
+        U_f = ndc_transform.to(device=device, dtype=torch.float32)
+        viewmats = viewmats @ U_f  # (2, 4, 4)
 
     # Intrinsics for gsplat: (2, 3, 3)
     K = torch.tensor([

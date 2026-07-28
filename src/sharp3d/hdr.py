@@ -138,6 +138,30 @@ def sdr_to_hdr10_filter() -> str:
 # Standard BT.2020 1000-nit mastering display metadata for x265 (HDR10).
 MASTER_DISPLAY = "G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(10000000,1)"
 MAX_CLL = "1000,400"
+# NVENC wants the same values but '|'-separated groups.
+MASTER_DISPLAY_NVENC = ("G(8500,39850)|B(6550,2300)|R(35400,14600)|"
+                        "WP(15635,16450)|L(10000000,1)")
+
+
+_NVENC_HDR10: bool | None = None
+
+
+def nvenc_hdr10_capable() -> bool:
+    """True if hevc_nvenc supports HDR10 metadata (-master_display). Cached."""
+    global _NVENC_HDR10
+    if _NVENC_HDR10 is None:
+        ok = False
+        if encoder_available("hevc_nvenc"):
+            try:
+                out = subprocess.run(
+                    [FFMPEG, "-hide_banner", "-h", "encoder=hevc_nvenc"],
+                    capture_output=True, creationflags=_NO_WINDOW,
+                ).stdout.decode("utf-8", "replace")
+                ok = "master_display" in out
+            except Exception:
+                ok = False
+        _NVENC_HDR10 = ok
+    return _NVENC_HDR10
 
 
 # --- Probing ----------------------------------------------------------------
@@ -304,13 +328,25 @@ class Hdr10Writer:
         # write to a temp file, mux audio later
         self.tmp_path = self.path.with_suffix(".tmp.mp4")
 
-        if codec == "av1" and encoder_available("libsvtav1"):
+        # Prefer hevc_nvenc for HEVC HDR10: the hardware encoder is ~10x
+        # faster than libx265 and carries the HDR10 static metadata itself
+        # (ffmpeg ≥ 6; capability is probed once above).
+        if (codec == "h265" and nvenc_hdr10_capable()
+                and max(width, height) <= 8192):
+            v_codec = "hevc_nvenc"
+            enc_params = [
+                "-profile:v", "main10",
+                "-rc", "vbr", "-qp", str(min(crf, 51)), "-b:v", "0",
+                "-preset", "p4",
+                "-master_display", MASTER_DISPLAY_NVENC,
+                "-max_cll", MAX_CLL,
+            ]
+        elif codec == "av1" and encoder_available("libsvtav1"):
             # SVT-AV1 can carry the HDR10 static metadata itself.
             v_codec = "libsvtav1"
             enc_params = ["-svtav1-params",
                           f"crf={crf}:master-display={MASTER_DISPLAY}:"
                           f"max-cll={MAX_CLL}"]
-            color_opts = []
         else:
             # No SVT-AV1 (e.g. a stripped ffmpeg build): other AV1 encoders
             # can't inject the HDR10 metadata reliably, so fall back to the
@@ -321,7 +357,6 @@ class Hdr10Writer:
                 f"master-display={MASTER_DISPLAY}:max-cll={MAX_CLL}"
             )
             enc_params = ["-x265-params", xparams]
-            color_opts = []
 
         cmd = [
             FFMPEG, "-y",

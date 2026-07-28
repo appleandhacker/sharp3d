@@ -608,14 +608,14 @@ class _PipelineWorker:
         if proj == "equirect360":
             from sharp3d.projection import get_cubemap_cameras, _FACE_DEFS
             viewmats, _ = get_cubemap_cameras(pred_face_size, device)
-            face_forwards = [fd[0] for fd in _FACE_DEFS]
+            face_forwards = [fd[0].to(device) for fd in _FACE_DEFS]
             n_faces = 6
             use_hemisphere = False
         else:
             from sharp3d.projection import (get_hemisphere_cameras,
                                             _HEMISPHERE_AXES)
             viewmats, _ = get_hemisphere_cameras(pred_face_size, device)
-            face_forwards = [ax[0] for ax in _HEMISPHERE_AXES]
+            face_forwards = [ax[0].to(device) for ax in _HEMISPHERE_AXES]
             n_faces = 4
             use_hemisphere = True
             seam_deg = 35.3
@@ -661,15 +661,24 @@ class _PipelineWorker:
         decoder = threading.Thread(target=_decode, daemon=True)
         decoder.start()
 
-        # Encode thread (overlaps encoding with GPU compute)
+        # Encode thread (overlaps encoding with GPU compute). Frames are
+        # downloaded D2H into pinned buffers non-blocking; the encode thread
+        # waits on the copy event, so the download overlaps GPU compute.
         encode_q: _queue.Queue = _queue.Queue(maxsize=3)
+        free_bufs: _queue.Queue = _queue.Queue()
+        for _ in range(3):
+            free_bufs.put(torch.empty((vid_h, vid_w, 3), dtype=torch.uint8,
+                                      pin_memory=True))
 
         def _encode_loop():
             while True:
                 item = encode_q.get()
                 if item is None:
                     break
-                writer.append_frame(item)
+                buf, ev = item
+                ev.synchronize()
+                writer.append_frame(buf.numpy())
+                free_bufs.put(buf)
 
         encode_thread = threading.Thread(target=_encode_loop, daemon=True)
         encode_thread.start()
@@ -678,12 +687,16 @@ class _PipelineWorker:
         want_depth = opts.get("depth", False)
         depth_writer = None
         if want_depth:
-            from sharp3d.projection import cubemap_to_equirect, cubemap_to_equirect180
+            from sharp3d.projection import (cubemap_to_equirect,
+                                            cubemap_to_equirect180,
+                                            get_cubemap_cameras)
             from gsplat.rendering import rasterization as _rast
             depth_path = out.with_stem(out.stem + "_depth")
             depth_writer = VideoWriter(str(depth_path), fps=out_fps,
                                        width=eye_w, height=eye_h,
                                        codec="h264", crf=18)
+            # Constant across frames — build once, not per frame.
+            viewmats_d, Ks_d = get_cubemap_cameras(render_face, device)
 
         # Main conversion loop
         n_done = 0
@@ -808,17 +821,19 @@ class _PipelineWorker:
                 device=device,
             )
 
-            # Encode (async)
-            encode_q.put(result.cpu().numpy())
+            # Encode (async D2H → encode thread)
+            buf = free_bufs.get()
+            buf.copy_(result, non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record()
+            encode_q.put((buf, ev))
             del result
 
             # Depth output (optional)
             if depth_writer is not None:
-                from sharp3d.projection import (cubemap_to_equirect as _c2e,
-                                               cubemap_to_equirect180 as _c2e180)
-                from gsplat.rendering import rasterization as _rast
-                depth_map_fn = _c2e180 if output_projection == "equirect180" else _c2e
-                viewmats_d, Ks_d = get_cubemap_cameras(render_face, device)
+                depth_map_fn = (cubemap_to_equirect180
+                                if output_projection == "equirect180"
+                                else cubemap_to_equirect)
                 with torch.no_grad():
                     rendered_d, _, _ = _rast(
                         means=merged.mean_vectors,
@@ -862,7 +877,8 @@ class _PipelineWorker:
                 del rendered_d, depths, depth_equirect, depth_vis
 
             del merged
-            torch.cuda.empty_cache()
+            # No per-frame empty_cache(): shapes are constant, the caching
+            # allocator reuses blocks; empty_cache only adds sync + churn.
 
             n_done += 1
             elapsed = time.time() - t_start
@@ -887,6 +903,11 @@ class _PipelineWorker:
         writer.close(source_video=source)
         if depth_writer is not None:
             depth_writer.close()
+
+        # Free cached projection grids (hundreds of MB at 4K) — they are
+        # rebuilt cheaply on the next conversion's first frame.
+        from sharp3d.projection import clear_projection_caches
+        clear_projection_caches()
 
         total_elapsed = time.time() - t_start
         avg = n_done / total_elapsed if total_elapsed > 0 else 0.0
@@ -918,13 +939,32 @@ class _PipelineWorker:
         t0 = time.time()
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
             g_ndc = self._compiled(img_r, df)
-        g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
-                           INTERNAL_SHAPE, decompose_method=method)
-        from sharp3d.render import _compute_focus_depth_gpu
         q = conv_q if conv_q else 0.50
-        conv_dist = _compute_focus_depth_gpu(g.mean_vectors, q_focus=q)
-        sbs, (sw, sh) = render_sbs(g, f_px, w, h, ipd=ipd_scene,
-                                   convergence=conv_dist, render_width=render_w)
+        need_world = opts.get("depth") or opts.get("ply")
+        if need_world:
+            g = fast_unproject(g_ndc, torch.eye(4, device=self._device), ir,
+                               INTERNAL_SHAPE, decompose_method=method)
+            from sharp3d.render import _compute_focus_depth_gpu
+            conv_dist = _compute_focus_depth_gpu(g.mean_vectors, q_focus=q)
+            sbs, (sw, sh) = render_sbs(g, f_px, w, h, ipd=ipd_scene,
+                                       convergence=conv_dist,
+                                       render_width=render_w)
+        else:
+            # Fast path: fold the unprojection into the view matrices and
+            # render NDC gaussians directly (skips the covariance
+            # compose→transform→eigendecompose round-trip).
+            from sharp.utils.gaussians import get_unprojection_matrix
+            from sharp3d.temporal import _mean_view
+            U = get_unprojection_matrix(torch.eye(4, device=self._device),
+                                        ir, INTERNAL_SHAPE)
+            mv = _mean_view(g_ndc).float()
+            z_world = mv @ U[2, :3] + U[2, 3]
+            z_pos = z_world[z_world > 0]
+            conv_dist = (max(2.0, float(torch.quantile(z_pos, q)))
+                         if z_pos.numel() else 2.0)
+            sbs, (sw, sh) = render_sbs(g_ndc, f_px, w, h, ipd=ipd_scene,
+                                       convergence=conv_dist,
+                                       render_width=render_w, ndc_transform=U)
         packed = pack_stereo(fmt, sbs)
         torch.cuda.synchronize()
         elapsed = time.time() - t0
@@ -940,7 +980,9 @@ class _PipelineWorker:
             from sharp.utils.gaussians import save_ply
             save_ply(g, f_px, (h, w), out.with_suffix(".ply"))
 
-        del g, g_ndc, sbs, packed
+        if need_world:
+            del g
+        del g_ndc, sbs, packed
         torch.cuda.empty_cache()
         gc.collect()
 
@@ -1080,16 +1122,30 @@ class _PipelineWorker:
         import queue as _queue
         encode_q: _queue.Queue = _queue.Queue(maxsize=3)
 
+        # Pinned download buffers: the main loop copies the rendered frame
+        # D2H non-blocking and hands (buffer, event) to the encode thread,
+        # which waits for the copy and writes the frame — so the download
+        # overlaps the next frame's GPU compute. Pinned memory also makes
+        # the copy itself ~2-3x faster than a pageable .cpu() (a 4K SBS
+        # frame is ~50 MB; pageable ~15 ms → pinned ~5 ms, fully hidden).
+        free_bufs: _queue.Queue = _queue.Queue()
+        for _ in range(3):
+            free_bufs.put(torch.empty((out_h, out_w, 3), dtype=torch.uint8,
+                                      pin_memory=True))
+
         def _encode_loop():
             while True:
                 item = encode_q.get()
                 if item is None:
                     break
-                frame_np, is_hdr = item
-                if is_hdr:
+                buf, ev = item
+                ev.synchronize()
+                frame_np = buf.numpy()
+                if hdr_out:
                     writer.write_frame(frame_np)
                 else:
                     writer.append_frame(frame_np)
+                free_bufs.put(buf)
 
         encode_thread = threading.Thread(target=_encode_loop, daemon=True)
         encode_thread.start()
@@ -1115,9 +1171,15 @@ class _PipelineWorker:
         want_ply = opts.get("ply", False)
         depth_writer = None
         if want_depth:
+            # BUG: render_depth_map always renders at the *source* resolution
+            # (via _get_screen_resolution(orig_w, orig_h)), not render_w/render_h.
+            # Declaring the writer at the scaled size corrupts the depth video
+            # whenever out_scale != 1 or a custom out_width is set.
+            from sharp3d.render import _get_screen_resolution
+            dw, dh = _get_screen_resolution(reader.width, reader.height)
             depth_path = out.with_stem(out.stem + "_depth")
             depth_writer = VideoWriter(str(depth_path), fps=out_fps,
-                                       width=render_w, height=render_h,
+                                       width=dw, height=dh,
                                        codec="h264", crf=18)
 
         # ── Main conversion loop ────────────────────────────────────────
@@ -1150,11 +1212,12 @@ class _PipelineWorker:
                         img_r, df, ir, (w, h),
                         return_depth=want_depth,
                         return_gaussians=want_ply,
+                        download=False,
                     )
 
                     # Unpack results
                     if want_ply:
-                        sbs_np, depth_np, g_world = result
+                        packed_gpu, depth_np, g_world = result
                         from sharp.utils.gaussians import save_ply
                         ply_path = out.with_suffix("") / f"{out.stem}_{n_done:05d}.ply"
                         ply_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1164,20 +1227,24 @@ class _PipelineWorker:
                                 f"PLY 序列导出中: {ply_path.parent.name}/",))
                         del g_world
                     elif want_depth:
-                        sbs_np, depth_np = result
+                        packed_gpu, depth_np = result
                     else:
-                        sbs_np = result
+                        packed_gpu = result
                         depth_np = None
 
-                    # ── Encode (async via encode thread) ────────────
-                    encode_q.put((sbs_np, hdr_out))
+                    # ── Async D2H into a pinned buffer, then encode ──
+                    buf = free_bufs.get()
+                    buf.copy_(packed_gpu, non_blocking=True)
+                    ev = torch.cuda.Event()
+                    ev.record()
+                    encode_q.put((buf, ev))
                     out_written += 1
 
                     # Depth video (synchronous, lightweight)
                     if depth_writer is not None and depth_np is not None:
                         depth_writer.append_frame(depth_np)
 
-                    del img_r, prepared, sbs_np, depth_np
+                    del img_r, prepared, packed_gpu, depth_np
 
                     n_done += 1
                     elapsed = time.time() - t_start

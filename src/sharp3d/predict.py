@@ -148,8 +148,11 @@ class SharpPredictor:
         self.accel_status.append((_ort_label, _ort_ok))
 
         # ── FP16 conversion (after ORT export which needs FP32) ──────────
-        if not already_fp16:
-            predictor.half()
+        # Unconditional: even when the cached checkpoint is already FP16,
+        # load_state_dict() casts the values up to the model's FP32 params,
+        # so skipping half() here silently kept the model in FP32 (2× VRAM,
+        # ~1.4 GB wasted for SHARP).
+        predictor.half()
 
         # ── Detect cache state ───────────────────────────────────────────
         trt_cached = (cache_dir / "trt_v3").exists() and any(

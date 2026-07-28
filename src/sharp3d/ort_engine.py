@@ -339,9 +339,13 @@ class ORTEncoder(nn.Module):
         """
         # torch.compile launches the patch-producing kernels asynchronously on
         # PyTorch's stream, but ORT runs inference on its own separate stream.
-        # Without this full sync, ORT can read patches that are not yet fully
+        # Without this sync, ORT can read patches that are not yet fully
         # produced → corrupted ViT features → intermittent blurry frames.
-        torch.cuda.synchronize()
+        # Only the *current* stream needs draining: a device-wide
+        # torch.cuda.synchronize() would also wait for the video pipeline's
+        # side-stream H2D prefetch of the next frame, serializing it with
+        # compute and silently defeating the double-buffering.
+        torch.cuda.current_stream().synchronize()
         try:
             return self._forward_iobinding(x)
         except Exception as e:

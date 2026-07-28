@@ -11,8 +11,22 @@ Modes:
     flow     – optical flow warp + occlusion-aware blend (best quality).
 """
 
+import math
+
 import torch
 from torch.nn.functional import grid_sample, interpolate
+
+
+def _mean_view(g_ndc) -> torch.Tensor:
+    """Return mean_vectors as (N, 3), squeezing the predictor's batch dim.
+
+    BUG#9: predictor output is [1, N, 3]; indexing [:, 2] on that tensor
+    selects gaussian #2's xyz (shape [1, 3]) instead of every gaussian's z
+    (shape [N]) — it silently broke all z-based stabilization below.
+    The returned view shares storage, so in-place writes propagate back.
+    """
+    mv = g_ndc.mean_vectors
+    return mv[0] if mv.ndim == 3 else mv
 
 
 class KalmanScalar:
@@ -189,14 +203,20 @@ class TemporalStabilizer:
         return scene_cut
 
     def _smooth_attributes(self, g_ndc) -> None:
-        """Recursive EMA-smooth opacities and singular_values."""
+        """Recursive EMA-smooth opacities and singular_values.
+
+        BUG: Gaussians3D is a NamedTuple — attribute assignment
+        (`g_ndc.opacities = ...`) raises AttributeError, so this crashed on
+        the *second* frame of every stabilized video conversion. Write
+        in-place instead (the tensors inside the tuple are mutable).
+        """
         a = self._attr_alpha
 
         # Opacities: (N, 1) or (N,)
         opac = g_ndc.opacities.float()
         if self._prev_opacities is not None:
             smoothed = a * opac + (1 - a) * self._prev_opacities.float()
-            g_ndc.opacities = smoothed.to(g_ndc.opacities.dtype)
+            g_ndc.opacities.copy_(smoothed.to(g_ndc.opacities.dtype))
             self._prev_opacities = smoothed.half()  # FP16 storage saves VRAM
         else:
             self._prev_opacities = opac.half()
@@ -205,7 +225,7 @@ class TemporalStabilizer:
         scales = g_ndc.singular_values.float()
         if self._prev_scales is not None:
             smoothed = a * scales + (1 - a) * self._prev_scales.float()
-            g_ndc.singular_values = smoothed.to(g_ndc.singular_values.dtype)
+            g_ndc.singular_values.copy_(smoothed.to(g_ndc.singular_values.dtype))
             self._prev_scales = smoothed.half()  # FP16 storage saves VRAM
         else:
             self._prev_scales = scales.half()
@@ -215,7 +235,8 @@ class TemporalStabilizer:
     def _stabilize_ema(self, g_ndc) -> bool:
         """Global or adaptive EMA stabilization. Returns True on scene cut."""
         # Force float32 — N can exceed FP16 max (65504), causing inf/nan.
-        z = g_ndc.mean_vectors[:, 2].float()  # (N,) depth in NDC
+        mv = _mean_view(g_ndc)
+        z = mv[:, 2].float()  # (N,) depth in NDC
         N = z.numel()
 
         # First frame: just store and return.
@@ -229,26 +250,30 @@ class TemporalStabilizer:
         x = z
         y = prev
 
-        sx = x.sum()
-        sxx = (x * x).sum()
-        sxy = (x * y).sum()
-        sy = y.sum()
-        n = torch.tensor(float(N), device=z.device, dtype=torch.float32)
-
-        det = sxx * n - sx * sx
-        if not torch.isfinite(det) or det.abs() < 1e-12:
-            self._prev_z = z.clone()
-            return True
-
-        s = (sxy * n - sx * sy) / det
-        t = (sxx * sy - sx * sxy) / det
+        # Mean-centered least squares. The naive normal equations
+        # (det = sxx·n − sx²) subtract two huge nearly-equal numbers
+        # (catastrophic cancellation in fp32: sxx·n and sx² are ~1e9+ for
+        # typical depths and N), costing several percent of fit accuracy.
+        xm = x.mean()
+        ym = y.mean()
+        xc = x - xm
+        yc = y - ym
+        var_x = (xc * xc).sum()
+        s = (xc * yc).sum() / var_x.clamp_min(1e-12)
+        t = ym - s * xm
         z_aligned = s * z + t
 
         # ── Scene cut detection ──────────────────────────────────────────
         residual = (z_aligned - prev).abs()
         mean_residual = residual.mean()
 
-        if not torch.isfinite(mean_residual) or mean_residual > self.cut_threshold:
+        # Single host sync for both the degenerate-fit guard (var_x ≈ 0/nan)
+        # and the scene-cut test — two separate reads would flush the GPU
+        # pipeline twice per frame.
+        var_x_val, mean_res = torch.stack([var_x, mean_residual]).tolist()
+        if (not math.isfinite(var_x_val) or var_x_val < 1e-12
+                or not math.isfinite(mean_res)
+                or mean_res > self.cut_threshold):
             self._prev_z = z.clone()
             return True
 
@@ -262,7 +287,7 @@ class TemporalStabilizer:
             z_out = confidence * z_smooth + (1.0 - confidence) * z
 
         # Write back in original dtype; keep prev in float32.
-        g_ndc.mean_vectors[:, 2] = z_out.to(g_ndc.mean_vectors.dtype)
+        mv[:, 2] = z_out.to(mv.dtype)
         self._prev_z = z_out
         return False
 
@@ -274,7 +299,8 @@ class TemporalStabilizer:
             # Fallback to global EMA if no image provided.
             return self._stabilize_ema(g_ndc)
 
-        z = g_ndc.mean_vectors[:, 2].float()  # (N,) — float32 to avoid FP16 overflow
+        mv = _mean_view(g_ndc)
+        z = mv[:, 2].float()  # (N,) — float32 to avoid FP16 overflow
         N = z.numel()
 
         # Prepare current frame at flow resolution.
@@ -360,31 +386,30 @@ class TemporalStabilizer:
         z_flat = z_spatial.reshape(-1)
         warped_flat = warped_z.reshape(-1)
 
-        if valid_flat.sum() > 100:
+        n_valid = valid_flat.sum()
+        if n_valid > 100:
             xv = z_flat[valid_flat]
             yv = warped_flat[valid_flat]
-            sx = xv.sum()
-            sxx = (xv * xv).sum()
-            sxy = (xv * yv).sum()
-            sy = yv.sum()
-            nv = torch.tensor(float(xv.numel()), device=z.device, dtype=torch.float32)
-            det = sxx * nv - sx * sx
-            if det.abs() > 1e-12:
-                s = (sxy * nv - sx * sy) / det
-                t = (sxx * sy - sx * sxy) / det
-                z_aligned = s * z_flat + t
-            else:
-                z_aligned = z_flat
-        else:
-            z_aligned = z_flat
+            # Mean-centered least squares (avoids fp32 cancellation).
+            xm = xv.mean()
+            ym = yv.mean()
+            xc = xv - xm
+            yc = yv - ym
+            var_x = (xc * xc).sum()
+            s = (xc * yc).sum() / var_x.clamp_min(1e-12)
+            t = ym - s * xm
+            z_aligned = s * z_flat + t
+            # Degenerate fit (constant z) → fall back to raw current frame.
+            z_aligned = torch.where(var_x > 1e-12, z_aligned, z_flat)
 
-        # ── Scene cut detection ──────────────────────────────────────────
-        if valid_flat.sum() > 100:
+            # ── Scene cut detection ──────────────────────────────────────
             res = (z_aligned[valid_flat] - warped_flat[valid_flat]).abs().mean()
             if res > self.cut_threshold:
                 self._prev_z = z.clone()
                 self._prev_img = curr_img
                 return True
+        else:
+            z_aligned = z_flat
 
         # ── Occlusion-aware blend ────────────────────────────────────────
         # Non-occluded: blend aligned current with warped prev.
@@ -402,7 +427,7 @@ class TemporalStabilizer:
         z_out[vis] = (self.alpha * z_aligned[vis]
                       + (1.0 - self.alpha) * warped_flat[vis])
 
-        g_ndc.mean_vectors[:, 2] = z_out.to(g_ndc.mean_vectors.dtype)
+        mv[:, 2] = z_out.to(mv.dtype)
         self._prev_z = z_out
         self._prev_img = curr_img
         return False

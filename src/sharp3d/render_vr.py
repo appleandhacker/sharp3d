@@ -18,6 +18,22 @@ from .projection import (
 from .render import linearRGB2sRGB
 
 
+# Camera matrices depend only on (face_size, eye offset, device) — cache them
+# across frames so the video loop doesn't rebuild 6 look-at matrices per eye
+# per frame.
+_CAM_CACHE: dict = {}
+
+
+def _cameras_cached(face_size: int, device, eye_offset: Tensor,
+                    offset_key: float):
+    key = (face_size, device.index, offset_key)
+    cams = _CAM_CACHE.get(key)
+    if cams is None:
+        cams = get_cubemap_cameras(face_size, device, eye_offset)
+        _CAM_CACHE[key] = cams
+    return cams
+
+
 def render_vr_stereo(
     gaussians,  # Gaussians3D
     ipd: float = 0.063,
@@ -82,31 +98,37 @@ def render_vr_stereo(
             )
             left_faces = _render_cubemap_higs(gaussians, left_offset, face_size,
                                               device, skip_back=skip_back,
-                                              scene=higs_scene)
+                                              scene=higs_scene,
+                                              offset_x=-ipd / 2)
             if progress_cb:
                 progress_cb(1, 6)
             right_faces = _render_cubemap_higs(gaussians, right_offset, face_size,
                                                device, skip_back=skip_back,
-                                               scene=higs_scene)
+                                               scene=higs_scene,
+                                               offset_x=ipd / 2)
             if progress_cb:
                 progress_cb(2, 6)
         except (ImportError, RuntimeError, OSError):
             # HiGS unavailable (JIT build failure / missing library) — fallback
             left_faces = _render_cubemap_standard(gaussians, left_offset, face_size,
-                                                  device, skip_back=skip_back)
+                                                  device, skip_back=skip_back,
+                                                  offset_x=-ipd / 2)
             if progress_cb:
                 progress_cb(1, 6)
             right_faces = _render_cubemap_standard(gaussians, right_offset, face_size,
-                                                   device, skip_back=skip_back)
+                                                   device, skip_back=skip_back,
+                                                   offset_x=ipd / 2)
             if progress_cb:
                 progress_cb(2, 6)
     else:
         left_faces = _render_cubemap_standard(gaussians, left_offset, face_size,
-                                              device, skip_back=skip_back)
+                                              device, skip_back=skip_back,
+                                              offset_x=-ipd / 2)
         if progress_cb:
             progress_cb(1, 6)
         right_faces = _render_cubemap_standard(gaussians, right_offset, face_size,
-                                               device, skip_back=skip_back)
+                                               device, skip_back=skip_back,
+                                               offset_x=ipd / 2)
         if progress_cb:
             progress_cb(2, 6)
 
@@ -146,6 +168,7 @@ def _render_cubemap_higs(
     device: torch.device,
     skip_back: bool = False,
     scene=None,
+    offset_x: float = 0.0,
 ) -> Tensor:
     """Render 6 cubemap faces using HiGS inference renderer.
 
@@ -185,7 +208,7 @@ def _render_cubemap_higs(
         id="vr_render",
     )
 
-    viewmats, Ks = get_cubemap_cameras(face_size, device, eye_offset)
+    viewmats, Ks = _cameras_cached(face_size, device, eye_offset, offset_x)
 
     faces = torch.zeros(6, 3, face_size, face_size, device=device)
     n_render = 5 if skip_back else 6
@@ -210,6 +233,7 @@ def _render_cubemap_standard(
     face_size: int,
     device: torch.device,
     skip_back: bool = False,
+    offset_x: float = 0.0,
 ) -> Tensor:
     """Render 6 cubemap faces using standard gsplat batched rasterization.
 
@@ -232,7 +256,7 @@ def _render_cubemap_standard(
     if opacities.dim() == 2:
         opacities = opacities.squeeze(0) if opacities.shape[0] == 1 else opacities.squeeze(-1)
 
-    viewmats, Ks = get_cubemap_cameras(face_size, device, eye_offset)
+    viewmats, Ks = _cameras_cached(face_size, device, eye_offset, offset_x)
 
     # Skip back face (-Z) for 180° output
     n_render = 5 if skip_back else 6
