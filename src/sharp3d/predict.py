@@ -83,10 +83,12 @@ class SharpPredictor:
             if bundled.exists():
                 fp16_ckpt = bundled
         if fp16_ckpt.exists():
+            self._progress(f"加载本地权重 ({fp16_ckpt.name})", 10)
             state_dict = torch.load(str(fp16_ckpt), map_location="cpu",
                                     mmap=True, weights_only=True)
             already_fp16 = True
         else:
+            self._progress("下载模型权重 (首次需联网)", 9)
             state_dict = torch.hub.load_state_dict_from_url(
                 MODEL_URL, progress=False, map_location="cpu")
             already_fp16 = False
@@ -123,7 +125,8 @@ class SharpPredictor:
         use_int8 = (perf_mode == "speed")
         _ort_ok = False
         try:
-            from .ort_engine import create_ort_patch_encoder, create_ort_image_encoder
+            from .ort_engine import (create_ort_patch_encoder,
+                                     create_ort_image_encoder, _TRT_CACHE_DIR)
             spn = predictor.monodepth_model.monodepth_predictor.encoder
 
             ort_enc = create_ort_patch_encoder(predictor, device, int8_enable=use_int8)
@@ -144,7 +147,15 @@ class SharpPredictor:
                     traceback.format_exc(), encoding="utf-8")
             except Exception:
                 pass
-        _ort_label = "ORT TensorRT" + (" INT8" if use_int8 else "")
+        # INT8 is only *actually* active when the calibration table exists
+        # (ort_engine falls back to FP16 otherwise) — label truthfully.
+        _int8_active = False
+        try:
+            _int8_active = use_int8 and (
+                _TRT_CACHE_DIR / "patch_encoder_calibration_table").exists()
+        except Exception:
+            pass
+        _ort_label = "ORT TensorRT" + (" INT8" if _int8_active else "")
         self.accel_status.append((_ort_label, _ort_ok))
 
         # ── FP16 conversion (after ORT export which needs FP32) ──────────
