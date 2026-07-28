@@ -170,13 +170,17 @@
 |------|--------|------|
 | ORT TensorRT FP16 | 1.74× | DINOv2 双编码器 (418ms → 240ms) |
 | torch.compile max-autotune | 1.16× | 持久缓存，热启动 10.8s |
-| GPU-direct prepare_input | — | VR面提取结果直传模型，消除PCIe往返 |
-| HiGS 场景复用 | — | fp16打包一次，双眼渲染复用 |
-| skip_back 优化 | — | 180°输出跳过-Z面 (6→5面) |
+| NDC fold 渲染 | — | unprojection 折入 viewmat，跳过每帧 118 万高斯协方差往返 |
+| pinned buffer 3 缓冲 | — | 异步 D2H + CUDA event，GPU 渲染与 CPU 编码真正重叠 |
+| VR 投影几何 LRU 缓存 | — | 采样网格 + cubemap_to_equirect 预计算 plan，消除每帧重建 |
+| GPU-direct prepare_input | — | VR 面提取结果直传模型，消除 PCIe 往返 |
+| HiGS 场景复用 | — | fp16 打包一次，双眼渲染复用 |
+| skip_back 优化 | — | 180° 输出跳过 -Z 面 (6→5面) |
 | GPU 四元数 (Shepperd) | 884× | 替代 scipy CPU 实现 |
 | 解析法特征分解 | 3× | 替代 GPU SVD (省 0.4s/帧) |
-| 3 级流水线 | — | 解码预取 / GPU 计算 / 编码重叠 |
+| 流级同步 | — | current_stream().synchronize() 替代全局 sync，保持流水线重叠 |
 | NVENC 硬件编码 | — | 独立编码引擎，不占 CUDA 核心 |
+| HDR10 hevc_nvenc | — | 自动探测 master_display 能力，HDR 编码走 GPU 硬编 |
 | IO Binding 零拷贝 | — | GPU→ORT→GPU 无 CPU 往返 |
 
 ---
