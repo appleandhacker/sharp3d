@@ -266,6 +266,25 @@ class VrTab(QWidget):
         perf_row.addWidget(self._perf_mode, 1)
         adv_card.add_layout(perf_row)
 
+        kf_row = QHBoxLayout()
+        kf_row.addWidget(QLabel("预测间隔"))
+        self._kf_interval = QComboBox()
+        self._kf_interval.addItems([
+            "每帧预测 (默认)",
+            "每 2 帧 (~1.8x)",
+            "每 3 帧 (~2.4x)",
+            "每 4 帧 (~2.8x)",
+            "每 5 帧 (~3.1x)",
+        ])
+        self._kf_interval.setToolTip(
+            "视频关键帧几何复用：每 N 帧对全部 cubemap 面完整运行一次\n"
+            "SHARP 预测，中间帧复用关键帧几何、仅用当前画面刷新颜色。\n"
+            "全景每帧需预测 4-6 个面，复用收益比普通视频更大。\n"
+            "场景切换会自动强制重新预测。"
+        )
+        kf_row.addWidget(self._kf_interval, 1)
+        adv_card.add_layout(kf_row)
+
         renderer_row = QHBoxLayout()
         renderer_row.addWidget(QLabel("渲染器"))
         self._renderer = QComboBox()
@@ -531,6 +550,7 @@ class VrTab(QWidget):
             "out_fps": out_fps,
             "temporal_stabilize": ["off", "global", "adaptive"][
                 self._stabilize.currentIndex()],
+            "keyframe_interval": self._kf_interval.currentIndex() + 1,
             "depth": self._chk_depth.isChecked(),
             "ply": self._chk_ply.isChecked(),
             "seam_blend": self._chk_seam.isChecked(),

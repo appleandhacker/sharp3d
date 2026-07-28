@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 
 from .anim_tab import AnimTab
 from .gaussian_tab import GaussianViewerWindow
-from .sbs_tab import SbsTab
+from .sbs_tab import SbsTab, precision_text
 from .vr_tab import VrTab
 from .theme import DISPLAY_FONT, ThemeManager, build_palette, build_qss
 from .widgets import GpuMeter
@@ -112,6 +112,9 @@ class MainWindow(QMainWindow):
         self.setStatusBar(sb)
         self._status_label = QLabel("正在加载模型…")
         sb.addWidget(self._status_label, 1)
+        self._precision_label = QLabel("模型量化精度：未加载")
+        self._precision_label.setProperty("cssClass", "hint")
+        sb.addPermanentWidget(self._precision_label)
         self._theme_label = QLabel("")
         sb.addPermanentWidget(self._theme_label)
 
@@ -119,6 +122,7 @@ class MainWindow(QMainWindow):
         self._theme.changed.connect(self._apply_theme)
         self._engine.status.connect(self._status_label.setText)
         self._engine.error.connect(self._status_label.setText)
+        self._engine.model_accel.connect(self._on_model_accel)
         self._sbs.status_message.connect(self._status_label.setText)
         self._anim.status_message.connect(self._status_label.setText)
         self._vr.status_message.connect(self._status_label.setText)
@@ -127,6 +131,10 @@ class MainWindow(QMainWindow):
 
         # Start loading the model immediately
         self._engine.preload()
+
+    # ------------------------------------------------------------------
+    def _on_model_accel(self, status: list) -> None:
+        self._precision_label.setText(f"模型量化精度：{precision_text(status)}")
 
     # ------------------------------------------------------------------
     def _open_viewer(self) -> None:

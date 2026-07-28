@@ -46,6 +46,18 @@ def _fmt_hms(seconds: float) -> str:
     return f"{m}:{sec:02d}"
 
 
+def precision_text(status: list) -> str:
+    """Derive the active model quantization precision from accel_status."""
+    names = {name for name, ok in status if ok}
+    if any("INT8" in n for n in names):
+        return "INT8 (TensorRT 量化)"
+    if any("TensorRT" in n for n in names):
+        return "FP16 (TensorRT)"
+    if any("FP16" in n for n in names):
+        return "FP16 (PyTorch)"
+    return "FP32 (PyTorch)"
+
+
 class SbsTab(QWidget):
     """Main 2D→3D SBS conversion workspace."""
 
@@ -184,7 +196,8 @@ class SbsTab(QWidget):
         )
         self._chk_hdr.toggled.connect(self._on_hdr_toggled)
         enc_card.add_widget(self._chk_hdr)
-        right.addWidget(enc_card)
+        # 输出设置放左列（立体参数下方），高级区域放右列
+        left.addWidget(enc_card)
 
         adv_card = SectionCard(c, "高级")
         perf_row = QHBoxLayout()
@@ -198,6 +211,26 @@ class SbsTab(QWidget):
         )
         perf_row.addWidget(self._perf_mode, 1)
         adv_card.add_layout(perf_row)
+
+        kf_row = QHBoxLayout()
+        kf_row.addWidget(QLabel("预测间隔"))
+        self._kf_interval = QComboBox()
+        self._kf_interval.addItems([
+            "每帧预测 (默认)",
+            "每 2 帧 (~1.8x)",
+            "每 3 帧 (~2.4x)",
+            "每 4 帧 (~2.8x)",
+            "每 5 帧 (~3.1x)",
+        ])
+        self._kf_interval.setToolTip(
+            "视频关键帧几何复用：每 N 帧完整运行一次 SHARP 预测，\n"
+            "中间帧复用关键帧几何、仅用当前画面刷新颜色。\n"
+            "场景切换会自动强制重新预测。\n\n"
+            "快速运动的物体可能有轻微几何滞后（1-2 帧），\n"
+            "静态/慢速镜头几乎无损。开启深度图/PLY 导出时不生效。"
+        )
+        kf_row.addWidget(self._kf_interval, 1)
+        adv_card.add_layout(kf_row)
 
         renderer_row = QHBoxLayout()
         renderer_row.addWidget(QLabel("渲染器"))
@@ -229,14 +262,15 @@ class SbsTab(QWidget):
         ])
         self._stabilize.setToolTip(
             "视频转换时消除帧间抖动（元素左右跳动/闪烁）。\n\n"
-            "关闭：不做处理，每帧独立（默认）。\n"
+            "关闭：不做处理，每帧独立。\n"
             "全局对齐：收敛平面EMA平滑 + 深度尺度对齐。\n"
-            "  消除自动收敛逐帧跳动引起的全局水平偏移，推荐。\n"
+            "  消除自动收敛逐帧跳动引起的全局水平偏移。\n"
             "自适应：同上 + 逐像素置信度加权深度平滑，\n"
-            "  静态区域更强平滑，运动物体自动保护。\n"
+            "  静态区域更强平滑，运动物体自动保护（默认，推荐）。\n"
             "光流：同上 + RAFT光流warp遮挡感知混合，\n"
             "  处理前景/背景独立运动，质量最佳但较慢(+50ms/帧)。"
         )
+        self._stabilize.setCurrentIndex(2)  # 默认：自适应平滑
         stab_row.addWidget(self._stabilize, 1)
         adv_card.add_layout(stab_row)
 
@@ -250,7 +284,7 @@ class SbsTab(QWidget):
         adv_card.add_widget(self._chk_depth)
         adv_card.add_widget(self._chk_ply)
         adv_card.add_widget(self._chk_edge)
-        left.addWidget(adv_card)
+        right.addWidget(adv_card)
 
         left_w = QWidget()
         left_w.setLayout(left)
@@ -460,6 +494,7 @@ class SbsTab(QWidget):
             out_width=out_width,
             temporal_stabilize=["off", "global", "adaptive", "flow"][
                 self._stabilize.currentIndex()],
+            keyframe_interval=self._kf_interval.currentIndex() + 1,
         )
         return opts.to_dict()
 
