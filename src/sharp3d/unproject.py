@@ -26,6 +26,16 @@ from .eigendecompose import decompose_covariance
 INTERNAL_SHAPE = (1536, 1536)
 
 
+# Intrinsics + disparity factor depend only on (f_px, w, h, device): cache
+# them per value so a video loop gets the SAME tensors every frame instead of
+# paying a rebuild (2 small H2D + ~4 kernels) per frame — and so the
+# conversion engine's unprojection cache can short-circuit on tensor identity
+# (no torch.equal kernel + host sync per frame). Callers must NOT mutate the
+# returned tensors; they are shared by design.
+_IR_CACHE: dict = {}
+_IR_CACHE_MAX = 8
+
+
 def prepare_input(image_input, f_px: float, device: torch.device,
                   async_upload: bool = False):
     """Prepare image for SHARP predictor.
@@ -73,8 +83,27 @@ def prepare_input(image_input, f_px: float, device: torch.device,
         img = t.to(device, non_blocking=async_upload).permute(2, 0, 1)
         img = img.float().div_(255.0)
 
-    # BUG#5 FIX: explicit dtype=float32 (Python float → f64 → FP16 autocast error)
-    disparity_factor = torch.tensor([f_px / w], device=device, dtype=torch.float32)
+    cache_key = (float(f_px), w, h, str(device))
+    cached = _IR_CACHE.get(cache_key)
+    if cached is not None:
+        disparity_factor, intrinsics_resized = cached
+    else:
+        # BUG#5 FIX: explicit dtype=float32 (Python float → f64 → FP16 autocast error)
+        disparity_factor = torch.tensor([f_px / w], device=device,
+                                        dtype=torch.float32)
+        intrinsics = torch.tensor([
+            [f_px, 0, w / 2, 0],
+            [0, f_px, h / 2, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ], dtype=torch.float32, device=device)
+        # Scale intrinsics to internal resolution
+        intrinsics_resized = intrinsics.clone()
+        intrinsics_resized[0] *= INTERNAL_SHAPE[0] / w
+        intrinsics_resized[1] *= INTERNAL_SHAPE[1] / h
+        if len(_IR_CACHE) >= _IR_CACHE_MAX:
+            _IR_CACHE.pop(next(iter(_IR_CACHE)))  # FIFO
+        _IR_CACHE[cache_key] = (disparity_factor, intrinsics_resized)
 
     if (h, w) == tuple(INTERNAL_SHAPE):
         # Already at target resolution — ensure contiguous [1, 3, H, W]
@@ -93,18 +122,6 @@ def prepare_input(image_input, f_px: float, device: torch.device,
             img[None], size=INTERNAL_SHAPE, mode="bilinear", align_corners=True,
             antialias=True
         )
-
-    intrinsics = torch.tensor([
-        [f_px, 0, w / 2, 0],
-        [0, f_px, h / 2, 0],
-        [0, 0, 1, 0],
-        [0, 0, 0, 1],
-    ], dtype=torch.float32, device=device)
-
-    # Scale intrinsics to internal resolution
-    intrinsics_resized = intrinsics.clone()
-    intrinsics_resized[0] *= INTERNAL_SHAPE[0] / w
-    intrinsics_resized[1] *= INTERNAL_SHAPE[1] / h
 
     return img_resized, disparity_factor, intrinsics_resized, (w, h)
 

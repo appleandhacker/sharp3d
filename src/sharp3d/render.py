@@ -319,15 +319,20 @@ def render_sbs(
     # rendered_colors: (2, H, W, 3) in linearRGB
     # rendered_alphas: (2, H, W, 1)
 
-    # BUG#3 FIX: linearRGB → sRGB gamma correction
-    rendered_colors = linearRGB2sRGB(rendered_colors)
-
-    # Convert to uint8 images
-    left_img = (rendered_colors[0] * 255).clamp(0, 255).to(torch.uint8)   # (H, W, 3)
-    right_img = (rendered_colors[1] * 255).clamp(0, 255).to(torch.uint8)  # (H, W, 3)
-
-    # Concatenate horizontally for SBS
-    sbs = torch.cat([left_img, right_img], dim=1)  # (H, W*2, 3)
+    # BUG#3 FIX: linearRGB → sRGB gamma correction, then quantize.
+    # Per-eye in-place chain into a preallocated (H, 2W, 3) uint8 buffer:
+    # the old whole-frame path materialized ~5 fp32 intermediates of the
+    # full (2, H, W, 3) frame (~950MB of element-level traffic at 4K) and
+    # ended with a cat. Per-eye halves the transient peak, mul_/clamp_ run
+    # in place on the fresh sRGB tensor, and writing the two output halves
+    # replaces the cat. Byte-identical to the old chain (identical ops,
+    # elementwise; asserted in tools/check_perf_cli.py).
+    sbs = torch.empty((screen_h, screen_w * 2, 3), dtype=torch.uint8,
+                      device=rendered_colors.device)
+    for eye in range(2):
+        img = linearRGB2sRGB(rendered_colors[eye])
+        img.mul_(255.0).clamp_(0.0, 255.0)
+        sbs[:, eye * screen_w:(eye + 1) * screen_w] = img.to(torch.uint8)
 
     return sbs, (screen_w, screen_h)
 

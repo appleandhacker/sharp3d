@@ -476,7 +476,11 @@ class Hdr10Writer:
 
     def write_frame(self, frame: np.ndarray) -> None:
         """Write an (H, W, 3) uint8 SDR frame."""
-        self._proc.stdin.write(frame.tobytes())
+        if not frame.flags.c_contiguous:
+            frame = np.ascontiguousarray(frame)
+        # memoryview hands the buffer straight to the pipe writer; the old
+        # frame.tobytes() made a full-frame copy (~100MB at 8K) every frame.
+        self._proc.stdin.write(memoryview(frame))
 
     def close(self, audio_source: str | Path | None = None) -> None:
         """Finish encoding and optionally mux audio from a source video."""

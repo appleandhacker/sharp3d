@@ -99,6 +99,8 @@ class VideoConversionEngine:
         self._unproj = None  # lazily cached (4, 4) NDC→world matrix
         self._unproj_ir = None  # intrinsics the cached matrix was built from
         self._last_ir = None  # intrinsics of the current frame, for _soften_depth_edges
+        self._soften_kernel = None  # cached (L, 1, 5, 5) depthwise blur kernel
+        self._soften_kernel_key = None  # (L, device) the kernel was built for
 
         # ── Keyframe geometry reuse state ────────────────────────────
         self._kf_interval = max(1, int(keyframe_interval))
@@ -123,7 +125,12 @@ class VideoConversionEngine:
         """
         cached, cached_ir = self._unproj, self._unproj_ir
         if cached is not None and cached_ir is not None:
-            if cached_ir.shape == ir.shape and torch.equal(ir, cached_ir):
+            # Identity first: prepare_input now returns the SAME cached
+            # intrinsics tensor every frame for a given (f_px, w, h, device),
+            # so the common case short-circuits without the torch.equal
+            # kernel + sync; the value compare remains for other callers.
+            if cached_ir is ir or (cached_ir.shape == ir.shape
+                                   and torch.equal(ir, cached_ir)):
                 return cached
         from sharp.utils.gaussians import get_unprojection_matrix
         self._unproj = get_unprojection_matrix(
@@ -480,24 +487,30 @@ class VideoConversionEngine:
         # 0.5 for every flat gaussian (blurring the whole frame). Offsetting
         # by a band puts g == 0 at the sigmoid's tail instead of its centre.
         thresh = med + band
-        # The sigmoid's centre is set at 2·band above the median, so a flat
-        # region (g == 0, med == 0) evaluates to sigmoid(-2) ≈ 0.12 and the
-        # reported "no false edges" bound is < 0.15. Genuine discontinuities
-        # exceed thresh by several bands and saturate near 1.
-        edge_weight = torch.sigmoid((grad_mag - thresh - band) / band)
-
-        # Edge weight: sigmoid ramp whose centre sits 2·band above the
-        # median gradient (see the threshold discussion above).
+        # Edge weight: sigmoid ramp whose centre sits 2·band above the median
+        # gradient (thresh is already med + band, so the extra +band puts the
+        # centre at med + 2·band): a flat region (g == 0, med == 0) evaluates
+        # to sigmoid(-2) ≈ 0.12 — under the 0.15 "no false edges" bound — and
+        # genuine discontinuities exceed the centre by several bands and
+        # saturate near 1. (An earlier draft computed this sigmoid twice with
+        # different-looking but algebraically identical arguments; the first
+        # result was discarded unused.)
         edge_weight = torch.sigmoid((grad_mag - (thresh + band)) / band)
 
-        # Gaussian blur (5x5, sigma=2) — depthwise conv (groups=L)
+        # Gaussian blur (5x5, sigma=2) — depthwise conv (groups=L). The kernel
+        # depends only on (L, device): build it once per video, not per frame.
         kernel_size = 5
         sigma = 2.0
-        coords = torch.arange(kernel_size, device=z_world.device, dtype=torch.float32) - kernel_size // 2
-        kernel_1d = torch.exp(-coords.pow(2) / (2 * sigma * sigma))
-        kernel_1d = kernel_1d / kernel_1d.sum()
-        kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]  # (5, 5)
-        kernel_2d = kernel_2d.expand(L, 1, -1, -1)  # (L, 1, 5, 5)
+        kern_key = (L, z_world.device)
+        if self._soften_kernel_key != kern_key:
+            coords = torch.arange(kernel_size, device=z_world.device, dtype=torch.float32) - kernel_size // 2
+            kernel_1d = torch.exp(-coords.pow(2) / (2 * sigma * sigma))
+            kernel_1d = kernel_1d / kernel_1d.sum()
+            kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]  # (5, 5)
+            kernel_2d = kernel_2d.expand(L, 1, -1, -1)  # (L, 1, 5, 5)
+            self._soften_kernel_key = kern_key
+            self._soften_kernel = kernel_2d
+        kernel_2d = self._soften_kernel
 
         z_blur = F.conv2d(log_z_4d, kernel_2d, padding=2,
                           groups=L).squeeze(0)  # (L, H, W)

@@ -5,6 +5,8 @@ Orchestrates all modules into a single coherent pipeline.
 
 import gc
 import logging
+import queue
+import threading
 import time
 from pathlib import Path
 from typing import Callable
@@ -18,9 +20,106 @@ from sharp.utils import io as sharp_io
 from .predict import SharpPredictor
 from .unproject import prepare_input, fast_unproject, INTERNAL_SHAPE
 from .render import render_sbs, render_depth_map
-from .video import VideoReader, VideoWriter
+from .video import VideoWriter
 
 logger = logging.getLogger(__name__)
+
+
+class _AsyncFrameSink:
+    """Pinned-buffer ring + encoder thread for the video loop.
+
+    Ported from gui/worker.py, where it was measured: pageable D2H of a
+    4K SBS frame costs ~15ms and a blocking pipe write more — both sat on
+    the render thread. With the ring, D2H (non_blocking into pinned memory)
+    overlaps the next frame's GPU work and the encoder pipe write runs on
+    its own thread. The ring also provides back-pressure: when the encoder
+    thread falls a full ring behind, submit() blocks on the free-buffer
+    queue, so per-frame dt remains an honest steady-state throughput
+    measure instead of racing ahead unboundedly.
+    """
+
+    def __init__(self, writer, use_hdr: bool, n_buffers: int = 3):
+        self._writer = writer
+        self._use_hdr = use_hdr
+        self._n_buffers = n_buffers
+        self._free: queue.Queue = queue.Queue()
+        self._work: queue.Queue = queue.Queue()
+        self._error: BaseException | None = None
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="sharp3d-encode")
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            item = self._work.get()
+            if item is None:
+                return
+            buf, ev = item
+            try:
+                ev.synchronize()
+                frame = buf.numpy()
+                if self._use_hdr:
+                    self._writer.write_frame(frame)
+                else:
+                    self._writer.append_frame(frame)
+            except BaseException as e:
+                # Store and let submit()/finish() surface it on the caller's
+                # thread; do not let it kill the loop silently.
+                self._error = e
+                return
+            finally:
+                try:
+                    self._free.put(buf)
+                except Exception:
+                    pass
+
+    def submit(self, packed_gpu: torch.Tensor) -> None:
+        """Queue one GPU frame for async D2H + encode. Blocks under backlog."""
+        if self._error is not None:
+            raise RuntimeError("视频编码线程已失败") from self._error
+        if not hasattr(self, "_shape"):
+            # Allocate the pinned ring from the first frame's shape (constant
+            # for the whole video — the writer was opened at this size).
+            self._shape = tuple(packed_gpu.shape)
+            for _ in range(self._n_buffers):
+                self._free.put(torch.empty(self._shape, dtype=torch.uint8,
+                                           pin_memory=True))
+        buf = self._free.get()  # back-pressure point
+        buf.copy_(packed_gpu, non_blocking=True)
+        ev = torch.cuda.Event()
+        ev.record()  # records on the current (render) stream, after the copy
+        self._work.put((buf, ev))
+
+    def finish(self) -> None:
+        """Wait until every queued frame has been written; raise on error."""
+        self._closed = True
+        self._work.put(None)
+        self._thread.join()
+        if self._error is not None:
+            raise RuntimeError("视频编码线程失败") from self._error
+
+    def shutdown(self) -> None:
+        """Idempotent best-effort stop for the failure path (never raises)."""
+        if self._closed:
+            # finish() already joined the thread; on the error path the
+            # thread may still be alive, so fall through to the drain.
+            pass
+        else:
+            self._closed = True
+        while True:
+            try:
+                self._work.get_nowait()
+            except queue.Empty:
+                break
+        try:
+            self._work.put(None)
+        except Exception:
+            pass
+        # Bounded wait: if the thread is stuck inside a blocking pipe write,
+        # writer.abort() (caller) terminates ffmpeg and unblocks it; the
+        # thread is a daemon, so process exit reaps it regardless.
+        self._thread.join(timeout=3)
 
 
 class Sharp3DPipeline:
@@ -226,10 +325,7 @@ class Sharp3DPipeline:
 
         # Prefetch: decode frames in a background thread so the ffmpeg pipe
         # read overlaps GPU rendering instead of serializing with it.
-        import queue as _queue
-        import threading
-
-        frame_q: _queue.Queue = _queue.Queue(maxsize=3)
+        frame_q: queue.Queue = queue.Queue(maxsize=3)
 
         def _decode():
             try:
@@ -241,6 +337,7 @@ class Sharp3DPipeline:
         decoder = threading.Thread(target=_decode, daemon=True)
         decoder.start()
 
+        sink: "_AsyncFrameSink | None" = None
         ok = False
         try:
             # Temporal stabilization + keyframe reuse via the shared engine
@@ -262,6 +359,10 @@ class Sharp3DPipeline:
             # use separate engines, so the upload overlaps GPU work).
             side_stream = torch.cuda.Stream()
             main_stream = torch.cuda.current_stream()
+
+            # Async D2H + encode thread (ported from gui/worker.py): the
+            # blocking .cpu() and the encoder pipe write leave this thread.
+            sink = _AsyncFrameSink(writer, use_hdr=want_hdr)
 
             def _prepare_async(frm):
                 with torch.cuda.stream(side_stream):
@@ -303,20 +404,16 @@ class Sharp3DPipeline:
                         download=False,
                     )
                     if prof:
-                        _t_d2h = time.time()
-                    # packed.cpu() is a blocking copy — it implicitly waits for
-                    # the render stream, so no torch.cuda.synchronize() is needed
-                    # (a device-wide sync would also stall on the next frame's
-                    # side-stream upload and break the overlap).
-                    sbs_np = packed.cpu().numpy()
+                        _t_sink = time.time()
+                    # Async D2H into the pinned ring + encoder thread. The
+                    # old path was packed.cpu().numpy() (blocking pageable
+                    # copy) + writer.append_frame (blocking pipe write) on
+                    # this thread; submit() blocks only under encoder backlog.
+                    sink.submit(packed)
                     dt = time.time() - t0
                     frame_times.append(dt)
-                    if want_hdr:
-                        writer.write_frame(sbs_np)
-                    else:
-                        writer.append_frame(sbs_np)
                     if prof:
-                        prof.frame_end((time.time() - _t_d2h) * 1000.0)
+                        prof.frame_end((time.time() - _t_sink) * 1000.0)
 
                     if progress_callback:
                         progress_callback(i, n_frames, 1.0 / dt if dt > 1e-6 else 0.0)
@@ -330,6 +427,8 @@ class Sharp3DPipeline:
                         break
                     prepared, upload_done = nxt_prepared
 
+            # Wait for the encoder thread to drain (raises if it failed).
+            sink.finish()
             ok = True
         finally:
             # Unblock the decoder thread: on an error path it may sit in
@@ -339,8 +438,15 @@ class Sharp3DPipeline:
             while True:
                 try:
                     frame_q.get_nowait()
-                except _queue.Empty:
+                except queue.Empty:
                     break
+            # Stop the encoder thread BEFORE touching the writer, so it is
+            # never mid-write when abort/close manipulates the process.
+            if sink is not None:
+                try:
+                    sink.shutdown()
+                except Exception:
+                    pass
             if not ok:
                 # Encoder cleanup on a failed run: without this the .tmp.mp4
                 # survived (looking like a valid output) and the encoder
