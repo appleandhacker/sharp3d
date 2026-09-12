@@ -13,6 +13,7 @@ polled every second so switching is live without restart.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPalette
@@ -140,10 +141,38 @@ class ThemeManager(QObject):
 
 # --- QSS generation ---------------------------------------------------------
 
+def _combo_arrow_svg(c: Colors) -> str:
+    """Write a small chevron SVG for combo down-arrows, return its URL.
+
+    QSS cannot draw a border-triangle on ::down-arrow (Qt renders it as a
+    solid block), so we materialize a 12px chevron SVG tinted for the active
+    theme and reference it by file URL.
+    """
+    import tempfile
+
+    # luminance of the window background decides dark vs light
+    bg = c.bg.lstrip("#")
+    r, g, b = (int(bg[i:i + 2], 16) for i in (0, 2, 4))
+    dark = (0.299 * r + 0.587 * g + 0.114 * b) < 128
+
+    svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' "
+        "viewBox='0 0 12 12'><path d='M2.5 4.25 L6 8 L9.5 4.25' fill='none' "
+        f"stroke='{c.text_muted}' stroke-width='1.7' "
+        "stroke-linecap='round' stroke-linejoin='round'/></svg>"
+    )
+    d = Path(tempfile.gettempdir()) / "sharp3d_gui"
+    d.mkdir(exist_ok=True)
+    f = d / f"combo_arrow_{'dark' if dark else 'light'}.svg"
+    f.write_text(svg, encoding="utf-8")
+    return f.as_posix()
+
+
 def build_qss(c: Colors) -> str:
     """Build the full stylesheet for a color set."""
 
     grad = f"qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {c.red}, stop:1 {c.cyan})"
+    combo_arrow = _combo_arrow_svg(c)
 
     return f"""
 /* ---------- base ---------- */
@@ -280,11 +309,10 @@ QComboBox::drop-down {{
     width: 22px;
 }}
 QComboBox::down-arrow {{
-    image: none;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid {c.text_muted};
-    margin-right: 8px;
+    image: url("{combo_arrow}");
+    width: 12px;
+    height: 12px;
+    margin-right: 6px;
 }}
 QComboBox QAbstractItemView {{
     background: {c.card};
