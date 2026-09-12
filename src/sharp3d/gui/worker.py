@@ -27,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal
+from .i18n import tr
 
 
 def _quat_multiply(q1, q2):
@@ -95,7 +96,7 @@ class _PipelineWorker:
         try:
             self._ensure_pipeline()
         except Exception as exc:  # noqa: BLE001
-            self._respond("error", (f"预加载失败: {exc}",))
+            self._respond("error", (tr("预加载失败: {}").format(exc),))
 
     def _ensure_pipeline(self, perf_mode="quality", fp16=None):
         # Normalize None to the resolved values BEFORE building the mode key.
@@ -108,7 +109,7 @@ class _PipelineWorker:
         # Rebuild if mode changed
         _mode_key = (perf_mode, fp16)
         if self._pipeline is not None and getattr(self, '_mode_active', None) != _mode_key:
-            self._respond("status", ("性能模式已切换，正在重建管线…",))
+            self._respond("status", (tr("性能模式已切换，正在重建管线…"),))
             self._pipeline = None
             self._compiled = None
             import torch
@@ -148,7 +149,7 @@ class _PipelineWorker:
         self._compiled = sp  # SharpPredictor is callable (predict_fn)
         self._respond("model_ready", ())
         self._respond("model_accel", (sp.accel_status,))
-        self._respond("status", ("模型就绪",))
+        self._respond("status", (tr("模型就绪"),))
 
     # ---- prepare: predict + unproject -> cache gaussians ----------------
     def prepare(self, path, frame_idx, perf_mode="quality", focal_35mm=None):
@@ -193,11 +194,11 @@ class _PipelineWorker:
             n_g = self._gaussians.mean_vectors.numel() // 3
             self._respond("prepared", ({"width": w, "height": h,
                                         "n_gaussians": n_g, "f_px": f_px},))
-            self._respond("status", (f"已重建 3D 场景 · {w}×{h}",))
+            self._respond("status", (tr("已重建 3D 场景 · {}×{}").format(w, h),))
             del g_ndc, img_r
             torch.cuda.empty_cache()
         except Exception as exc:  # noqa: BLE001
-            self._respond("error", (f"准备失败: {exc}",))
+            self._respond("error", (tr("准备失败: {}").format(exc),))
 
     # ---- preview render from cached gaussians ---------------------------
     def render_preview(self, ipd_mm, convergence, strength, preview_width):
@@ -217,7 +218,7 @@ class _PipelineWorker:
             torch.cuda.synchronize()
             self._respond("preview_ready", (sbs.cpu().numpy(),))
         except Exception as exc:  # noqa: BLE001
-            self._respond("error", (f"预览渲染失败: {exc}",))
+            self._respond("error", (tr("预览渲染失败: {}").format(exc),))
 
     # ---- full conversion ------------------------------------------------
     def convert(self, opts):
@@ -252,7 +253,7 @@ class _PipelineWorker:
                                     prepare_input, fast_unproject, render_sbs,
                                     INTERNAL_SHAPE, torch, sharp_io)
         except Exception as exc:  # noqa: BLE001
-            self._respond("error", (f"转换失败: {exc}",))
+            self._respond("error", (tr("转换失败: {}").format(exc),))
 
     def _convert_vr(self, opts):
         """VR panoramic conversion: equirect/fisheye → stereo 3D VR."""
@@ -475,7 +476,7 @@ class _PipelineWorker:
                 )
                 save_ply(merged_ply, 1.0, (1, 1), out.with_suffix(".ply"))
             except Exception as e:
-                self._respond("status", (f"PLY导出失败(不影响转换): {e}",))
+                self._respond("status", (tr("PLY导出失败(不影响转换): {}").format(e),))
 
         # Render VR stereo (adaptive face size based on output resolution)
         render_face = _compute_render_face_size(eye_w, output_projection)
@@ -601,7 +602,7 @@ class _PipelineWorker:
         is_gpu = "nvenc" in enc
         label = "GPU" if is_gpu else "CPU"
         self._respond("status", (
-            f"编码器: {enc} ({label}) · 输出 {vid_w}×{vid_h}",))
+            tr("编码器: {} ({}) · 输出 {}×{}").format(enc, label, vid_w, vid_h),))
 
         writer = VideoWriter(out, fps=out_fps, width=vid_w, height=vid_h,
                              codec=codec, crf=crf)
@@ -1131,11 +1132,11 @@ class _PipelineWorker:
             is_gpu = "nvenc" in enc
             label = "GPU" if is_gpu else "CPU"
             self._respond("status", (
-                f"编码器: {enc} ({label}) · 输出 {out_w}×{out_h}",))
+                tr("编码器: {} ({}) · 输出 {}×{}").format(enc, label, out_w, out_h),))
             if not is_gpu:
                 self._respond("status", (
-                    f"输出 {out_w}×{out_h} 超过NVENC分辨率上限，"
-                    f"已回退CPU编码 ({enc})，CPU占用会较高",))
+                    tr("输出 {}×{} 超过NVENC分辨率上限，已回退CPU编码 ({})，CPU占用会较高").format(
+                        out_w, out_h, enc),))
 
         hdr_out = opts.get("hdr_output", False)
         if hdr_out:
@@ -1341,7 +1342,7 @@ class _PipelineWorker:
                         save_ply(g_world, f_px, (h, w), ply_path)
                         if n_done == 0:
                             self._respond("status", (
-                                f"PLY 序列导出中: {ply_path.parent.name}/",))
+                                tr("PLY 序列导出中: {}/").format(ply_path.parent.name),))
                         del g_world
                     elif want_depth:
                         packed_gpu, depth_np = result
@@ -1439,7 +1440,7 @@ class _PipelineWorker:
     # ---- 2.5D parallax animation ----------------------------------------
     def render_anim(self, opts):
         if self._gaussians is None:
-            self._respond("error", ("请先加载一张图片",))
+            self._respond("error", (tr("请先加载一张图片"),))
             return
         try:
             torch = self._torch
@@ -1476,7 +1477,7 @@ class _PipelineWorker:
                 self._respond("anim_progress", (i + 1, total))
             self._respond("anim_done", ({"n_frames": len(frames)},))
         except Exception as exc:  # noqa: BLE001
-            self._respond("error", (f"动画渲染失败: {exc}",))
+            self._respond("error", (tr("动画渲染失败: {}").format(exc),))
 
     def export_anim(self, opts):
         try:
@@ -1486,7 +1487,7 @@ class _PipelineWorker:
             codec = opts["codec"]
             frames = getattr(self, "_anim_frames", None)
             if not frames:
-                raise RuntimeError("请先生成动画（帧已渲染后才可导出）")
+                raise RuntimeError(tr("请先生成动画（帧已渲染后才可导出）"))
             if codec in ("av1", "libsvtav1"):
                 # Resolve to the best AV1 encoder this machine has (NVENC
                 # first, software fallback), honoring the frame size cap.
@@ -1494,8 +1495,7 @@ class _PipelineWorker:
                 codec = video.resolve_av1(fw, fh)
                 if codec is None:
                     raise RuntimeError(
-                        "当前 ffmpeg 不支持任何 AV1 编码器"
-                        "（需要 libsvtav1 / av1_nvenc / libaom-av1 之一）"
+                        tr("当前 ffmpeg 不支持任何 AV1 编码器（需要 libsvtav1 / av1_nvenc / libaom-av1 之一）")
                     )
             if codec in ("libsvtav1", "av1_nvenc", "libaom-av1"):
                 output_params = video.av1_output_params(codec, 18)
@@ -1511,7 +1511,7 @@ class _PipelineWorker:
             writer.close()
             self._respond("anim_exported", (path,))
         except Exception as exc:  # noqa: BLE001
-            self._respond("error", (f"动画导出失败: {exc}",))
+            self._respond("error", (tr("动画导出失败: {}").format(exc),))
 
     # ---- Gaussian viewer: load PLY + orbit render ----------------------
     def load_ply(self, path):
@@ -1537,9 +1537,9 @@ class _PipelineWorker:
                 "width": self._orig_w,
                 "height": self._orig_h,
             },))
-            self._respond("status", (f"已加载 PLY · {n_g:,} 高斯点",))
+            self._respond("status", (tr("已加载 PLY · {:,} 高斯点").format(n_g),))
         except Exception as exc:  # noqa: BLE001
-            self._respond("error", (f"PLY 加载失败: {exc}",))
+            self._respond("error", (tr("PLY 加载失败: {}").format(exc),))
 
     def render_orbit(self, opts):
         """Render a single orbit view from spherical coordinates."""
@@ -1549,7 +1549,7 @@ class _PipelineWorker:
             from sharp3d.render import render_single
 
             if self._gaussians is None:
-                self._respond("error", ("请先加载 PLY 文件",))
+                self._respond("error", (tr("请先加载 PLY 文件"),))
                 return
 
             azimuth = math.radians(opts.get("azimuth", 0.0))
@@ -1573,7 +1573,7 @@ class _PipelineWorker:
             torch.cuda.synchronize()
             self._respond("orbit_frame", (img.cpu().numpy(),))
         except Exception as exc:  # noqa: BLE001
-            self._respond("error", (f"渲染失败: {exc}",))
+            self._respond("error", (tr("渲染失败: {}").format(exc),))
 
 
 def _child_main(req_q, resp_q, cancel_event):
@@ -1595,8 +1595,8 @@ def _child_main(req_q, resp_q, cancel_event):
             pass
         # Tell GUI so it doesn't hang forever
         try:
-            resp_q.put(("error", (f"子进程启动失败: {exc}",)))
-            resp_q.put(("status", (f"错误: {exc}",)))
+            resp_q.put(("error", (tr("子进程启动失败: {}").format(exc),)))
+            resp_q.put(("status", (tr("错误: {}").format(exc),)))
         except Exception:
             pass
 
@@ -1638,7 +1638,7 @@ def _child_main_inner(req_q, resp_q, cancel_event):
             try:
                 handler(**kwargs)
             except Exception as exc:  # noqa: BLE001
-                resp_q.put(("error", (f"{method} 失败: {exc}",)))
+                resp_q.put(("error", (tr("{} 失败: {}").format(method, exc),)))
     resp_q.close()
 
 

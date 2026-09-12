@@ -5,9 +5,11 @@ from __future__ import annotations
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import (
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QStatusBar,
     QTabWidget,
@@ -23,6 +25,7 @@ from .theme import DISPLAY_FONT, ThemeManager, build_palette, build_qss
 from .widgets import GpuMeter
 from .worker import EngineProcess
 from .. import __version__
+from .i18n import current_language, set_language, tr
 
 
 class MainWindow(QMainWindow):
@@ -80,6 +83,15 @@ class MainWindow(QMainWindow):
         self._gpu = GpuMeter(self._theme.colors)
         header_layout.addWidget(self._gpu)
 
+        # language switcher (takes effect after restart)
+        self._lang = QComboBox()
+        self._lang.addItem("中文", "zh")
+        self._lang.addItem("English", "en")
+        self._lang.setCurrentIndex(1 if current_language() == "en" else 0)
+        self._lang.currentIndexChanged.connect(self._on_language_changed)
+        self._lang.setToolTip("切换界面语言 / Switch UI language (restart to apply)")
+        header_layout.addWidget(self._lang)
+
         root.addWidget(header)
 
         # tabs
@@ -88,12 +100,12 @@ class MainWindow(QMainWindow):
         self._sbs = SbsTab(self._theme, self._engine)
         self._anim = AnimTab(self._theme, self._engine)
         self._vr = VrTab(self._theme, self._engine)
-        self._tabs.addTab(self._sbs, "平面立体转换")
-        self._tabs.addTab(self._vr, "全景转换")
-        self._tabs.addTab(self._anim, "2.5D 视差动画")
+        self._tabs.addTab(self._sbs, tr("平面立体转换"))
+        self._tabs.addTab(self._vr, tr("全景转换"))
+        self._tabs.addTab(self._anim, tr("2.5D 视差动画"))
 
         # Gaussian viewer button in tab bar corner
-        btn_viewer = QPushButton("高斯查看器")
+        btn_viewer = QPushButton(tr("高斯查看器"))
         btn_viewer.clicked.connect(self._open_viewer)
         self._tabs.setCornerWidget(btn_viewer)
 
@@ -102,9 +114,9 @@ class MainWindow(QMainWindow):
         # status bar
         sb = QStatusBar()
         self.setStatusBar(sb)
-        self._status_label = QLabel("正在加载模型…")
+        self._status_label = QLabel(tr("正在加载模型…"))
         sb.addWidget(self._status_label, 1)
-        self._precision_label = QLabel("模型量化精度：未加载")
+        self._precision_label = QLabel(tr("模型量化精度：未加载"))
         self._precision_label.setProperty("cssClass", "hint")
         sb.addPermanentWidget(self._precision_label)
         self._theme_label = QLabel("")
@@ -126,7 +138,7 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------
     def _on_model_accel(self, status: list) -> None:
-        self._precision_label.setText(f"模型量化精度：{precision_text(status)}")
+        self._precision_label.setText(tr("模型量化精度：{}").format(precision_text(status)))
 
     # ------------------------------------------------------------------
     def _open_viewer(self) -> None:
@@ -139,6 +151,15 @@ class MainWindow(QMainWindow):
         self._viewer.activateWindow()
 
     # ------------------------------------------------------------------
+    def _on_language_changed(self, index: int) -> None:
+        lang = self._lang.itemData(index)
+        if lang == current_language():
+            return
+        set_language(lang)
+        QMessageBox.information(
+            self, tr("语言已切换"),
+            tr("界面语言将在下次启动 sharp3d 时生效。"))
+
     def _apply_theme(self, is_dark: bool) -> None:
         c = self._theme.colors
         from PySide6.QtWidgets import QApplication
@@ -152,7 +173,7 @@ class MainWindow(QMainWindow):
         self._vr.apply_theme(c)
         if self._viewer is not None:
             self._viewer.set_colors(c)
-        self._theme_label.setText("暗色模式" if is_dark else "亮色模式")
+        self._theme_label.setText(tr("暗色模式") if is_dark else tr("亮色模式"))
 
     # ------------------------------------------------------------------
     def closeEvent(self, event) -> None:

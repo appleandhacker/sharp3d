@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
 )
 
 from .theme import DISPLAY_FONT, MONO_FONT, Colors
+from .i18n import tr
 
 
 # ---------------------------------------------------------------------------
@@ -178,7 +179,7 @@ class GpuMeter(QWidget):
                 name = name.decode("utf-8", "ignore")
             self._name.setText(name)
         except Exception:
-            self._name.setText("GPU 不可用")
+            self._name.setText(tr("GPU 不可用"))
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
@@ -376,9 +377,9 @@ class FileField(QWidget):
 
         self._edit = QLineEdit()
         self._edit.setReadOnly(True)
-        self._edit.setPlaceholderText("拖入文件/文件夹，或点击浏览…")
+        self._edit.setPlaceholderText(tr("拖入文件/文件夹，或点击浏览…"))
 
-        self._btn = QPushButton("浏览…")
+        self._btn = QPushButton(tr("浏览…"))
         self._btn.setFixedWidth(64)
         self._btn.clicked.connect(self._browse)
 
@@ -389,26 +390,26 @@ class FileField(QWidget):
     def _browse(self) -> None:
         start = self._edit.text() or str(Path.home())
         if self._pick_dir:
-            path = QFileDialog.getExistingDirectory(self, "选择目录", start)
+            path = QFileDialog.getExistingDirectory(self, tr("选择目录"), start)
         elif self._save:
-            path, _ = QFileDialog.getSaveFileName(self, "保存", start, self._filter)
+            path, _ = QFileDialog.getSaveFileName(self, tr("保存"), start, self._filter)
         elif self._allow_folder:
             # Offer both file and folder selection via menu
             from PySide6.QtWidgets import QMenu
             from PySide6.QtCore import QPoint
             menu = QMenu(self)
-            act_file = menu.addAction("选择文件")
-            act_folder = menu.addAction("选择文件夹（批量）")
+            act_file = menu.addAction(tr("选择文件"))
+            act_folder = menu.addAction(tr("选择文件夹（批量）"))
             chosen = menu.exec(self._btn.mapToGlobal(
                 QPoint(0, self._btn.height())))
             if chosen == act_file:
-                path, _ = QFileDialog.getOpenFileName(self, "打开", start, self._filter)
+                path, _ = QFileDialog.getOpenFileName(self, tr("打开"), start, self._filter)
             elif chosen == act_folder:
-                path = QFileDialog.getExistingDirectory(self, "选择文件夹（批量）", start)
+                path = QFileDialog.getExistingDirectory(self, tr("选择文件夹（批量）"), start)
             else:
                 return
         else:
-            path, _ = QFileDialog.getOpenFileName(self, "打开", start, self._filter)
+            path, _ = QFileDialog.getOpenFileName(self, tr("打开"), start, self._filter)
         if path:
             self.set_path(path)
 
@@ -443,7 +444,7 @@ class PreviewPane(QWidget):
         self._colors = colors
         self._stereo = stereo
         self._pixmap: QPixmap | None = None
-        self._message = "拖入图片或视频\n开始立体转换"
+        self._message = tr("拖入图片或视频\n开始立体转换")
         self.setMinimumSize(480, 260)
         self.setAcceptDrops(True)
 

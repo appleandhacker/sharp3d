@@ -22,8 +22,9 @@ from PySide6.QtWidgets import (
 
 from .theme import Colors
 from .worker import EngineProcess
+from .i18n import tr
 
-PLY_FILTER = "Gaussian PLY (*.ply);;所有文件 (*)"
+PLY_FILTER = tr("Gaussian PLY (*.ply);;所有文件 (*)")
 
 
 class OrbitView(QWidget):
@@ -38,7 +39,7 @@ class OrbitView(QWidget):
         super().__init__(parent)
         self._colors = colors
         self._pixmap: QPixmap | None = None
-        self._message = "拖入 PLY 文件打开\n左键旋转 · 滚轮缩放"
+        self._message = tr("拖入 PLY 文件打开\n左键旋转 · 滚轮缩放")
         self._dragging = False
         self._last_pos = QPoint()
         self.setMinimumSize(640, 480)
@@ -146,7 +147,7 @@ class GaussianViewerWindow(QMainWindow):
 
     def __init__(self, engine: EngineProcess, colors: Colors, parent=None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("高斯查看器 — sharp3d")
+        self.setWindowTitle(tr("高斯查看器 — sharp3d"))
         self.resize(900, 680)
         self._engine = engine
         self._colors = colors
@@ -167,16 +168,16 @@ class GaussianViewerWindow(QMainWindow):
         self.setCentralWidget(self._view)
 
         # Toolbar
-        tb = QToolBar("工具")
+        tb = QToolBar(tr("工具"))
         tb.setMovable(False)
         self.addToolBar(tb)
-        btn_open = QPushButton("打开 PLY…")
+        btn_open = QPushButton(tr("打开 PLY…"))
         btn_open.clicked.connect(self._on_open)
         tb.addWidget(btn_open)
-        btn_reset = QPushButton("重置视角")
+        btn_reset = QPushButton(tr("重置视角"))
         btn_reset.clicked.connect(self._on_reset)
         tb.addWidget(btn_reset)
-        self._info = QLabel("  未加载")
+        self._info = QLabel(tr("  未加载"))
         tb.addWidget(self._info)
 
         # Render throttle: continuous during drag, single-shot for wheel
@@ -193,13 +194,13 @@ class GaussianViewerWindow(QMainWindow):
     # ---- actions --------------------------------------------------------
     def _on_open(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "打开高斯 PLY 文件", str(Path.home()), PLY_FILTER)
+            self, tr("打开高斯 PLY 文件"), str(Path.home()), PLY_FILTER)
         if path:
-            self._view.set_message("加载中…")
+            self._view.set_message(tr("加载中…"))
             self._engine.load_ply(path)
 
     def _on_file_dropped(self, path: str) -> None:
-        self._view.set_message("加载中…")
+        self._view.set_message(tr("加载中…"))
         self._engine.load_ply(path)
 
     def _on_reset(self) -> None:
@@ -246,7 +247,7 @@ class GaussianViewerWindow(QMainWindow):
     def _on_ply_loaded(self, info: dict) -> None:
         self._loaded = True
         n = info.get("n_gaussians", 0)
-        self._info.setText(f"  {n:,} 高斯点 · 拖拽旋转 · 滚轮缩放")
+        self._info.setText(tr("  {:,} 高斯点 · 拖拽旋转 · 滚轮缩放").format(n))
         self._azimuth = 180.0
         self._elevation = 0.0
         self._distance = 5.0
