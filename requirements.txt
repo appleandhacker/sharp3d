@@ -32,11 +32,14 @@ PySide6==6.11.1
 # ---- 核心依赖 ----
 numpy==2.4.4
 Pillow==12.2.0
+opencv-python-headless==5.0.0.93
 pillow-heif==1.4.0
 imageio==2.37.4
 imageio-ffmpeg==0.6.0
+# 以下为 sharp (ml-sharp, editable) 声明的依赖，显式锁版本保证环境一致
 scipy==1.18.0
 plyfile==1.1.4
+matplotlib==3.11.1
 safetensors==0.8.0
 
 # ---- 模型/推理辅助 ----
@@ -45,9 +48,8 @@ jaxtyping==0.3.11
 huggingface-hub==1.24.0
 
 # ---- GPU 监控 ----
-pynvml==13.0.1
+# nvidia-ml-py 提供 pynvml 模块（pynvml 包已废弃，勿重复安装）
 nvidia-ml-py==13.610.43
-nvtx==0.2.15
 
 # ---- ONNX 导出 ----
 onnx==1.22.0
@@ -55,9 +57,3 @@ onnxscript==0.7.1
 
 # ---- 打包分发 ----
 pyinstaller==6.19.0
-
-# ---- 通用工具 ----
-tqdm==4.69.0
-rich==15.0.0
-matplotlib==3.11.1
-PyYAML==6.0.3
