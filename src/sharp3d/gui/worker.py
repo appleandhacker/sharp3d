@@ -135,7 +135,9 @@ class _PipelineWorker:
         cache_dir = resolve_cache_dir()
 
         def _progress(stage, pct):
-            self._respond("model_load_progress", (stage, pct))
+            # stage text originates from core predict.py — translate here so
+            # the core module stays GUI-free while EN users see English
+            self._respond("model_load_progress", (tr(stage), pct))
             self._respond("status", (stage + "…",))
 
         sp = SharpPredictor(
