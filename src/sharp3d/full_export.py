@@ -25,6 +25,42 @@ from sharp.models.encoders.spn_encoder import merge
 logger = logging.getLogger(__name__)
 
 
+# SlidingPyramidNetwork patch layouts, keyed by total patch count.
+#   quality (use_patch_overlap=True):  overlap .25/.5 -> x0 5x5=25, x1 3x3=9,
+#                                      x2 1x1 -> 35 patches, merge padding 3
+#   speed   (use_patch_overlap=False): overlap 0/0    -> x0 4x4=16, x1 2x2=4,
+#                                      x2 1x1 -> 21 patches, merge padding 0
+# Source of truth: ml-sharp/src/sharp/models/encoders/spn_encoder.py:forward
+# (steps 1/3), which selects the overlap ratios and padding from
+# use_patch_overlap. Keep this in sync if that ever gains a third mode.
+_SPN_LAYOUTS: dict[int, tuple[int, int]] = {35: (5, 3), 21: (4, 2)}
+
+
+def _spn_geometry(n_patches: int) -> tuple[int, list[int], int]:
+    """Derive the SPN patch geometry from the total patch count.
+
+    Returns ``(x0_tile_size, split_sizes, padding)``. The split sizes drive
+    ``torch.split`` on the patch-ViT output and the ``[:x0_tile_size]`` slice
+    that feeds the two latent branches; ``padding`` must match, because
+    ``merge()`` infers its own grid from ``sqrt(len)`` and then trims each
+    interior seam by exactly this many pixels.
+
+    Raises ValueError for an unsupported count rather than exporting a graph
+    with the wrong grouping — a mis-grouped graph loads fine and only fails
+    (or silently produces wrong geometry) at inference time.
+    """
+    try:
+        g0, g1 = _SPN_LAYOUTS[n_patches]
+    except KeyError:
+        raise ValueError(
+            f"n_patches={n_patches} 不受支持（仅 35=quality / 21=speed）"
+        ) from None
+    split_sizes = [g0 * g0, g1 * g1, 1]
+    assert sum(split_sizes) == n_patches, (split_sizes, n_patches)
+    padding = 3 if g0 == 5 else 0
+    return split_sizes[0], split_sizes, padding
+
+
 class _ExportWrapper(nn.Module):
     """Flatten the Gaussians3D NamedTuple into 5 ordered tensor outputs."""
 
@@ -78,19 +114,22 @@ def export_spn_tail(predictor, onnx_path: Path, device: torch.device,
     """Export the post-ViT graph (SPN merge/upsample + decoder + composer).
 
     Inputs: image (1,3,1536,1536), disparity_factor (1,), patch-ViT features
-    (35,1024,24,24), two patch-ViT intermediates (35,577,1024 each),
-    image-ViT features (1,1024,24,24). Weights ≈0.3GB — single-file ONNX.
+    (n_patches,1024,24,24), two patch-ViT intermediates (n_patches,577,1024
+    each), image-ViT features (1,1024,24,24). Weights ≈0.3GB — single-file ONNX.
+
+    ``n_patches`` (35 quality / 21 speed) fixes both the dummy input shapes and
+    the merge grouping — the two are the same table (see ``_spn_geometry``).
     """
     from .spn_tail import SpnTail
 
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
-    tail = SpnTail(predictor).eval().float()
+    tail = SpnTail(predictor, n_patches).eval().float()
 
     image = torch.randn(1, 3, 1536, 1536, device=device)
     df = torch.tensor([1.0], device=device, dtype=torch.float32)
-    pe_feat = torch.randn(35, 1024, 24, 24, device=device)
-    pe_i0 = torch.randn(35, 577, 1024, device=device)
-    pe_i1 = torch.randn(35, 577, 1024, device=device)
+    pe_feat = torch.randn(n_patches, 1024, 24, 24, device=device)
+    pe_i0 = torch.randn(n_patches, 577, 1024, device=device)
+    pe_i1 = torch.randn(n_patches, 577, 1024, device=device)
     ie_feat = torch.randn(1, 1024, 24, 24, device=device)
     args = (image, df, pe_feat, pe_i0, pe_i1, ie_feat)
 
@@ -118,25 +157,41 @@ class _SpnFront(torch.nn.Module):
     Pure convs + ConvTranspose + slice/cat (no norm layers): measured fp16
     safe, unlike the decoder half whose GroupNorm-family ops degrade under
     TRT fp16 (autocast keeps those in fp32; TRT has no such policy).
+
+    ``n_patches`` selects the patch grouping (35 quality / 21 speed). The
+    derived values are plain Python ints/lists stored on the module: the
+    legacy (``dynamo=False``) tracer evaluates attribute reads eagerly and
+    bakes them in as constants, exactly like ``_TailFromEncodings`` already
+    does with ``_n_enc``/``_sort2``. Do NOT turn them into buffers or tensors —
+    that would promote them to graph tensors.
     """
 
     _OUT_NAMES = ["enc0", "enc1", "enc2", "enc3", "enc4"]
 
-    def __init__(self, predictor):
+    def __init__(self, predictor, n_patches: int):
         super().__init__()
         self.predictor = predictor
+        # Validate here, not in forward(): torch.onnx.export wraps exceptions
+        # raised during tracing, which would bury this message.
+        x0, split_sizes, padding = _spn_geometry(n_patches)
+        self._n_patches = n_patches
+        self._x0_tile_size = x0        # int → traced constant
+        self._split_sizes = split_sizes  # list[int] → onnx::Constant for Split
+        self._padding = padding        # int → traced constant
 
     def forward(self, pe_feat, pe_int0, pe_int1, ie_feat):
         spn = self.predictor.monodepth_model.monodepth_predictor.encoder
+        # Latent branches consume only the x0-resolution patches, i.e. the
+        # first `batch_size * x0_tile_size` rows (batch_size == 1 here).
         x_latent0 = spn.upsample_latent0(
-            merge(spn.patch_encoder.reshape_feature(pe_int0)[:25],
-                  batch_size=1, padding=3))
+            merge(spn.patch_encoder.reshape_feature(pe_int0)[:self._x0_tile_size],
+                  batch_size=1, padding=self._padding))
         x_latent1 = spn.upsample_latent1(
-            merge(spn.patch_encoder.reshape_feature(pe_int1)[:25],
-                  batch_size=1, padding=3))
-        x0e, x1e, x2e = torch.split(pe_feat, [25, 9, 1], dim=0)
-        x0 = spn.upsample0(merge(x0e, batch_size=1, padding=3))
-        x1 = spn.upsample1(merge(x1e, batch_size=1, padding=2 * 3))
+            merge(spn.patch_encoder.reshape_feature(pe_int1)[:self._x0_tile_size],
+                  batch_size=1, padding=self._padding))
+        x0e, x1e, x2e = torch.split(pe_feat, self._split_sizes, dim=0)
+        x0 = spn.upsample0(merge(x0e, batch_size=1, padding=self._padding))
+        x1 = spn.upsample1(merge(x1e, batch_size=1, padding=2 * self._padding))
         x2 = spn.upsample2(x2e)
         lowres = spn.upsample_lowres(ie_feat)
         lowres = spn.fuse_lowres(torch.cat((x2, lowres), dim=1))
@@ -201,12 +256,12 @@ def export_spn_split(predictor, device: torch.device, n_patches: int,
     front_path = onnx_dir / f"spn_front_{n_patches}.onnx"
     rest_path = onnx_dir / f"tail_rest_{n_patches}.onnx"
 
-    front = _SpnFront(predictor).eval().float()
+    front = _SpnFront(predictor, n_patches).eval().float()
     rest = _TailFromEncodings(predictor).eval().float()
 
-    pe_feat = torch.randn(35, 1024, 24, 24, device=device)
-    pe_i0 = torch.randn(35, 577, 1024, device=device)
-    pe_i1 = torch.randn(35, 577, 1024, device=device)
+    pe_feat = torch.randn(n_patches, 1024, 24, 24, device=device)
+    pe_i0 = torch.randn(n_patches, 577, 1024, device=device)
+    pe_i1 = torch.randn(n_patches, 577, 1024, device=device)
     ie_feat = torch.randn(1, 1024, 24, 24, device=device)
 
     with torch.no_grad():

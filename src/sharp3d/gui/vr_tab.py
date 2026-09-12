@@ -35,6 +35,10 @@ VID_FILTER = tr("视频 (*.mp4 *.mkv *.avi *.mov *.webm);;所有文件 (*)")
 IMG_FILTER = tr("图片 (*.png *.jpg *.jpeg *.bmp *.webp);;所有文件 (*)")
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+# Codec ids by combo index — matches ["AV1", "H.265", "H.264"] below (note
+# this tab's order differs from sbs_tab's). Index (not currentText) so the
+# mapping cannot break if the labels ever get wrapped in tr().
+_CODECS = ("av1", "h265", "h264")
 
 # Output resolution presets: (label, width_per_eye, height_per_eye)
 RES_PRESETS = [
@@ -59,7 +63,7 @@ class VrTab(QWidget):
     """Panoramic video → stereo 3D VR conversion workspace."""
 
     status_message = Signal(str)
-    request_convert = Signal(dict)
+    request_convert = Signal(dict, int)
 
     def __init__(self, theme: ThemeManager, engine: EngineProcess, parent=None) -> None:
         super().__init__(parent)
@@ -67,6 +71,8 @@ class VrTab(QWidget):
         self._engine = engine
         self._converting = False
         self._n_frames = 1
+        # Ownership of the in-flight convert request (see sbs_tab).
+        self._job_id = -1
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 12, 14, 14)
@@ -460,7 +466,8 @@ class VrTab(QWidget):
         self._btn_cancel.setEnabled(True)
         self._progress.set_busy(False)
         self._progress.set_value(0.0)
-        self.request_convert.emit(opts)
+        self._job_id = self._engine.new_job()
+        self.request_convert.emit(opts, self._job_id)
 
     def _build_opts(self, inp: str, out: str) -> dict:
         """Build VR conversion options."""
@@ -476,7 +483,7 @@ class VrTab(QWidget):
             else:
                 eye_h = eye_w
 
-        codec_map = {"H.264": "h264", "H.265": "h265", "AV1": "av1"}
+        codec = _CODECS[self._codec.currentIndex()]
         fps_text = self._fps.currentText()
         out_fps = None if fps_text == tr("跟随源") else float(fps_text)
 
@@ -521,7 +528,7 @@ class VrTab(QWidget):
             "eye_height": eye_h,
             "ipd_mm": self._s_ipd.value(),
             "strength": self._s_strength.value(),
-            "codec": codec_map[self._codec.currentText()],
+            "codec": codec,
             "crf": int(self._crf.currentText()),
             "audio": self._chk_audio.isChecked(),
             "perf_mode": "quality" if self._perf_mode.currentIndex() == 0 else "speed",
@@ -569,9 +576,9 @@ class VrTab(QWidget):
             f"{'✔' if ok else '✘'} {name}" for name, ok in status))
 
     def _on_convert_progress(self, frame: int, total: int, fps: float,
-                             elapsed: float) -> None:
+                             elapsed: float, job_id: int = -1) -> None:
         # All tabs share one EngineProcess — ignore other tabs' conversions.
-        if not self._converting:
+        if job_id != self._job_id or not self._converting:
             return
         file_frac = frame / total if total else 0.0
         self._progress.set_value(file_frac)
@@ -583,8 +590,8 @@ class VrTab(QWidget):
         )
 
     def _on_convert_done(self, result: dict) -> None:
-        if not self._converting:
-            return  # another tab's conversion — ignore
+        if result.get("job_id", -1) != self._job_id:
+            return  # another tab's (or a stale) conversion — ignore
         if result.get("cancelled"):
             self._converting = False
             self._btn_start.setEnabled(True)
@@ -596,6 +603,7 @@ class VrTab(QWidget):
             return
 
         self._converting = False
+        self._job_id = -1
         self._btn_start.setEnabled(True)
         self._btn_cancel.setEnabled(False)
         self._progress.set_value(1.0)
@@ -607,10 +615,11 @@ class VrTab(QWidget):
         )
         self.status_message.emit(tr("转换完成 → {}").format(result['output']))
 
-    def _on_error(self, msg: str) -> None:
-        if not self._converting:
-            return  # another tab's conversion — ignore
+    def _on_error(self, msg: str, job_id: int = -1) -> None:
+        if job_id != self._job_id or not self._converting:
+            return  # another tab's (or a global) error — ignore
         self._converting = False
+        self._job_id = -1
         self._btn_start.setEnabled(True)
         self._btn_cancel.setEnabled(False)
         self._progress.set_busy(False)

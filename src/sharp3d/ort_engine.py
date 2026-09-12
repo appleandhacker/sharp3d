@@ -178,7 +178,15 @@ def _export_onnx_model(module, onnx_path: Path, device: torch.device,
 
 
 def export_patch_encoder(predictor, onnx_path: Path, device: torch.device):
-    """Export patch_encoder to ONNX format."""
+    """Export patch_encoder to ONNX format.
+
+    The batch dim is fixed at 35 here deliberately. Unlike spn_front/tail_rest
+    (which are per-mode files), ``patch_encoder.onnx`` is a single shared
+    artifact whose cached TRT engine is reused across both perf modes, so it
+    must carry the quality-mode shape; the speed-mode runtime feeds 21 patches
+    and TRT rebuilds/re-optimizes as needed. Exporting this at 21 would break
+    the quality path.
+    """
     patch_encoder = predictor.monodepth_model.monodepth_predictor.encoder.patch_encoder
     dummy = torch.randn(35, 3, 384, 384, device=device, dtype=torch.float32)
     _export_onnx_model(
@@ -233,6 +241,10 @@ class ORTEncoder(nn.Module):
         self._trt_cache_dir = trt_cache_dir
         self._label = label
         self._qdq = qdq   # explicit QDQ graph (FP8 experiment)
+        # Honored in _create_session below (it used to be accepted and then
+        # silently ignored — the workspace size stayed hardcoded at 2GB while
+        # the parameter implied otherwise).
+        self._workspace_gb = int(workspace_gb)
 
         _ensure_cudnn_path()
         self._session = self._create_session()
@@ -260,6 +272,16 @@ class ORTEncoder(nn.Module):
         self.intermediate_features_ids = list(
             intermediate_ids or self._INTERMEDIATE_IDS)
 
+        # IO Binding failure bookkeeping. A *transient* failure (most commonly
+        # a CUDA OOM while the video pipeline holds its double buffers) must not
+        # disable the zero-copy path for the rest of the session: that turned a
+        # one-frame hiccup into a permanent ~30ms/frame numpy penalty with no
+        # visible indication. Only a run of consecutive failures is treated as
+        # structural (unsupported by this ORT build) and latches the fallback.
+        self._iobinding_failed = False
+        self._iobinding_fail_streak = 0
+        self._IOBINDING_MAX_FAILS = 5
+
         self.using_trt = "TensorrtExecutionProvider" in             self._session.get_providers()
         logger.info("ORT %s ready: %d outputs, grid=%s, trt=%s",
                      label, self._n_outputs, self._grid_size, self.using_trt)
@@ -281,6 +303,13 @@ class ORTEncoder(nn.Module):
         so.log_severity_level = 2
 
         cache_base = _ascii_safe_trt_dir(self._trt_cache_dir)
+        if self._workspace_gb != 2:
+            # Engines built with a different trt_max_workspace_size can pick
+            # different algorithms, so they must not share the default cache
+            # dir (a stale engine for another workspace would be reused
+            # silently). The default (2GB) keeps the historical path so all
+            # existing caches stay valid — no forced rebuild for anyone.
+            cache_base = cache_base / f"ws{self._workspace_gb}"
         cache_base.mkdir(parents=True, exist_ok=True)
 
         trt_opts = {
@@ -288,7 +317,7 @@ class ORTEncoder(nn.Module):
             # 2GB workspace per engine. 1GB forced TRT into slower algorithms
             # (speed regression); 4GB overflowed 12GB VRAM into shared memory.
             # 2GB keeps total VRAM ~9.5GB (safe margin) with fast algorithms.
-            "trt_max_workspace_size": 2 * 1024 * 1024 * 1024,
+            "trt_max_workspace_size": self._workspace_gb * 1024 * 1024 * 1024,
             "trt_engine_cache_enable": True,
             "trt_engine_cache_path": str(cache_base),
         }
@@ -413,7 +442,12 @@ class ORTEncoder(nn.Module):
 
     def _forward_numpy(self, x: torch.Tensor):
         """Fallback path: GPU → CPU numpy → ORT → CPU numpy → GPU."""
-        x_np = x.detach().cpu().numpy()
+        # Must mirror the FP32 cast in _forward_iobinding (see the comment
+        # there): after predictor.half() the patches arrive as float16, and the
+        # ONNX session declares float32 inputs. Without this the numpy path —
+        # which is exactly where we land when IO Binding fails — raises a dtype
+        # mismatch instead of producing a result.
+        x_np = x.detach().float().cpu().numpy()
         outputs = self._session.run(None, {self._input_name: x_np})
 
         features = torch.from_numpy(outputs[0]).to(self.device, non_blocking=True)
@@ -445,13 +479,32 @@ class ORTEncoder(nn.Module):
         # Stream-ordering sync lives inside _forward_iobinding (after the
         # input staging copy); the numpy fallback path syncs via .cpu().
         _t0 = time.perf_counter() if profiling.ENABLED else 0.0
-        try:
-            out = self._forward_iobinding(x)
-        except Exception as e:
-            if not getattr(self, '_iobinding_failed', False):
-                logger.warning("IO Binding failed, falling back to numpy: %s", e)
-                self._iobinding_failed = True
-            out = self._forward_numpy(x)
+        if not self._iobinding_failed:
+            try:
+                out = self._forward_iobinding(x)
+                self._iobinding_fail_streak = 0   # recovered — clear the streak
+                if profiling.ENABLED:
+                    profiling.add_ort(self._label,
+                                      (time.perf_counter() - _t0) * 1000.0)
+                return out
+            except Exception as e:
+                self._iobinding_fail_streak += 1
+                if self._iobinding_fail_streak >= self._IOBINDING_MAX_FAILS:
+                    # Structural: latch to numpy for good, but say so loudly —
+                    # this is a multi-x slowdown, not a cosmetic warning.
+                    self._iobinding_failed = True
+                    logger.error(
+                        "IO Binding 连续失败 %d 次，已永久回退 numpy 路径"
+                        "（性能显著下降，GPU 零拷贝加速失效）: %s",
+                        self._iobinding_fail_streak, e)
+                else:
+                    logger.warning("IO Binding failed (%d/%d), using numpy for "
+                                   "this frame: %s",
+                                   self._iobinding_fail_streak,
+                                   self._IOBINDING_MAX_FAILS, e)
+        else:
+            logger.debug("IO Binding disabled earlier; using numpy path")
+        out = self._forward_numpy(x)
         if profiling.ENABLED:
             profiling.add_ort(self._label, (time.perf_counter() - _t0) * 1000.0)
         return out
@@ -491,6 +544,11 @@ class ORTRestSession:
             logger.info("FP32 CUDA 会话就绪: %s", label)
         else:
             engine_dir = _ascii_safe_trt_dir(trt_cache_dir) / "tail" / label
+            if workspace_gb != 2:
+                # Same rationale as ORTEncoder: key the engine cache on the
+                # build-affecting workspace size; default keeps the historical
+                # path so cached engines (label "35"/"21") stay valid.
+                engine_dir = engine_dir.parent / f"{label}_ws{workspace_gb}"
             engine_dir.mkdir(parents=True, exist_ok=True)
             trt_opts = {
                 "trt_fp16_enable": True,
@@ -600,11 +658,18 @@ class ORTFullPredictor(nn.Module):
                 split(xn, overlap_ratio=0.25, patch_size=384),
                 split(x1, overlap_ratio=0.5, patch_size=384),
                 x2), dim=0)
-        else:  # speed mode: 21 = 4×4 + 2×2 + 1×1, no overlap
+        elif self._n_patches == 21:
+            # speed mode: 21 = 4×4 + 2×2 + 1×1, no overlap
             patches = torch.cat((
                 split(xn, overlap_ratio=0.0, patch_size=384),
                 split(x1, overlap_ratio=0.0, patch_size=384),
                 x2), dim=0)
+        else:
+            # Fail loudly: a silent wrong-branch would feed the wrong number of
+            # patches to graphs built for a different layout, producing either a
+            # shape error deep in the tail or plausible-looking wrong geometry.
+            raise ValueError(
+                f"不支持的 n_patches={self._n_patches}（仅 35 / 21）")
 
         pe_feat, pe_ints = self._patch(patches)
         ie_feat, _ = self._image(x2)

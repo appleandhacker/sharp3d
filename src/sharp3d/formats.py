@@ -70,13 +70,26 @@ def output_size(fmt: str, w: int, h: int) -> tuple[int, int]:
 
 
 def _squeeze(img: "torch.Tensor", size: tuple[int, int]) -> "torch.Tensor":
-    """(H, W, 3) uint8 -> bilinear-resized (size_h, size_w, 3) uint8."""
+    """(H, W, 3) uint8 -> bilinear-resized (size_h, size_w, 3) uint8.
+
+    Bilinear resampling needs a wider dtype (uint8 input raises
+    NotImplementedError), but converting the whole frame at once co-resident
+    a 4x-inflated float frame with its float result — ~144MB transient for a
+    4K eye at 2:1. Channels are independent under bilinear interpolation, so
+    converting one channel at a time is byte-identical to the old whole-frame
+    path while cutting the transient ~2.5x.
+    """
     import torch
     import torch.nn.functional as F
 
-    t = img.permute(2, 0, 1)[None].float()
-    out = F.interpolate(t, size=size, mode="bilinear", align_corners=True)
-    return out[0].permute(1, 2, 0).round().clamp(0, 255).to(torch.uint8)
+    out = torch.empty((size[0], size[1], img.shape[2]),
+                      dtype=torch.uint8, device=img.device)
+    for c in range(img.shape[2]):
+        plane = F.interpolate(
+            img[:, :, c][None, None].float(), size=size,
+            mode="bilinear", align_corners=True)[0, 0]
+        out[:, :, c] = plane.round_().clamp_(0, 255).to(torch.uint8)
+    return out
 
 
 def pack(fmt: str, sbs: "torch.Tensor") -> "torch.Tensor":

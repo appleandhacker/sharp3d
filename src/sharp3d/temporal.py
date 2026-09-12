@@ -304,9 +304,18 @@ class TemporalStabilizer:
         N = z.numel()
 
         # Prepare current frame at flow resolution.
+        #
+        # align_corners=True throughout this module. The sampling grid
+        # built below (see the /(W-1), /(H-1) normalization) is explicitly
+        # the align_corners=True convention — it maps pixel *centers* 0 and
+        # W-1 onto -1 and +1. Using the False convention for the resampling
+        # ops (as this call and the flow upsample used to) puts the two
+        # coordinate systems half a pixel apart, so every warp carried a
+        # systematic 0.5 * (H/Hf) px bias — invisible per frame, but it
+        # accumulates into a slow drift of the stabilized depth.
         curr_img = interpolate(img, size=(self.flow_resolution,
                                             self.flow_resolution),
-                                 mode="bilinear", align_corners=False)
+                                 mode="bilinear", align_corners=True)
 
         # First frame: store and return.
         if self._prev_z is None or self._prev_img is None:
@@ -337,13 +346,22 @@ class TemporalStabilizer:
         occ_mask = cycle_err > 2.0  # (1, 1, Hf, Wf) — True = occluded
 
         # ── Upsample flow + occlusion to full z resolution ───────────────
+        if self._shape is None:
+            # Unrecognised gaussian count: we cannot reshape z into a grid,
+            # so the flow warp below is impossible. Fall back to the
+            # scale-shift path (which is purely element-wise and works on
+            # any length) instead of aborting stabilization entirely.
+            self._prev_z = z.clone()
+            self._prev_img = curr_img
+            return self._stabilize_ema(g_ndc)
         L, H, W = self._shape  # e.g. (2, 1536, 1536)
         scale_h = H / self.flow_resolution
         scale_w = W / self.flow_resolution
 
-        # Scale flow values to full resolution.
+        # Scale flow values to full resolution. align_corners=True to match
+        # the grid convention used by every grid_sample in this module.
         flow_full = interpolate(flow_fwd, size=(H, W), mode="bilinear",
-                                  align_corners=False)
+                                  align_corners=True)
         flow_full[:, 0] *= scale_w  # x displacement
         flow_full[:, 1] *= scale_h  # y displacement
 
@@ -463,11 +481,19 @@ class TemporalStabilizer:
         The gaussian grid side is internal_resolution / 2 (768 for the
         released SHARP model) — the old hardcoded 1536² checks never
         matched, degrading flow mode to a meaningless (1, 1, N) layout.
+
+        Returns None on an unrecognised count. It previously fell back to
+        ``(1, 1, N)``: that is a *plausible-looking* shape which is never
+        the truth, so instead of skipping the flow path the caller went on
+        to treat 1.18M gaussians as a 1×1 image of height N — every
+        subsequent warp/index was silently garbage rather than absent.
+        Callers all check ``if grid is None`` (see ``stabilize``), so
+        returning None is the honest signal.
         """
+        self._shape = None
         for layers in (2, 1):
             if N % layers == 0:
                 side = math.isqrt(N // layers)
                 if side * side * layers == N:
                     self._shape = (layers, side, side)
                     return
-        self._shape = (1, 1, N)

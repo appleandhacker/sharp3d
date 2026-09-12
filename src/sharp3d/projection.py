@@ -598,14 +598,20 @@ def _build_equirect_plan(
     abs_y = y.abs()
     abs_z = z.abs()
 
-    # Determine dominant axis (face selection)
-    face_idx = torch.zeros(out_h, out_w, dtype=torch.long, device=device)
-    face_idx[(x > 0) & (abs_x >= abs_y) & (abs_x >= abs_z)] = 0   # +X
-    face_idx[(x < 0) & (abs_x >= abs_y) & (abs_x >= abs_z)] = 1   # -X
-    face_idx[(y > 0) & (abs_y > abs_x) & (abs_y >= abs_z)] = 2    # +Y
-    face_idx[(y < 0) & (abs_y > abs_x) & (abs_y >= abs_z)] = 3    # -Y
-    face_idx[(z > 0) & (abs_z > abs_x) & (abs_z > abs_y)] = 4     # +Z
-    face_idx[(z < 0) & (abs_z > abs_x) & (abs_z > abs_y)] = 5     # -Z
+    # Determine dominant axis (face selection). Nested argmax with a fixed
+    # priority X > Y > Z: each pixel lands in exactly one face by
+    # construction (the previous incremental mask chain mixed strict and
+    # non-strict comparisons, which was equivalent but only provable by
+    # walking every tie case — and a fall-through silently aliased to +X
+    # because the tensor was zero-initialized).
+    face_x = (abs_x >= abs_y) & (abs_x >= abs_z)
+    face_y = ~face_x & (abs_y >= abs_z)
+    face_idx = torch.where(
+        face_x,
+        torch.where(x >= 0, 0, 1),
+        torch.where(face_y, torch.where(y >= 0, 2, 3),
+                    torch.where(z >= 0, 4, 5)),
+    )
 
     # Compute UV on each face using the face's projection
     u = torch.zeros(out_h, out_w, device=device)

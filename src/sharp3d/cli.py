@@ -45,6 +45,15 @@ def main():
 
     args = parser.parse_args()
 
+    # Range validation (argparse choices would print an unreadable list for
+    # numeric ranges; explicit checks give one-line errors).
+    if not (0 <= args.crf <= 51):
+        parser.error(f"--crf 必须在 0-51 之间（收到 {args.crf}）")
+    if args.ipd <= 0:
+        parser.error(f"--ipd 必须为正数（收到 {args.ipd}）")
+    if args.keyframe_interval < 1:
+        parser.error(f"--keyframe-interval 必须 >= 1（收到 {args.keyframe_interval}）")
+
     input_path = Path(args.input)
     if not input_path.exists():
         print(f"Error: Input file not found: {input_path}")

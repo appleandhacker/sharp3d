@@ -19,15 +19,20 @@ Layout:
 """
 
 import gc
+import logging
 import math
 import multiprocessing as mp
 import os
+import queue
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
 from PySide6.QtCore import QObject, QTimer, Signal
 from .i18n import tr
+
+logger = logging.getLogger(__name__)
 
 
 def _quat_multiply(q1, q2):
@@ -237,7 +242,10 @@ class _PipelineWorker:
             from sharp3d.unproject import prepare_input, fast_unproject, INTERNAL_SHAPE
             from sharp3d.render import render_sbs
 
-            self._cancel_event.clear()
+            # No cancel_event.clear() here: clearing at job start silently
+            # wiped a cancel clicked while this request was still queued
+            # behind the previous one. The GUI clears the shared event when
+            # the pipeline goes idle instead (EngineProcess._poll).
             path = Path(opts["input"])
             out = Path(opts["output"])
             ipd_scene = (opts["ipd_mm"] / 1000.0) * opts["strength"]
@@ -266,7 +274,7 @@ class _PipelineWorker:
         from sharp3d.projection import equirect_to_cubemap, fisheye_to_cubemap
         from sharp3d.render_vr import render_vr_stereo
 
-        self._cancel_event.clear()
+        # No cancel_event.clear() — see the note in convert().
         path = Path(opts["input"])
         out = Path(opts["output"])
         ipd_scene = (opts["ipd_mm"] / 1000.0) * opts["strength"]
@@ -1449,7 +1457,7 @@ class _PipelineWorker:
             from sharp.utils import camera as sharp_camera
             from sharp3d.render import render_single
 
-            self._cancel_event.clear()
+            # No cancel_event.clear() — see the note in convert().
             params = sharp_camera.TrajectoryParams(
                 type=opts["type"], max_disparity=opts["max_disparity"],
                 max_zoom=opts["max_zoom"], num_steps=opts["num_steps"],
@@ -1505,6 +1513,9 @@ class _PipelineWorker:
                 output_params = ["-crf", "18", "-preset", "medium"]
                 if codec == "libx265":
                     output_params += ["-tag:v", "hvc1"]
+            # Fragmented container, matching every other video output so the
+            # export is playable while frames are still being written.
+            output_params += video.MOVFLAGS_LIVE
             writer = imageio.get_writer(path, fps=opts["fps"], codec=codec,
                                        quality=8, pixelformat="yuv420p",
                                        output_params=output_params)
@@ -1661,15 +1672,25 @@ class EngineProcess(QObject):
     model_accel = Signal(list)  # [(name, enabled), ...]
     prepared = Signal(dict)
     preview_ready = Signal(object)
-    convert_progress = Signal(int, int, float, float)  # done, total, avg_fps, elapsed_s
-    convert_done = Signal(dict)
-    anim_progress = Signal(int, int)
-    anim_done = Signal(dict)
-    anim_exported = Signal(str)
-    ply_loaded = Signal(dict)
+    # job_id: which request the progress belongs to (-1 = unattributed).
+    convert_progress = Signal(int, int, float, float, int)
+    convert_done = Signal(dict)              # payload carries "job_id"
+    anim_progress = Signal(int, int, int)
+    anim_done = Signal(dict)                 # payload carries "job_id"
+    anim_exported = Signal(str, int)         # (path, job_id)
+    ply_loaded = Signal(dict)                # payload carries "job_id"
     orbit_frame = Signal(object)
-    error = Signal(str)
+    # job_id: -1 = global (startup / no active job); tabs filter on it.
+    error = Signal(str, int)
     status = Signal(str)
+
+    # Responses that end the request they belong to. The child processes
+    # requests strictly sequentially, so attribution is a FIFO: everything
+    # emitted before the terminal response belongs to the front job.
+    _TERMINAL_RESPONSES = frozenset({
+        "prepared", "preview_ready", "convert_done", "anim_done",
+        "anim_exported", "ply_loaded", "orbit_frame", "model_ready", "error",
+    })
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1677,6 +1698,11 @@ class EngineProcess(QObject):
         self._req_q = ctx.Queue()
         self._resp_q = ctx.Queue()
         self._cancel_event = ctx.Event()
+        # Job ownership: tabs call new_job() before emitting a request and
+        # compare the id on responses, so one tab's completion can no longer
+        # reset another tab's in-flight state (all tabs share one process).
+        self._job_seq = 0
+        self._active_jobs: deque[int] = deque()
         self._proc = ctx.Process(
             target=_child_main,
             args=(self._req_q, self._resp_q, self._cancel_event),
@@ -1693,16 +1719,65 @@ class EngineProcess(QObject):
         self._poll_timer.timeout.connect(self._poll)
         self._poll_timer.start(20)
 
+    # ---- job ownership ---------------------------------------------------
+    def new_job(self) -> int:
+        """Issue a job id and mark it active.
+
+        Tabs call this right before emitting a request; response handlers
+        compare the id they receive against the one they stored. Auto-stamped
+        requests (preload, PLY viewer) don't need this — they have no owner
+        to filter on.
+        """
+        self._job_seq += 1
+        self._active_jobs.append(self._job_seq)
+        return self._job_seq
+
+    def _accept_job(self, job_id: int | None) -> int:
+        """Register a request's job; auto-stamp when the caller passed none."""
+        if job_id is None:
+            self._job_seq += 1
+            job_id = self._job_seq
+            self._active_jobs.append(job_id)
+        return job_id
+
     # ---- response polling ----------------------------------------------
     def _poll(self):
         try:
             while True:
-                name, args = self._resp_q.get_nowait()
+                try:
+                    name, args = self._resp_q.get_nowait()
+                except queue.Empty:
+                    break
+                job_id = self._active_jobs[0] if self._active_jobs else -1
+                if name in self._TERMINAL_RESPONSES and self._active_jobs:
+                    self._active_jobs.popleft()
+                    if not self._active_jobs:
+                        # Pipeline fully idle. A cancel clicked after the
+                        # last job finished must not leak into the next one,
+                        # and the child no longer clears the event at job
+                        # start (that wiped cancels queued behind a running
+                        # job), so the idle side resets it.
+                        self._cancel_event.clear()
                 sig = getattr(self, name, None)
-                if sig is not None:
-                    sig.emit(*args)
-        except Exception:  # queue.Empty or shutdown
-            pass
+                if sig is None:
+                    continue
+                try:
+                    if name in ("error", "anim_exported"):
+                        sig.emit(args[0], job_id)
+                    elif args and isinstance(args[0], dict):
+                        payload = dict(args[0])
+                        payload["job_id"] = job_id
+                        sig.emit(payload, *args[1:])
+                    elif name in ("convert_progress", "anim_progress"):
+                        sig.emit(*args, job_id)
+                    else:
+                        sig.emit(*args)
+                except Exception:
+                    # One bad handler must not silently swallow the rest of
+                    # the queue (it previously aborted the whole poll loop).
+                    logger.exception("信号分发失败: %s", name)
+        except Exception:
+            logger.exception("响应轮询异常")
 
     # ---- request methods (non-blocking; enqueue to child) ---------------
     def preload(self):
@@ -1710,34 +1785,47 @@ class EngineProcess(QObject):
         one-time cost overlaps with app startup instead of the first convert."""
         self._req_q.put(("preload", {}))
 
-    def prepare(self, path, frame_idx, perf_mode="quality", focal_35mm=None):
+    def prepare(self, path, frame_idx, perf_mode="quality", focal_35mm=None,
+                job_id=None):
+        self._accept_job(job_id)
         self._req_q.put(("prepare", {"path": path, "frame_idx": frame_idx,
                                      "perf_mode": perf_mode,
                                      "focal_35mm": focal_35mm}))
 
-    def render_preview(self, ipd_mm, convergence, strength, preview_width):
+    def render_preview(self, ipd_mm, convergence, strength, preview_width,
+                       job_id=None):
+        self._accept_job(job_id)
         self._req_q.put(("render_preview", {
             "ipd_mm": ipd_mm, "convergence": convergence,
             "strength": strength, "preview_width": preview_width,
         }))
 
-    def convert(self, opts):
+    def convert(self, opts, job_id=None):
+        self._accept_job(job_id)
         self._req_q.put(("convert", {"opts": opts}))
 
-    def render_anim(self, opts):
+    def render_anim(self, opts, job_id=None):
+        self._accept_job(job_id)
         self._req_q.put(("render_anim", {"opts": opts}))
 
-    def export_anim(self, opts):
+    def export_anim(self, opts, job_id=None):
+        self._accept_job(job_id)
         self._req_q.put(("export_anim", {"opts": opts}))
 
-    def load_ply(self, path):
+    def load_ply(self, path, job_id=None):
+        self._accept_job(job_id)
         self._req_q.put(("load_ply", {"path": path}))
 
-    def render_orbit(self, opts):
+    def render_orbit(self, opts, job_id=None):
+        self._accept_job(job_id)
         self._req_q.put(("render_orbit", {"opts": opts}))
 
     def cancel(self):
         # Cross-process cancel: set the shared event the child loop polls.
+        # The event is cleared when the pipeline goes idle (see _poll), NOT
+        # at the next job's start — clearing there silently discarded any
+        # cancel issued while a request was still queued behind a running
+        # one, leaving the user's click with no effect.
         self._cancel_event.set()
 
     # ---- shutdown -------------------------------------------------------

@@ -30,9 +30,31 @@ def analytical_eigen_decompose(cov_matrices: torch.Tensor) -> tuple[torch.Tensor
         singular_values: (..., 3) sqrt of eigenvalues, descending order.
     """
     cov = cov_matrices.detach().to(torch.float32)
+    # A single NaN/Inf anywhere in the batch poisons the whole result
+    # (it propagates through the trace to every eigenvalue of *that*
+    # matrix, and NaN in `cos_arg` makes acos return NaN for the batch).
+    # Zero is the correct neutral element for a covariance matrix, and
+    # the callers only consume finite results (render + PLY export).
+    cov = torch.nan_to_num(cov, nan=0.0, posinf=0.0, neginf=0.0)
     batch_shape = cov.shape[:-2]
     cov = cov.reshape(-1, 3, 3)  # Flatten to (N, 3, 3)
     N = cov.shape[0]
+
+    # ── Scale normalisation ─────────────────────────────────────────────
+    # The symmetric invariants below are *cubic* in the matrix entries:
+    # q is a sum of products like a·d and b², r a sum of a·d·f. For a
+    # covariance with entries around 1e-30 those products are ~1e-60 —
+    # far below fp32's smallest normal (~1.2e-38), so they flush to zero
+    # and the eigenvalues come back as pure round-off (measured: 1.7e-21
+    # for a matrix whose true eigenvalues are 1e-30…9e-30).
+    #
+    # Dividing by the largest diagonal entry first makes the invariants
+    # O(1) regardless of the physical scale, and the eigenvalues are then
+    # multiplied back. `clamp_min` keeps all-zero (invalid) matrices from
+    # producing NaN; they decompose to zero eigenvalues, which is correct.
+    scale = cov.diagonal(dim1=-2, dim2=-1).abs().amax(dim=-1)
+    scale = scale.clamp_min(torch.finfo(cov.dtype).tiny)
+    cov = cov / scale[:, None, None]
 
     # Extract symmetric matrix elements
     a = cov[:, 0, 0]
@@ -54,21 +76,45 @@ def analytical_eigen_decompose(cov_matrices: torch.Tensor) -> tuple[torch.Tensor
     q2 = (p * p - 3.0 * q) / 9.0
     r2 = (2.0 * p * p * p - 9.0 * p * q + 27.0 * r) / 54.0
 
-    # Clamp for numerical safety (acos domain [-1, 1])
-    q2 = q2.clamp(min=1e-20)
-    cos_arg = (r2 / q2.sqrt()**3).clamp(-1.0, 1.0)
+    # Clamp for numerical safety (acos domain [-1, 1]).
+    #
+    # cov was normalised above, so p, q, r are O(1) and an absolute floor is
+    # the right tool. The floor must stay *far* below the smallest meaningful
+    # eigenvalue, though: q2 appears as sqrt(q2) in the reconstruction, so a
+    # floor of 1e-12 injects 1e-6 of noise into every eigenvalue. For a
+    # matrix normalised to have unit diagonal but near-zero eigenvalues
+    # (a strongly anisotropic covariance) that 1e-6 is the entire answer.
+    # 1e-24 keeps the injected term at 1e-12, still far above the fp32
+    # denormal range (~1e-38) so the sqrt stays finite.
+    q2_floor = 1e-24
+    q2 = torch.maximum(q2, torch.full_like(q2, q2_floor))
+    sqrt_q2 = q2.sqrt()
+    # r2 / q2^1.5 is the normalized cos argument; where q2 is at its floor
+    # the quotient is meaningless (both tend to 0), so pin it to 0 — that
+    # makes theta = pi/2 and returns the three equal roots p/3, which is
+    # the correct limit for a matrix with no shear.
+    denom = q2 * sqrt_q2
+    ratio = torch.where(q2 > q2_floor, r2 / denom, torch.zeros_like(r2))
+    cos_arg = ratio.clamp(-1.0, 1.0)
     theta = torch.acos(cos_arg)
 
-    sqrt_q2 = q2.sqrt()
-    # Three eigenvalues (descending order after sort)
-    lam1 = p3 + 2.0 * sqrt_q2 * torch.cos(theta / 3.0)
-    lam2 = p3 + 2.0 * sqrt_q2 * torch.cos((theta - 2.0 * torch.pi) / 3.0)
-    lam3 = p3 + 2.0 * sqrt_q2 * torch.cos((theta + 2.0 * torch.pi) / 3.0)
+    # Three eigenvalues (descending order after sort). Undo the scale
+    # normalisation: the eigenvalues of (cov / scale) are those of cov
+    # divided by scale, and the quaternions below are scale-invariant.
+    lam1 = scale * (p3 + 2.0 * sqrt_q2 * torch.cos(theta / 3.0))
+    lam2 = scale * (p3 + 2.0 * sqrt_q2 * torch.cos((theta - 2.0 * torch.pi) / 3.0))
+    lam3 = scale * (p3 + 2.0 * sqrt_q2 * torch.cos((theta + 2.0 * torch.pi) / 3.0))
 
     # Sort descending (required: aligns with SVD convention)
     eigenvalues = torch.stack([lam1, lam2, lam3], dim=-1)
     eigenvalues, sort_idx = eigenvalues.sort(dim=-1, descending=True)
     eigenvalues = eigenvalues.clamp(min=0.0)  # PSD guarantee
+
+    # `_cross_eigvec` forms (A - λI) from the *normalised* entries a..f, so it
+    # must be handed the matching eigenvalues; feeding it the un-normalised
+    # ones would mix scales and destroy the null space. The vector itself is
+    # scale-invariant, so only the normalised form is ever needed.
+    eigenvalues_n = eigenvalues / scale[:, None]
 
     # === Eigenvectors via cross product method ===
     # For each eigenvalue λ, (A - λI) has rank ≤ 2, so the cross product of
@@ -131,8 +177,8 @@ def analytical_eigen_decompose(cov_matrices: torch.Tensor) -> tuple[torch.Tensor
         sign = torch.where(sign == 0, torch.ones_like(sign), sign)
         return v0 * sign, v1 * sign, v2 * sign
 
-    v0hi, v1hi, v2hi = _cross_eigvec(eigenvalues[:, 0])   # λ_max
-    v0lo, v1lo, v2lo = _cross_eigvec(eigenvalues[:, 2])   # λ_min
+    v0hi, v1hi, v2hi = _cross_eigvec(eigenvalues_n[:, 0])   # λ_max
+    v0lo, v1lo, v2lo = _cross_eigvec(eigenvalues_n[:, 2])   # λ_min
 
     # Degenerate guard: if the two extracted vectors are (nearly) parallel,
     # the middle cross product below would collapse to noise. Rebuild the

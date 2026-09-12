@@ -73,7 +73,11 @@ def _write_startup_log(cache_dir: Path, device, perf_mode: str) -> None:
             sz = p.stat().st_size / 2**20 if p.is_file() else 0
             return f"{sz:.0f}MB" if p.is_file() else "dir"
 
-        engines = sorted((cache_dir / "trt_v3").glob("*.engine")) if (cache_dir / "trt_v3").is_dir() else []
+        # Engines may be redirected to ProgramData on non-ASCII install paths;
+        # listing the raw dir would always report zero engines there.
+        from .ort_engine import _ascii_safe_trt_dir as _trt_probe_dir
+        _trt_dir_probe = _trt_probe_dir(cache_dir / "trt_v3")
+        engines = sorted(_trt_dir_probe.glob("*.engine")) if _trt_dir_probe.is_dir() else []
         # The TRT EP encodes the target SM in the engine filename; an engine
         # built for one GPU architecture cannot be loaded on another.
         sm_tags = sorted({e.name.split("_")[-1].replace(".engine", "") for e in engines})
@@ -215,7 +219,7 @@ class SharpPredictor:
         # doubling both the RAM peak and the weights' H2D transfer, which
         # matters a lot on 8GB-GPU machines.
         import os as _os
-        from .ort_engine import onnx_models_cached
+        from .ort_engine import onnx_models_cached, _ascii_safe_trt_dir
         direct_fp16 = bool(
             already_fp16 and fp16 and onnx_models_cached()
             and _os.environ.get("SHARP3D_NO_DIRECT_FP16") != "1")
@@ -255,7 +259,7 @@ class SharpPredictor:
         # (engines are architecture-specific: one built on sm_120 cannot load
         # on sm_89). It used to happen with no progress update at all, so the
         # UI sat at ~20% for minutes looking frozen.
-        _trt_dir = cache_dir / "trt_v3"
+        _trt_dir = _ascii_safe_trt_dir(cache_dir / "trt_v3")
 
         # ── 整模型 TRT（实验性，默认关闭）────────────────────────────────
         # 单图 TRT fp16 与拆分式（SPN front fp16 + 解码器 fp32 CUDA）均已
@@ -337,8 +341,10 @@ class SharpPredictor:
                 predictor.half()
 
         # ── Detect cache state ───────────────────────────────────────────
-        trt_cached = (cache_dir / "trt_v3").exists() and any(
-            (cache_dir / "trt_v3").glob("*.engine"))
+        # Probe the *redirected* TRT dir: on a non-ASCII install path the
+        # engines actually live in ProgramData, so probing the raw cache_dir
+        # always reported "first build" (wrong UI state, wrong warmup branch).
+        trt_cached = _trt_dir.exists() and any(_trt_dir.glob("*.engine"))
         inductor_cached = (cache_dir / "inductor").exists() and any(
             (cache_dir / "inductor").rglob("*.py"))
         triton_cached = (cache_dir / "triton").exists() and (

@@ -231,8 +231,6 @@ _ZH2EN: dict[str, str] = {
     "文件 {}/{} · {}": "File {}/{} · {}",
     "批量完成 · 共 {} 个文件": "Batch finished · {} files in total",
     "批量转换完成 · {} 个文件": "Batch conversion complete · {} files",
-    "批量 [{}/{}] 出错，点击开始从断点继续":
-        "Batch [{}/{}] failed; click Start to resume from the breakpoint",
     "帧 {}/{} · {:.2f} fps · 已用 {} · 剩余 {}":
         "Frame {}/{} · {:.2f} fps · elapsed {} · remaining {}",
     "[{}/{}] 帧 {}/{} · {:.2f} fps · 本文件剩余 {} · 批量剩余 ~{}":
@@ -312,7 +310,13 @@ _ZH2EN: dict[str, str] = {
     '跳过编译（回退 eager）': 'Skipping compile (fallback to eager)',
     '预热推理': 'Warming up inference',
     '编译渲染内核': 'Compiling render kernels',
-    "Anaglyph 红青": "Anaglyph red/cyan",    '画质优先：完整 6 面 cubemap 高精度渲染。\n速度优先：降低 cubemap 面分辨率后上采样，提速约 40%。': 'Quality first: full 6-face cubemap rendering at high precision.\nSpeed first: renders cubemap faces at reduced resolution then upscales, ~40% faster.',}
+    "Anaglyph 红青": "Anaglyph red/cyan",
+    '画质优先：完整 6 面 cubemap 高精度渲染。\n速度优先：降低 cubemap 面分辨率后上采样，提速约 40%。': 'Quality first: full 6-face cubemap rendering at high precision.\nSpeed first: renders cubemap faces at reduced resolution then upscales, ~40% faster.',
+    '批量完成 · 共 {} 个文件 · 跳过 {} 个失败': 'Batch finished · {} files total · {} skipped',
+    '批量转换完成 · {} 个文件 · 跳过 {} 个失败': 'Batch conversion finished · {} files · {} skipped',
+    '批量转换完成 · {} 个文件 · 跳过 {} 个失败: {}': 'Batch conversion finished · {} files · {} skipped: {}',
+    '文件出错已跳过 · {}': 'File failed, skipped · {}',
+}
 
 
 def _detect_system_language() -> str:

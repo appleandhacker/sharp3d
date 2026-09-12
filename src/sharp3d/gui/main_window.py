@@ -125,7 +125,10 @@ class MainWindow(QMainWindow):
         # signals
         self._theme.changed.connect(self._apply_theme)
         self._engine.status.connect(self._status_label.setText)
-        self._engine.error.connect(self._status_label.setText)
+        # error now carries (message, job_id): the main window shows every
+        # error regardless of owner, so drop the id.
+        self._engine.error.connect(
+            lambda msg, job_id=-1: self._status_label.setText(msg))
         self._engine.model_accel.connect(self._on_model_accel)
         self._sbs.status_message.connect(self._status_label.setText)
         self._anim.status_message.connect(self._status_label.setText)

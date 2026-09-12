@@ -34,6 +34,10 @@ from ..formats import FORMATS
 from .i18n import tr
 
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+# Codec ids by combo index — matches ["AV1", "H.264", "H.265"] below. Index
+# (not currentText) so the mapping cannot break if the labels ever get
+# wrapped in tr().
+_CODECS = ("av1", "h264", "h265")
 IMG_FILTER = tr("图片 (*.png *.jpg *.jpeg *.bmp *.webp);;所有文件 (*)")
 VID_FILTER = tr("视频 (*.mp4 *.mkv *.avi *.mov *.webm);;所有文件 (*)")
 
@@ -68,7 +72,7 @@ class SbsTab(QWidget):
     """Main 2D→3D SBS conversion workspace."""
 
     status_message = Signal(str)
-    request_convert = Signal(dict)
+    request_convert = Signal(dict, int)
 
     def __init__(self, theme: ThemeManager, engine: EngineProcess, parent=None) -> None:
         super().__init__(parent)
@@ -80,6 +84,11 @@ class SbsTab(QWidget):
         self._last_fps = 0.0
         self._batch_files: list[str] = []
         self._batch_idx = 0
+        self._failed_files: list[str] = []
+        # Ownership of the in-flight convert request. All tabs share one
+        # EngineProcess, so done/error/progress signals broadcast to every
+        # tab; handlers below drop anything that is not ours.
+        self._job_id = -1
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 12, 14, 14)
@@ -448,6 +457,7 @@ class SbsTab(QWidget):
             # otherwise start fresh.
             if self._batch_idx == 0 or self._batch_idx >= len(self._batch_files):
                 self._batch_idx = 0
+                self._failed_files = []
             self._start_batch_item()
             return
 
@@ -461,7 +471,8 @@ class SbsTab(QWidget):
         self._btn_cancel.setEnabled(True)
         self._progress.set_busy(False)
         self._progress.set_value(0.0)
-        self.request_convert.emit(self._build_opts(inp, out))
+        self._job_id = self._engine.new_job()
+        self.request_convert.emit(self._build_opts(inp, out), self._job_id)
 
     def _parse_focal(self) -> float | None:
         """Focal override: None = auto, else clamped 35mm-equivalent mm."""
@@ -477,7 +488,7 @@ class SbsTab(QWidget):
         """Build conversion options for a single file (typed via ConvertOptions)."""
         from sharp3d.options import ConvertOptions
 
-        codec_map = {"H.264": "h264", "H.265": "h265", "AV1": "av1"}
+        codec = _CODECS[self._codec.currentIndex()]
         fps_text = self._fps.currentText()
         out_fps = None if fps_text == tr("跟随源") else float(fps_text)
         scale_map = {tr("源尺寸 (100%)"): 1.0, "75%": 0.75, "50%": 0.5, "25%": 0.25}
@@ -496,7 +507,7 @@ class SbsTab(QWidget):
             ipd_mm=self._s_ipd.value(),
             convergence=self._s_conv.value() / 100.0,  # 0=auto, else quantile
             strength=self._s_strength.value(),
-            codec=codec_map[self._codec.currentText()],
+            codec=codec,
             crf=min(51, max(0, int(self._crf.currentText().strip() or 20))),
             audio=self._chk_audio.isChecked(),
             decompose="analytical" if self._decompose.currentIndex() == 0 else "svd",
@@ -542,17 +553,18 @@ class SbsTab(QWidget):
         self._progress.set_value(0.0)
         self._prog_label.setText(
             tr("文件 {}/{} · {}").format(self._batch_idx + 1, len(self._batch_files), p.name))
-        self.request_convert.emit(self._build_opts(inp, out))
+        self._job_id = self._engine.new_job()
+        self.request_convert.emit(self._build_opts(inp, out), self._job_id)
 
     def _on_cancel(self) -> None:
         self._engine.cancel()
         self.status_message.emit(tr("正在取消…"))
 
     def _on_convert_progress(self, frame: int, total: int, fps: float,
-                             elapsed: float) -> None:
+                             elapsed: float, job_id: int = -1) -> None:
         # All tabs share one EngineProcess, so conversion events broadcast to
         # every tab. Ignore ones this tab did not start.
-        if not self._converting:
+        if job_id != self._job_id or not self._converting:
             return
         self._last_fps = fps
         file_frac = frame / total if total else 0.0
@@ -577,8 +589,8 @@ class SbsTab(QWidget):
             )
 
     def _on_convert_done(self, result: dict) -> None:
-        if not self._converting and not self._batch_files:
-            return  # another tab's conversion — ignore
+        if result.get("job_id", -1) != self._job_id:
+            return  # another tab's (or a stale) conversion — ignore
         if result.get("cancelled"):
             self._converting = False
             self._btn_start.setEnabled(True)
@@ -588,6 +600,7 @@ class SbsTab(QWidget):
             self._prog_label.setText(tr("已取消"))
             self.status_message.emit(tr("转换已取消"))
             self._batch_files = []
+            self._failed_files = []
             return
 
         # Batch mode: auto-start next file
@@ -603,13 +616,22 @@ class SbsTab(QWidget):
             self._progress.set_value(1.0)
             self._pct_label.setText("100%")
             n = len(self._batch_files)
-            self._prog_label.setText(tr("批量完成 · 共 {} 个文件").format(n))
-            self.status_message.emit(tr("批量转换完成 · {} 个文件").format(n))
+            skipped = len(self._failed_files)
+            if skipped:
+                self._prog_label.setText(
+                    tr("批量完成 · 共 {} 个文件 · 跳过 {} 个失败").format(n, skipped))
+                self.status_message.emit(
+                    tr("批量转换完成 · {} 个文件 · 跳过 {} 个失败").format(n, skipped))
+            else:
+                self._prog_label.setText(tr("批量完成 · 共 {} 个文件").format(n))
+                self.status_message.emit(tr("批量转换完成 · {} 个文件").format(n))
             self._batch_files = []
+            self._failed_files = []
             return
 
         # Single file done
         self._converting = False
+        self._job_id = -1
         self._btn_start.setEnabled(True)
         self._btn_cancel.setEnabled(False)
         self._progress.set_value(1.0)
@@ -620,19 +642,43 @@ class SbsTab(QWidget):
         )
         self.status_message.emit(tr("转换完成 → {}").format(result['output']))
 
-    def _on_error(self, msg: str) -> None:
-        if not self._converting:
-            return  # another tab's conversion — ignore
+    def _on_error(self, msg: str, job_id: int = -1) -> None:
+        if job_id != self._job_id or not self._converting:
+            return  # another tab's (or a global) error — ignore
+        if self._batch_files and self._batch_idx < len(self._batch_files):
+            # Record the failure and move on to the next file. The old
+            # behaviour kept _batch_idx pointing at the failed file, so
+            # "点击开始从断点继续" retried the same file forever.
+            self._failed_files.append(self._batch_files[self._batch_idx])
+            if self._batch_idx + 1 < len(self._batch_files):
+                self._batch_idx += 1
+                self.status_message.emit(
+                    tr("文件出错已跳过 · {}").format(msg))
+                self._start_batch_item()
+                return
+            # All remaining files exhausted — the loop below finalises.
+            self._converting = False
+            self._job_id = -1
+            self._btn_start.setEnabled(True)
+            self._btn_cancel.setEnabled(False)
+            self._progress.set_busy(False)
+            n = len(self._batch_files)
+            skipped = len(self._failed_files)
+            self._prog_label.setText(
+                tr("批量完成 · 共 {} 个文件 · 跳过 {} 个失败").format(n, skipped))
+            self.status_message.emit(
+                tr("批量转换完成 · {} 个文件 · 跳过 {} 个失败: {}").format(n, skipped, msg))
+            self._batch_files = []
+            self._failed_files = []
+            return
+
+        # Single file failed
         self._converting = False
+        self._job_id = -1
         self._btn_start.setEnabled(True)
         self._btn_cancel.setEnabled(False)
         self._progress.set_busy(False)
-        if self._batch_files and self._batch_idx < len(self._batch_files):
-            self._prog_label.setText(
-                tr("批量 [{}/{}] 出错，点击开始从断点继续").format(
-                    self._batch_idx + 1, len(self._batch_files)))
-        else:
-            self._prog_label.setText(tr("出错"))
+        self._prog_label.setText(tr("出错"))
         self.status_message.emit(msg)
 
     # ------------------------------------------------------------------

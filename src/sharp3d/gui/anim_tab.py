@@ -27,6 +27,10 @@ from .worker import EngineProcess
 from .i18n import tr
 
 IMG_FILTER = tr("图片 (*.png *.jpg *.jpeg *.bmp *.webp);;所有文件 (*)")
+# Codec ids by combo index — matches ["AV1", "H.264", "H.265"] below. Index
+# (not currentText) so the mapping cannot break if the labels ever get
+# wrapped in tr().
+_CODECS = ("av1", "h264", "h265")
 ANIM_RESOLUTIONS = [
     # (label, render width; -1 = source width)
     ("720p  (1280)", 1280),
@@ -106,9 +110,9 @@ class AnimTab(QWidget):
 
     status_message = Signal(str)
 
-    request_prepare = Signal(str, int, str, object)
-    request_render_anim = Signal(dict)
-    request_export_anim = Signal(dict)
+    request_prepare = Signal(str, int, str, object, int)
+    request_render_anim = Signal(dict, int)
+    request_export_anim = Signal(dict, int)
 
     def __init__(self, theme: ThemeManager, engine: EngineProcess, parent=None) -> None:
         super().__init__(parent)
@@ -122,6 +126,13 @@ class AnimTab(QWidget):
         self._pending_render = False
         self._input_path = ""
         self._rendering = False
+        # Ownership: responses carry the job id; handlers below drop anything
+        # this tab did not start (previously _on_error had no guard at all,
+        # so any tab's error reset an in-flight animation render).
+        self._job_id = -1
+        # Params the rendered frames correspond to (set at render start);
+        # _on_export refuses to export when the current selection differs.
+        self._rendered_params = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(14, 12, 14, 14)
@@ -268,16 +279,19 @@ class AnimTab(QWidget):
     def _on_input(self, path: str) -> None:
         self._prepared = False
         self._has_anim = False
+        self._rendered_params = None
         self._btn_export.setEnabled(False)
         self._awaiting_prepare = True
         self._input_path = path
         self._prep_mode = ("quality", "speed", "fp32")[self._prec.currentIndex()]
         self._prep_focal = self._parse_focal()
         self._prog_label.setText(tr("正在重建 3D 场景…"))
-        self.request_prepare.emit(path, 0, self._prep_mode, self._prep_focal)
+        self._job_id = self._engine.new_job()
+        self.request_prepare.emit(path, 0, self._prep_mode, self._prep_focal,
+                                  self._job_id)
 
     def _on_prepared(self, info: dict) -> None:
-        if not self._awaiting_prepare:
+        if not self._awaiting_prepare or info.get("job_id", -1) != self._job_id:
             return
         self._awaiting_prepare = False
         self._prepared = True
@@ -290,7 +304,10 @@ class AnimTab(QWidget):
         self.status_message.emit(tr("场景重建完成 · {:,} 高斯").format(info['n_gaussians']))
 
     def _on_render(self) -> None:
-        if not self._prepared or self._rendering:
+        # _awaiting_prepare doubles as the "preparing" guard: without it a
+        # second click while a rebuild was in flight emitted a duplicate
+        # request_prepare, and whichever prepare finished last won.
+        if not self._prepared or self._rendering or self._awaiting_prepare:
             return
         mode = ("quality", "speed", "fp32")[self._prec.currentIndex()]
         focal = self._parse_focal()
@@ -303,13 +320,16 @@ class AnimTab(QWidget):
             # would silently refuse to start the actual render.
             self._pending_render = True
             self._has_anim = False
+            self._rendered_params = None
             self._awaiting_prepare = True
             self._btn_render.setEnabled(False)
             self._btn_export.setEnabled(False)  # frames are now stale-precision
             self._prep_mode = mode
             self._prep_focal = focal
             self._prog_label.setText(tr("正在按新焦距/精度重建 3D 场景…"))
-            self.request_prepare.emit(self._input_path, 0, mode, focal)
+            self._job_id = self._engine.new_job()
+            self.request_prepare.emit(self._input_path, 0, mode, focal,
+                                      self._job_id)
             return
         self._rendering = True
         self._has_anim = False
@@ -324,13 +344,18 @@ class AnimTab(QWidget):
             "num_repeats": self._repeats.value(),
             "preview_width": ANIM_RESOLUTIONS[self._res.currentIndex()][1],
         }
-        self.request_render_anim.emit(opts)
+        self._job_id = self._engine.new_job()
+        self.request_render_anim.emit(opts, self._job_id)
 
-    def _on_anim_progress(self, i: int, total: int) -> None:
+    def _on_anim_progress(self, i: int, total: int, job_id: int = -1) -> None:
+        if job_id != self._job_id:
+            return
         self._progress.set_value(i / total if total else 0.0)
         self._prog_label.setText(tr("渲染中 {}/{}").format(i, total))
 
     def _on_anim_done(self, result: dict) -> None:
+        if result.get("job_id", -1) != self._job_id:
+            return
         self._rendering = False
         self._btn_render.setEnabled(True)
         self._progress.set_value(1.0)
@@ -339,9 +364,15 @@ class AnimTab(QWidget):
         self._prog_label.setText(tr("完成 · {} 帧").format(n))
         if n > 0:
             self._has_anim = True
+            # Frames now on the worker correspond to the scene these params
+            # were prepared with — the export-time staleness check compares
+            # against exactly this snapshot.
+            self._rendered_params = (self._prep_mode, self._prep_focal)
             self._btn_export.setEnabled(True)
 
-    def _on_error(self, msg: str) -> None:
+    def _on_error(self, msg: str, job_id: int = -1) -> None:
+        if job_id != self._job_id:
+            return  # another tab's (or a global) error — ignore
         self._rendering = False
         self._awaiting_prepare = False
         self._pending_render = False  # a failed rebuild must not auto-render
@@ -365,6 +396,17 @@ class AnimTab(QWidget):
     def _on_export(self) -> None:
         if not self._has_anim:
             return
+        # Stale-frames guard: the worker-side frames were rendered from the
+        # scene prepared with _rendered_params. If the precision/focal
+        # selection has moved on since, exporting would silently produce a
+        # video from the OLD parameters while the UI shows the new ones.
+        current = (("quality", "speed", "fp32")[self._prec.currentIndex()],
+                   self._parse_focal())
+        if self._rendered_params is not None and current != self._rendered_params:
+            self.status_message.emit(
+                tr("精度/焦距已更改，帧序列仍是旧参数 — 请先重新生成动画"))
+            self._prog_label.setText(tr("参数已更改 · 请重新生成动画"))
+            return
         from PySide6.QtWidgets import QFileDialog
 
         path, _ = QFileDialog.getSaveFileName(
@@ -373,17 +415,20 @@ class AnimTab(QWidget):
         )
         if not path:
             return
-        codec_map = {"H.264": "h264", "H.265": "h265", "AV1": "av1"}
-        codec = codec_map[self._codec.currentText()]
+        codec = _CODECS[self._codec.currentIndex()]
         fps = int(self._fps.currentText())
         self.status_message.emit(tr("正在导出 {} …").format(path))
         self._prog_label.setText(tr("正在导出视频…"))
         self._btn_export.setEnabled(False)
         # Frames stay worker-side (up to GBs at 4K) — only the export
         # parameters cross the IPC boundary.
-        self.request_export_anim.emit({"path": path, "codec": codec, "fps": fps})
+        self._job_id = self._engine.new_job()
+        self.request_export_anim.emit(
+            {"path": path, "codec": codec, "fps": fps}, self._job_id)
 
-    def _on_exported(self, path: str) -> None:
+    def _on_exported(self, path: str, job_id: int = -1) -> None:
+        if job_id != self._job_id:
+            return
         self._btn_export.setEnabled(True)
         self._prog_label.setText(tr("已导出 → {}").format(path)[:80])
         self.status_message.emit(tr("动画已导出 → {}").format(path))

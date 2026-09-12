@@ -10,10 +10,32 @@ from __future__ import annotations
 
 import os
 
-ENABLED = os.environ.get("SHARP3D_PROFILE") in ("1", "2", "3")
-# =3 additionally enables CPU-side per-section wall timestamps in the worker
-# loop (worker.py), to locate GPU-idle glue between the CUDA-event stages.
-CPU_TRACE = os.environ.get("SHARP3D_PROFILE") == "3"
+
+def _env() -> str | None:
+    return os.environ.get("SHARP3D_PROFILE")
+
+
+def enabled() -> bool:
+    """Profiling on (levels 1/2/3). Read at call time, not import time: a
+    launcher .bat that sets SHARP3D_PROFILE after python starts was invisible
+    to the old import-time constants."""
+    return _env() in ("1", "2", "3")
+
+
+def cpu_trace() -> bool:
+    """Level 3: CPU-side per-section wall timestamps in the worker loop."""
+    return _env() == "3"
+
+
+def __getattr__(name: str):
+    """PEP 562: keep the historical module attributes ENABLED / CPU_TRACE
+    working (all existing call sites keep their spelling) but resolve them
+    dynamically via the functions above."""
+    if name == "ENABLED":
+        return enabled()
+    if name == "CPU_TRACE":
+        return cpu_trace()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # Wall-clock ms accumulated inside ORTEncoder.forward, keyed by label.
 ort_ms: dict[str, float] = {"patch_encoder": 0.0, "image_encoder": 0.0}
@@ -111,6 +133,10 @@ class StageTimer:
 
     def flush(self) -> None:
         if not self._frames:
+            # Still drain the ORT accumulator: a window with no frame_start
+            # (e.g. a pure keyframe-reuse stretch) otherwise let ort_ms ride
+            # into the next window and poisoned its averages.
+            take_ort()
             return
         self._torch.cuda.synchronize()
         n = len(self._frames)

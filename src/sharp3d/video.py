@@ -4,6 +4,7 @@ Uses imageio for frame I/O and ffmpeg subprocess for audio mux.
 Encoding: H.264 (libx264 crf18) / H.265 (libx265) / AV1 (best available).
 """
 
+import logging
 import os
 import subprocess
 import sys
@@ -14,14 +15,33 @@ import numpy as np
 
 from .hdr import FFMPEG
 
+logger = logging.getLogger(__name__)
+
 # 隐藏 Windows 子进程控制台窗口
 _NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 
-# imageio bundles its own minimal ffmpeg that may lack libsvtav1 (the AV1
-# encoder the GUI offers). Pin it to the same full-featured binary the rest
-# of the pipeline uses. Must run before the first imageio writer is created;
-# a user-provided IMAGEIO_FFMPEG_EXE is respected.
-os.environ.setdefault("IMAGEIO_FFMPEG_EXE", FFMPEG)
+_IMAGEIO_FFMPEG_PINNED = False
+
+
+def _pin_imageio_ffmpeg() -> None:
+    """Pin imageio to the same full-featured ffmpeg binary the pipeline uses.
+
+    imageio bundles its own minimal ffmpeg that may lack libsvtav1 (the AV1
+    encoder the GUI offers). Must run before the first imageio reader/writer
+    is created; a user-provided IMAGEIO_FFMPEG_EXE is respected.
+
+    Deferred to first use instead of import time: resolving FFMPEG at import
+    and writing it into the environment froze a possibly-bare "ffmpeg" (when
+    nothing was on PATH) into IMAGEIO_FFMPEG_EXE, so imageio failed later with
+    an error pointing at the wrong binary. Note importing this module already
+    imports .hdr, which resolved FFMPEG the same way — deferring only helps
+    if PATH changes between import and first writer creation, and keeps the
+    environment untouched for importers that never do video I/O.
+    """
+    global _IMAGEIO_FFMPEG_PINNED
+    if not _IMAGEIO_FFMPEG_PINNED:
+        os.environ.setdefault("IMAGEIO_FFMPEG_EXE", FFMPEG)
+        _IMAGEIO_FFMPEG_PINNED = True
 
 # Encoder preference: GPU (NVENC) first, CPU fallback.
 # NVENC runs on a dedicated hardware engine — ~10x faster than software,
@@ -37,6 +57,29 @@ NVENC_LIMITS = {"h264_nvenc": 4096, "hevc_nvenc": 8192, "av1_nvenc": 8192}
 
 # File extension per codec family.
 CODEC_EXT = {"h264": ".mp4", "h265": ".mp4", "av1": ".mp4"}
+
+# Fragmented MP4, so the file becomes readable as fragments are flushed
+# instead of only after the muxer writes its single trailing moov index at
+# close(). Lets a player open the output mid-conversion and seek through
+# whatever has been encoded so far.
+#
+# Two non-obvious requirements, both measured on ffmpeg 7.1 (640x368@30,
+# frames piped through stdin):
+#   -flush_packets 1      ffmpeg buffers output packets in userspace by
+#                         default, so the movflags alone leave the file at a
+#                         bare 28-byte ftyp header until close(). Without
+#                         this flag nothing is gained at all.
+#   -frag_duration 1s     fragment boundaries are otherwise driven purely by
+#                         keyframes, and none of the encoders here set a
+#                         short GOP: with the x264 default (250 frames) the
+#                         first readable fragment appeared only at frame 250.
+#                         A 1s cap makes that ~30 frames regardless of the
+#                         encoder's GOP.
+# Verified: first readable at frame 270 before this change, frame 50 after,
+# with libx264 and h264_nvenc behaving identically.
+MOVFLAGS_LIVE = ["-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+                 "-frag_duration", "1000000",
+                 "-flush_packets", "1"]
 
 
 def resolve_encoder(codec: str, width: int = 0, height: int = 0) -> str:
@@ -82,6 +125,9 @@ def _is_nvenc(encoder: str) -> bool:
 
 def encoder_output_params(encoder: str, crf: int, preset: str = "medium") -> list[str]:
     """ffmpeg output params for the given encoder at ~crf quality."""
+    # Clamp both ends: every encoder here rejects negative CRF/qp, and 0
+    # (near-lossless) can explode the file size.
+    crf = max(0, min(int(crf), 51))
     if encoder == "av1_nvenc":
         # NVENC has no CRF; constqp is the closest analogue. Measured
         # (2026-09-11): -qp under -rc vbr is silently IGNORED (qp 28 and 36
@@ -115,20 +161,38 @@ class VideoReader:
     """Read video frames with metadata."""
 
     def __init__(self, path: str | Path):
+        _pin_imageio_ffmpeg()
         self.path = Path(path)
-        self.reader = imageio.get_reader(str(self.path))
-        meta = self.reader.get_meta_data()
-        self.width, self.height = meta["size"]
-        self.fps = meta["fps"]
-        self.n_frames = self.reader.count_frames()
-        self.has_audio = meta.get("audio_codec") is not None
+        self.reader = None
+        try:
+            self.reader = imageio.get_reader(str(self.path))
+            meta = self.reader.get_meta_data()
+            # Some containers / damaged files come back without size or fps;
+            # indexing raised KeyError (and leaked the open reader). Fail
+            # loudly on an unusable size instead of producing a 0-size writer.
+            width, height = (meta.get("size") or (0, 0))
+            self.width, self.height = int(width), int(height)
+            self.fps = float(meta.get("fps") or 30.0)
+            if self.width <= 0 or self.height <= 0:
+                raise ValueError(
+                    f"视频尺寸无效（{self.width}x{self.height}）: {self.path}")
+            self.n_frames = self.reader.count_frames()
+            self.has_audio = meta.get("audio_codec") is not None
+        except Exception:
+            self.close()
+            raise
 
     def get_frame(self, idx: int) -> np.ndarray:
         """Get frame as (H, W, 3) uint8 numpy array."""
         return self.reader.get_data(idx)
 
     def close(self):
-        self.reader.close()
+        if getattr(self, "reader", None) is not None:
+            try:
+                self.reader.close()
+            except Exception:
+                logger.debug("VideoReader.close() 失败（忽略）", exc_info=True)
+            self.reader = None
 
     def __len__(self):
         return self.n_frames
@@ -145,6 +209,7 @@ class VideoWriter:
 
     def __init__(self, path: str | Path, fps: float, width: int, height: int,
                  codec: str = "h264", crf: int = 18, preset: str = "medium"):
+        _pin_imageio_ffmpeg()
         self.path = Path(path)
         self.fps = fps
         self.width = width
@@ -161,6 +226,9 @@ class VideoWriter:
         output_params = encoder_output_params(codec_lib, crf, preset)
         if codec == "h265":
             output_params.extend(["-tag:v", "hvc1"])
+        # Fragmented container: append last so it applies to every encoder
+        # branch, and lands before the output path imageio appends.
+        output_params.extend(MOVFLAGS_LIVE)
 
         # nvenc uses -qp in output_params; passing quality= would add the
         # deprecated -global_quality flag and trigger ffmpeg warnings/errors.
@@ -190,7 +258,37 @@ class VideoWriter:
         if source_video is not None:
             self._mux_audio(Path(source_video))
         else:
+            self._finalize()
+
+    def _finalize(self) -> None:
+        """Promote tmp → final path, never leaving the tmp behind on failure."""
+        try:
             self.tmp_path.replace(self.path)
+        except OSError as e:
+            # A locked destination (another process holding self.path open) or a
+            # cross-device rename. Report the tmp path so the work is not lost.
+            logger.error("无法将临时文件移为最终输出（%s → %s）: %s；"
+                         "视频仍保留在 %s", self.tmp_path, self.path, e,
+                         self.tmp_path)
+            raise
+
+    def abort(self) -> None:
+        """Best-effort cleanup after a failed/cancelled run. Never raises.
+
+        Closes the imageio writer (shutting down its ffmpeg child) and removes
+        the tmp file, so an exception between writer creation and close()
+        neither leaks the encoder subprocess nor leaves a partial .tmp.mp4
+        that could be mistaken for a finished output.
+        """
+        try:
+            self.writer.close()
+        except Exception:
+            logger.debug("abort: writer.close() 失败（忽略）", exc_info=True)
+        try:
+            self.tmp_path.unlink(missing_ok=True)
+        except OSError:
+            logger.debug("abort: 临时文件删除失败: %s", self.tmp_path,
+                         exc_info=True)
 
     def _mux_audio(self, source: Path):
         """Mux audio from source video into output."""
@@ -203,6 +301,11 @@ class VideoWriter:
             "-map", "0:v:0",
             "-map", "1:a:0",
             "-shortest",
+            # Re-fragment: a plain copy remux rewrites the container as a
+            # standard MP4 (measured layout ftyp/free/mdat/moov), which would
+            # silently drop the live-playable property for any output that
+            # carries audio.
+            *MOVFLAGS_LIVE,
             str(self.path),
         ]
         # binary capture: only the return code matters; text decoding of
@@ -211,7 +314,19 @@ class VideoWriter:
         result = subprocess.run(cmd, capture_output=True,
                                 creationflags=_NO_WINDOW)
         if result.returncode == 0:
-            self.tmp_path.unlink(missing_ok=True)
-        else:
-            # Fallback: keep video without audio
-            self.tmp_path.replace(self.path)
+            try:
+                self.tmp_path.unlink(missing_ok=True)
+            except OSError as e:
+                logger.warning("音频复用成功但临时文件删除失败: %s", e)
+            return
+
+        # Audio mux failed. Falling back to the silent video is the right call
+        # (the video is complete and valuable), but it must be *visible*: this
+        # previously happened with no message at all, so users received
+        # audio-less output believing the conversion succeeded.
+        tail = ""
+        if result.stderr:
+            tail = result.stderr.decode("utf-8", errors="replace").strip()[-500:]
+        logger.error("音频复用失败（返回码 %d），已保留无音频视频: %s\n%s",
+                     result.returncode, self.path, tail)
+        self._finalize()

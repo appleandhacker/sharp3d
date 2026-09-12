@@ -29,7 +29,7 @@ def main():
 
     g_ref, cap = capture_vit_outputs(predictor, img_r, df_t)
 
-    tail = SpnTail(predictor).eval()
+    tail = SpnTail(predictor, 35).eval()
     with torch.no_grad():
         outs = tail(img_r, df_t, cap["pe_feat"], cap["pe_int0"],
                     cap["pe_int1"], cap["ie_feat"])

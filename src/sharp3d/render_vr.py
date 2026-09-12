@@ -24,8 +24,10 @@ logger = logging.getLogger(__name__)
 
 # Camera matrices depend only on (face_size, eye offset, device) — cache them
 # across frames so the video loop doesn't rebuild 6 look-at matrices per eye
-# per frame.
+# per frame. Bounded: per-frame floating offsets used to mint a new entry per
+# frame (6 look-at matrices each) and grew without limit on long videos.
 _CAM_CACHE: dict = {}
+_CAM_CACHE_MAX = 8
 
 # Sticky HiGS failure flag. When the gsplat_scene_cuda extension is not
 # importable (e.g. no MSVC for the JIT build), gsplat's lazy backend re-raises
@@ -39,10 +41,24 @@ _HIGS_BROKEN = False
 
 def _cameras_cached(face_size: int, device, eye_offset: Tensor,
                     offset_key: float):
-    key = (face_size, device.index, offset_key)
+    # Quantize the offset before it becomes a key: raw float keys made every
+    # per-frame offset variation a new cache entry (6 look-at matrices each,
+    # retained forever), and fp representation noise alone could mint
+    # duplicates. 1e-3 scene units is ~1.6% of the default IPD (0.063) — far
+    # below any visible parallax change.
+    offset_q = round(float(offset_key), 3)
+    key = (face_size, device.index, offset_q)
     cams = _CAM_CACHE.get(key)
     if cams is None:
-        cams = get_cubemap_cameras(face_size, device, eye_offset)
+        # Rebuild the eye offset at the quantized value so a cache hit and a
+        # fresh build produce identical geometry. Every caller passes
+        # eye_offset = [offset_x, 0, 0] (left/right eye at ±ipd/2), so only
+        # the x component carries information; keep the others verbatim.
+        offset_vec = eye_offset.detach().clone()
+        offset_vec[0] = offset_q
+        cams = get_cubemap_cameras(face_size, device, offset_vec)
+        if len(_CAM_CACHE) >= _CAM_CACHE_MAX:
+            _CAM_CACHE.pop(next(iter(_CAM_CACHE)))  # FIFO eviction
         _CAM_CACHE[key] = cams
     return cams
 

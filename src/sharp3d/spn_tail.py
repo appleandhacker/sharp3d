@@ -33,11 +33,20 @@ class SpnTail(nn.Module):
     _OUT_FIELDS = ("mean_vectors", "singular_values", "quaternions",
                    "colors", "opacities")
 
-    def __init__(self, predictor):
+    def __init__(self, predictor, n_patches: int):
         super().__init__()
         self.predictor = predictor
         adaptor = predictor.monodepth_model
         self._n_enc = len(adaptor.monodepth_predictor.encoder.dims_encoder)
+        # Patch grouping follows the perf mode (35 quality / 21 speed). Derived
+        # in __init__ from the shared table so the exported graph can never
+        # disagree with the tensor shapes the caller feeds (see
+        # full_export._spn_geometry).
+        from .full_export import _spn_geometry
+        x0, split_sizes, padding = _spn_geometry(n_patches)
+        self._x0_tile_size = x0
+        self._split_sizes = split_sizes
+        self._padding = padding
         # Traced as constants (same values the adaptor bakes in).
         self._ret_enc = bool(adaptor.return_encoder_features)
         self._ret_dec = bool(adaptor.return_decoder_features)
@@ -51,21 +60,22 @@ class SpnTail(nn.Module):
         spn = md.encoder
 
         # ── SlidingPyramidNetwork.forward steps 3+ (merging) ────────────
-        # Latent features come from patch-encoder intermediates (35,577,1024)
-        # — strip CLS, reshape to 24×24, merge the 5×5 overlap grid.
+        # Latent features come from patch-encoder intermediates
+        # (n_patches,577,1024) — strip CLS, reshape to 24×24, merge the
+        # x0-resolution grid (5×5 with overlap, 4×4 without).
         # reshape_feature lives on TimmViT; calling the method does not trace
         # the ViT weights into the graph (no forward call).
         x_latent0 = spn.upsample_latent0(
-            merge(spn.patch_encoder.reshape_feature(pe_int0)[:25],
-                  batch_size=1, padding=3))
+            merge(spn.patch_encoder.reshape_feature(pe_int0)[:self._x0_tile_size],
+                  batch_size=1, padding=self._padding))
         x_latent1 = spn.upsample_latent1(
-            merge(spn.patch_encoder.reshape_feature(pe_int1)[:25],
-                  batch_size=1, padding=3))
+            merge(spn.patch_encoder.reshape_feature(pe_int1)[:self._x0_tile_size],
+                  batch_size=1, padding=self._padding))
 
-        # 35-batch features split back into 5×5 + 3×3 + 1×1.
-        x0e, x1e, x2e = torch.split(pe_feat, [25, 9, 1], dim=0)
-        x0 = spn.upsample0(merge(x0e, batch_size=1, padding=3))
-        x1 = spn.upsample1(merge(x1e, batch_size=1, padding=2 * 3))
+        # Batch split back into the pyramid's three grids (25+9+1 or 16+4+1).
+        x0e, x1e, x2e = torch.split(pe_feat, self._split_sizes, dim=0)
+        x0 = spn.upsample0(merge(x0e, batch_size=1, padding=self._padding))
+        x1 = spn.upsample1(merge(x1e, batch_size=1, padding=2 * self._padding))
         x2 = spn.upsample2(x2e)
 
         lowres = spn.upsample_lowres(ie_feat)
@@ -117,7 +127,15 @@ class ViTCapture(nn.Module):
         try:
             return super().__getattr__(name)
         except AttributeError:
-            return getattr(self.__dict__["_modules"]["inner"], name)
+            inner = self.__dict__.get("_modules", {}).get("inner")
+            if inner is None:
+                # _modules["inner"] missing raised a bare KeyError before
+                # (masking the real AttributeError at e.g. copy.deepcopy or
+                # pickling time, when __getattr__ runs before __init__).
+                raise AttributeError(
+                    f"{type(self).__name__!r} object has no attribute {name!r}"
+                    f" (no inner module is set)") from None
+            return getattr(inner, name)
 
     def forward(self, x):
         out = self.inner(x)

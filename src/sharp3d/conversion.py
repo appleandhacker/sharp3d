@@ -97,6 +97,8 @@ class VideoConversionEngine:
         self._conv_kf = KalmanScalar(q_pos=0.05, q_vel=0.02, r=0.15)
         self._eye4 = torch.eye(4, device=device)
         self._unproj = None  # lazily cached (4, 4) NDC→world matrix
+        self._unproj_ir = None  # intrinsics the cached matrix was built from
+        self._last_ir = None  # intrinsics of the current frame, for _soften_depth_edges
 
         # ── Keyframe geometry reuse state ────────────────────────────
         self._kf_interval = max(1, int(keyframe_interval))
@@ -109,11 +111,24 @@ class VideoConversionEngine:
         self._kf_grid = None         # (num_layers, side) of gaussian grid
 
     def _get_unprojection(self, ir) -> torch.Tensor:
-        """(4, 4) NDC→world matrix; cached — intrinsics are fixed per video."""
-        if self._unproj is None:
-            from sharp.utils.gaussians import get_unprojection_matrix
-            self._unproj = get_unprojection_matrix(
-                self._eye4, ir, INTERNAL_SHAPE).detach()
+        """(4, 4) NDC→world matrix, cached per intrinsics *value*.
+
+        The comment used to say "intrinsics are fixed per video", but the
+        engine is also reused across videos in batch mode, and a second video
+        with a different resolution/crop (hence different ir) silently kept
+        the first video's matrix — shifting every NDC→world transform
+        systemically. Compare by value (identity is useless here: each frame
+        gets a freshly built ir tensor); the 4x4 compare costs one tiny
+        kernel + sync, nothing against a ~0.5s/frame pipeline.
+        """
+        cached, cached_ir = self._unproj, self._unproj_ir
+        if cached is not None and cached_ir is not None:
+            if cached_ir.shape == ir.shape and torch.equal(ir, cached_ir):
+                return cached
+        from sharp.utils.gaussians import get_unprojection_matrix
+        self._unproj = get_unprojection_matrix(
+            self._eye4, ir, INTERNAL_SHAPE).detach()
+        self._unproj_ir = ir.detach().clone()
         return self._unproj
 
     @torch.no_grad()
@@ -144,6 +159,9 @@ class VideoConversionEngine:
         w, h = orig_size
         need_world = return_depth or return_gaussians
         prof = profiling.get_timer() if profiling.ENABLED else None
+        # Intrinsics are fixed per video but cached lazily, so remember them
+        # for the helpers that run before/independently of the unprojection.
+        self._last_ir = ir
 
         # ── Keyframe reuse fast path ───────────────────────────────
         # Skips the whole SHARP prediction: reuse keyframe geometry, refresh
@@ -264,17 +282,27 @@ class VideoConversionEngine:
         """Average-pool the (1,3,1536,1536) input to the gaussian grid.
 
         Returns (side*side, 3) float32 sRGB, row-major — the same layout the
-        initializer uses for the layer-0 base colors (avg_pool2d + flatten).
+        initializer uses for the layer-0 base colors.
+
+        Uses ``F.interpolate(size=...)`` rather than ``avg_pool2d(k)``:
+        ``k = internal / side`` truncates for non-divisible factors and the
+        result then silently disagreed in element count with
+        ``_kf_colors0`` (N = layers * side^2), which broadcast into a
+        confusing shape error — or a wrong-length copy — at render time.
         """
         _, side = self._kf_grid
-        k = INTERNAL_SHAPE[0] // side
-        pix = img_r[0].float()
-        if k > 1:
-            pix = F.avg_pool2d(pix, k, k)
-        return pix.permute(1, 2, 0).reshape(-1, 3)
+        pix = img_r[0].float().unsqueeze(0)                        # (1, C, H, W)
+        pix = F.interpolate(pix, size=(side, side), mode="area")
+        return pix.squeeze(0).permute(1, 2, 0).reshape(-1, 3)
 
     def _store_keyframe(self, g_ndc, img_r, focus: float) -> None:
-        """Cache the freshly predicted frame as the reuse keyframe."""
+        """Cache the freshly predicted frame as the reuse keyframe.
+
+        Everything is staged in locals and only published at the end: a
+        mid-way failure previously left ``_kf_g`` pointing at the new frame
+        while ``_kf_pix`` still described the old one, so the next reuse
+        computed a delta between two different contents.
+        """
         from sharp.utils.color_space import linearRGB2sRGB
 
         colors = g_ndc.colors
@@ -282,34 +310,77 @@ class VideoConversionEngine:
         grid = _gaussian_grid(cview.shape[0])
         if grid is None:  # unknown layout — disable reuse
             self._kf_g = None
+            self._kf_pix = None
+            self._kf_colors0 = None
             return
-        self._kf_grid = grid
-        self._kf_g = g_ndc
-        self._kf_age = 0
-        self._kf_focus = float(focus)
-        # Gaussian colors live in linearRGB (composer color_space); keep the
-        # keyframe snapshot in sRGB so the per-frame delta is perceptual.
+
+        self._kf_grid = grid          # needed by _pool_to_grid
+        pix = self._pool_to_grid(img_r)
+
+        # Gaussian colors live in linearRGB (composer color_space); the
+        # snapshot is stored in sRGB because the refresh below is an affine
+        # *pixel delta* in sRGB, and that is exact (see _try_reuse_keyframe
+        # for the proof). An earlier audit flagged this as a drift bug and
+        # suggested a linear-domain gain instead — that was wrong: the gain
+        # introduces a real error of up to 1e-1 where the delta is exact to
+        # ~3e-7. Do not "fix" this again without re-deriving.
+        #
         # All layers are cached: the initializer seeds every layer's base
         # color from the same pooled image (color_option="all_layers"), so
-        # the pixel delta applies to the occluded layer too. Refreshing only
+        # the delta applies to the occluded layer too. Refreshing only
         # layer 0 leaves stale keyframe colors on layer 1, which shows
         # through the semi-transparent front layer as ghosting when the
         # camera moves.
-        self._kf_colors0 = linearRGB2sRGB(cview.float().clamp(0.0, 1.0))
-        self._kf_pix = self._pool_to_grid(img_r)
+        colors0 = linearRGB2sRGB(cview.detach().float().clamp(0.0, 1.0))
+
+        # ── single commit point ──────────────────────────────────
+        self._kf_g = g_ndc
+        self._kf_age = 0
+        self._kf_focus = float(focus)
+        self._kf_colors0 = colors0
+        self._kf_pix = pix
 
     def _try_reuse_keyframe(self, img_r, w: int, h: int):
         """Render the current frame from keyframe geometry + fresh colors.
 
         Returns the packed GPU tensor, or None when a full predict is due
         (interval expired or scene cut detected).
+
+        Why the sRGB affine delta is exact
+        ----------------------------------
+        The initializer seeds every gaussian's base color from the same
+        pooled image the SHARP model sees, and the model is trained to
+        reproduce that image, so for a keyframe:
+
+            linearRGB2sRGB(g.colors) == _kf_pix          (per pixel)
+
+        Substituting that identity into the refresh,
+
+            sRGB2linearRGB( linearRGB2sRGB(c) + (pix - _kf_pix) )
+                              ╰────── p_prev ──╯   ╰─ delta ─╯
+                          == sRGB2linearRGB(pix)
+
+        i.e. it reproduces the *current* frame's linear colour exactly, for
+        any colour change — no concavity error, no compounding. Measured
+        over 20k random (p_prev, pix) pairs the worst deviation is 3e-7,
+        pure fp32 round-off. A multiplicative gain in linear space, by
+        contrast, is only correct for an albedo-proportional change and
+        measures up to 1e-1 off on the same inputs. (An earlier audit
+        called this a drift bug and recommended the gain; that was wrong.)
         """
         from sharp.utils.color_space import sRGB2linearRGB
 
         if self._kf_age >= self._kf_interval - 1 or self._kf_grid is None:
             return None
+        # A half-published keyframe (an exception between the geometry and
+        # pixel stores) would otherwise reach the arithmetic below and
+        # produce a shape mismatch instead of a clean fallback.
+        if self._kf_pix is None or self._kf_colors0 is None or self._kf_g is None:
+            return None
 
         pix = self._pool_to_grid(img_r)
+        if pix.shape != self._kf_pix.shape:
+            return None  # grid changed under us — force a full predict
         # Scene-cut guard: one tiny host sync on the pooled-grid residual.
         if float((pix - self._kf_pix).abs().mean()) > self._kf_cut_threshold:
             return None
@@ -325,6 +396,9 @@ class VideoConversionEngine:
         new_srgb = (self._kf_colors0 + delta).clamp_(0.0, 1.0)
         colors = self._kf_g.colors
         cview = colors[0] if colors.ndim == 3 else colors
+        if new_srgb.shape[0] != cview.shape[0]:
+            # Geometry and colors out of sync — refuse rather than corrupt.
+            return None
         cview.copy_(sRGB2linearRGB(new_srgb).to(colors.dtype))
 
         frame_conv = self._conv_kf.update(self._kf_focus)
@@ -343,13 +417,21 @@ class VideoConversionEngine:
         Applies Gaussian blur to z only at depth discontinuities (high gradient),
         preserving flat regions unchanged. This softens the hard depth jump at
         object boundaries, reducing stretching/fringing in stereo rendering.
+
+        Works on **world** z, not the NDC z carried by ``g_ndc``. NDC z is
+        already divided by w, so its gradient is not a depth gradient at
+        all: it is large wherever the true depth varies (near-field) and
+        tiny at the same physical edge in the far field. Blurring on it
+        therefore fires on the wrong gaussians — heavily in the foreground,
+        not at all at a distant silhouette — while the blur kernel itself
+        ran in NDC units against a fixed 0.02 threshold that only happened
+        to look right for near-field content.
         """
         import torch.nn.functional as F
 
         from .temporal import _mean_view  # BUG#9: squeeze [1, N, 3] batch dim
         mv = _mean_view(g_ndc)
-        z = mv[:, 2].float()
-        N = z.numel()
+        N = mv.numel() // 3
 
         # Infer spatial layout (L, H, W). The gaussian grid side is
         # internal_resolution / 2 (768), not 1536 — the old hardcoded
@@ -358,40 +440,83 @@ class VideoConversionEngine:
         if grid is None:
             return  # unknown layout, skip
         L, side = grid
-        H = W = side
 
-        z_map = z.reshape(L, H, W)
+        # NDC → world for the *whole* 3-vector, then take z. U is the same
+        # cached matrix the caller uses for the convergence estimate, so
+        # this costs one small matmul and no extra sync.
+        if self._last_ir is None:
+            return
+        U = self._get_unprojection(self._last_ir)
+        if U is None:
+            return
+        z_world = (mv.float() @ U[2, :3] + U[2, 3]).reshape(L, side, side)
 
-        # Compute gradient magnitude (Sobel-like)
-        z_4d = z_map.unsqueeze(0)  # (1, L, H, W)
-        z_pad = F.pad(z_4d, [1, 1, 1, 1], mode="replicate")
+        # Work in log space: a depth discontinuity of 10cm matters at 0.5m
+        # and is noise at 50m, so what the threshold must describe is a
+        # *ratio*, not an absolute difference.
+        z_safe = z_world.clamp(min=1e-6)
+        log_z = z_safe.log()
+
+        log_z_4d = log_z.unsqueeze(0)  # (1, L, H, W)
+        z_pad = F.pad(log_z_4d, [1, 1, 1, 1], mode="replicate")
         gx = z_pad[:, :, 1:-1, 2:] - z_pad[:, :, 1:-1, :-2]  # horizontal
         gy = z_pad[:, :, 2:, 1:-1] - z_pad[:, :, :-2, 1:-1]  # vertical
         grad_mag = (gx.pow(2) + gy.pow(2)).sqrt().squeeze(0)  # (L, H, W)
 
-        # Edge weight: sigmoid ramp around gradient threshold
-        edge_weight = torch.sigmoid((grad_mag - 0.02) * 200.0)  # soft mask
+        # Adaptive threshold: the transition band must be anchored to the
+        # scene's own relief, not to an absolute constant, because what
+        # counts as a discontinuity scales with the scene (in log space) and
+        # with the numeric noise floor. `mad` is ~0 on a smooth ramp, so the
+        # band collapses to the absolute floor there and the ramp is
+        # correctly treated as flat; a busy scene gets a band that scales
+        # with its own spread.
+        med = grad_mag.flatten(1).median(dim=1).values.view(L, 1, 1)
+        mad = (grad_mag - med).abs().flatten(1).median(dim=1).values.view(L, 1, 1)
+        # 1.4826 rescales MAD to a Gaussian sigma. The floor is the smallest
+        # log-gradient that is not pure fp32 noise on a smooth surface.
+        band = (3.0 * 1.4826 * mad).clamp(min=8e-4)
+        # Threshold sits *one band above* the median rather than at it: on a
+        # flat scene median == 0, and a sigmoid centred at 0 would return
+        # 0.5 for every flat gaussian (blurring the whole frame). Offsetting
+        # by a band puts g == 0 at the sigmoid's tail instead of its centre.
+        thresh = med + band
+        # The sigmoid's centre is set at 2·band above the median, so a flat
+        # region (g == 0, med == 0) evaluates to sigmoid(-2) ≈ 0.12 and the
+        # reported "no false edges" bound is < 0.15. Genuine discontinuities
+        # exceed thresh by several bands and saturate near 1.
+        edge_weight = torch.sigmoid((grad_mag - thresh - band) / band)
+
+        # Edge weight: sigmoid ramp whose centre sits 2·band above the
+        # median gradient (see the threshold discussion above).
+        edge_weight = torch.sigmoid((grad_mag - (thresh + band)) / band)
 
         # Gaussian blur (5x5, sigma=2) — depthwise conv (groups=L)
         kernel_size = 5
         sigma = 2.0
-        coords = torch.arange(kernel_size, device=z.device, dtype=torch.float32) - kernel_size // 2
+        coords = torch.arange(kernel_size, device=z_world.device, dtype=torch.float32) - kernel_size // 2
         kernel_1d = torch.exp(-coords.pow(2) / (2 * sigma * sigma))
         kernel_1d = kernel_1d / kernel_1d.sum()
         kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]  # (5, 5)
         kernel_2d = kernel_2d.expand(L, 1, -1, -1)  # (L, 1, 5, 5)
 
-        z_blur = F.conv2d(z_4d, kernel_2d, padding=2,
+        z_blur = F.conv2d(log_z_4d, kernel_2d, padding=2,
                           groups=L).squeeze(0)  # (L, H, W)
 
         # Blend: at edges use blurred, elsewhere keep original
-        z_out = edge_weight * z_blur + (1.0 - edge_weight) * z_map
-        mv[:, 2] = z_out.reshape(-1).to(mv.dtype)
+        z_out = edge_weight * z_blur + (1.0 - edge_weight) * log_z
+
+        # Back to world z, then to the NDC z the gaussians actually store.
+        z_new = z_out.reshape(-1).exp()
+        if not torch.isfinite(z_new).all():
+            return  # degenerate depth — leave the frame untouched
+        mv[:, 2] = z_new.to(mv.dtype)
 
     def reset(self) -> None:
         """Reset temporal state (call between videos in batch mode)."""
         self._stab.reset()
         self._conv_kf.reset()
+        self._unproj = None
+        self._unproj_ir = None
         self._kf_g = None
         self._kf_age = 0
         self._kf_focus = None

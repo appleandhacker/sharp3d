@@ -4,6 +4,7 @@ Orchestrates all modules into a single coherent pipeline.
 """
 
 import gc
+import logging
 import time
 from pathlib import Path
 from typing import Callable
@@ -18,6 +19,8 @@ from .predict import SharpPredictor
 from .unproject import prepare_input, fast_unproject, INTERNAL_SHAPE
 from .render import render_sbs, render_depth_map
 from .video import VideoReader, VideoWriter
+
+logger = logging.getLogger(__name__)
 
 
 class Sharp3DPipeline:
@@ -129,7 +132,7 @@ class Sharp3DPipeline:
 
         result = {
             "elapsed": elapsed,
-            "fps": 1.0 / elapsed,
+            "fps": 1.0 / elapsed if elapsed > 1e-9 else 0.0,
             "output_path": str(output_path),
             "output_size": output_size(format, sw, sh),
         }
@@ -238,103 +241,126 @@ class Sharp3DPipeline:
         decoder = threading.Thread(target=_decode, daemon=True)
         decoder.start()
 
-        # Temporal stabilization + keyframe reuse via the shared engine
-        # (same code path as the GUI worker).
-        from .conversion import VideoConversionEngine
-        engine = VideoConversionEngine(
-            predict_fn=self.predictor,
-            device=self.device,
-            f_px=f_px,
-            fmt=format,
-            ipd=self.ipd,
-            decompose_method=self.decompose_method,
-            stabilize_mode="adaptive",
-            keyframe_interval=keyframe_interval,
-        )
+        ok = False
+        try:
+            # Temporal stabilization + keyframe reuse via the shared engine
+            # (same code path as the GUI worker).
+            from .conversion import VideoConversionEngine
+            engine = VideoConversionEngine(
+                predict_fn=self.predictor,
+                device=self.device,
+                f_px=f_px,
+                fmt=format,
+                ipd=self.ipd,
+                decompose_method=self.decompose_method,
+                stabilize_mode="adaptive",
+                keyframe_interval=keyframe_interval,
+            )
 
-        # Pipeline the host->device transfer: prepare frame N+1 on a side
-        # stream while frame N renders on the main stream (copy and compute
-        # use separate engines, so the upload overlaps GPU work).
-        side_stream = torch.cuda.Stream()
-        main_stream = torch.cuda.current_stream()
+            # Pipeline the host->device transfer: prepare frame N+1 on a side
+            # stream while frame N renders on the main stream (copy and compute
+            # use separate engines, so the upload overlaps GPU work).
+            side_stream = torch.cuda.Stream()
+            main_stream = torch.cuda.current_stream()
 
-        def _prepare_async(frm):
-            with torch.cuda.stream(side_stream):
-                prepared = prepare_input(frm, f_px, self.device,
-                                         async_upload=True)
-                upload_done = side_stream.record_event()
-            # No CPU-side event wait here. PyTorch's CachingHostAllocator
-            # records an event on the copy stream when the pinned block is
-            # freed, so a later pin_memory() can only reuse it after the copy
-            # finished — buffer safety does not need a manual synchronize.
-            # Waiting here would stall the CPU *before* the current frame's
-            # GPU work is even submitted (the caller prepares frame N+1 first),
-            # leaving the GPU idle every frame and defeating the prefetch.
-            return prepared, upload_done
+            def _prepare_async(frm):
+                with torch.cuda.stream(side_stream):
+                    prepared = prepare_input(frm, f_px, self.device,
+                                             async_upload=True)
+                    upload_done = side_stream.record_event()
+                # No CPU-side event wait here. PyTorch's CachingHostAllocator
+                # records an event on the copy stream when the pinned block is
+                # freed, so a later pin_memory() can only reuse it after the copy
+                # finished — buffer safety does not need a manual synchronize.
+                # Waiting here would stall the CPU *before* the current frame's
+                # GPU work is even submitted (the caller prepares frame N+1 first),
+                # leaving the GPU idle every frame and defeating the prefetch.
+                return prepared, upload_done
 
-        i = 0
+            i = 0
 
-        # Optional per-stage profiling (SHARP3D_PROFILE=1). The engine marks
-        # predict/stabilize/render internally; we add the D2H+write wall time.
-        from . import profiling
-        prof = profiling.get_timer() if profiling.ENABLED else None
+            # Optional per-stage profiling (SHARP3D_PROFILE=1). The engine marks
+            # predict/stabilize/render internally; we add the D2H+write wall time.
+            from . import profiling
+            prof = profiling.get_timer() if profiling.ENABLED else None
 
-        first = frame_q.get()
-        if first is not None:
-            prepared, upload_done = _prepare_async(first)
-            del first
+            first = frame_q.get()
+            if first is not None:
+                prepared, upload_done = _prepare_async(first)
+                del first
+                while True:
+                    nxt = frame_q.get()
+                    nxt_prepared = _prepare_async(nxt) if nxt is not None else None
+                    del nxt
+
+                    main_stream.wait_event(upload_done)
+                    img_resized, df, intrinsics_resized, (orig_w, orig_h) = prepared
+
+                    t0 = time.time()
+
+                    packed = engine.process_frame(
+                        img_resized, df, intrinsics_resized, (orig_w, orig_h),
+                        download=False,
+                    )
+                    if prof:
+                        _t_d2h = time.time()
+                    # packed.cpu() is a blocking copy — it implicitly waits for
+                    # the render stream, so no torch.cuda.synchronize() is needed
+                    # (a device-wide sync would also stall on the next frame's
+                    # side-stream upload and break the overlap).
+                    sbs_np = packed.cpu().numpy()
+                    dt = time.time() - t0
+                    frame_times.append(dt)
+                    if want_hdr:
+                        writer.write_frame(sbs_np)
+                    else:
+                        writer.append_frame(sbs_np)
+                    if prof:
+                        prof.frame_end((time.time() - _t_d2h) * 1000.0)
+
+                    if progress_callback:
+                        progress_callback(i, n_frames, 1.0 / dt if dt > 1e-6 else 0.0)
+                    i += 1
+
+                    del packed, img_resized, prepared
+                    # No per-frame empty_cache(): constant shapes mean the caching
+                    # allocator reuses blocks; empty_cache only adds sync + churn.
+
+                    if nxt_prepared is None:
+                        break
+                    prepared, upload_done = nxt_prepared
+
+            ok = True
+        finally:
+            # Unblock the decoder thread: on an error path it may sit in
+            # frame_q.put() on a full queue, and draining lets stream_frames'
+            # generator finally reap its ffmpeg child instead of leaving the
+            # thread and process alive until interpreter exit.
             while True:
-                nxt = frame_q.get()
-                nxt_prepared = _prepare_async(nxt) if nxt is not None else None
-                del nxt
-
-                main_stream.wait_event(upload_done)
-                img_resized, df, intrinsics_resized, (orig_w, orig_h) = prepared
-
-        
-                t0 = time.time()
-
-                packed = engine.process_frame(
-                    img_resized, df, intrinsics_resized, (orig_w, orig_h),
-                    download=False,
-                )
-                if prof:
-                    _t_d2h = time.time()
-                # packed.cpu() is a blocking copy — it implicitly waits for
-                # the render stream, so no torch.cuda.synchronize() is needed
-                # (a device-wide sync would also stall on the next frame's
-                # side-stream upload and break the overlap).
-                sbs_np = packed.cpu().numpy()
-                dt = time.time() - t0
-                frame_times.append(dt)
-                if want_hdr:
-                    writer.write_frame(sbs_np)
-                else:
-                    writer.append_frame(sbs_np)
-                if prof:
-                    prof.frame_end((time.time() - _t_d2h) * 1000.0)
-
-                if progress_callback:
-                    progress_callback(i, n_frames, 1.0 / dt)
-                i += 1
-
-                del packed, img_resized, prepared
-                # No per-frame empty_cache(): constant shapes mean the caching
-                # allocator reuses blocks; empty_cache only adds sync + churn.
-
-                if nxt_prepared is None:
+                try:
+                    frame_q.get_nowait()
+                except _queue.Empty:
                     break
-                prepared, upload_done = nxt_prepared
+            if not ok:
+                # Encoder cleanup on a failed run: without this the .tmp.mp4
+                # survived (looking like a valid output) and the encoder
+                # subprocess outlived the exception.
+                writer.abort()
+                torch.cuda.empty_cache()
 
         if prof:
             prof.flush()
 
-        while True:
-            try:
-                frame_q.get_nowait()
-            except _queue.Empty:
-                break
+        # Bound the wait but do not ignore a straggler: the decoder thread is a
+        # daemon, so if it is still blocked in proc.stdout.read (ffmpeg slowly
+        # draining a pipe the encoder no longer consumes) it would outlive the
+        # conversion holding an ffmpeg process. FrameReader.close() is the
+        # cooperative hook; the generator's own finally is the real guarantee.
         decoder.join(timeout=5)
+        if decoder.is_alive():
+            logger.warning("解码线程未在 5s 内退出（帧队列已排空）；"
+                           "该线程为 daemon，进程退出时会一并回收")
+        reader.close()
         torch.cuda.empty_cache()
 
         # Close and mux audio
@@ -345,7 +371,12 @@ class Sharp3DPipeline:
             writer.close(source_video=source)
 
         total_elapsed = time.time() - total_start
-        avg_frame_time = np.mean(frame_times)
+        if not frame_times:
+            # Should be unreachable (probe_video rejects 0-frame inputs), but
+            # np.mean([]) is nan and 1.0/nan must never reach the UI.
+            raise RuntimeError(
+                f"没有处理任何帧（n_frames={n_frames}）: {input_path}")
+        avg_frame_time = max(float(np.mean(frame_times)), 1e-6)
 
         return {
             "total_elapsed": total_elapsed,
