@@ -331,4 +331,6 @@ src/sharp3d/
 
 ## 许可
 
-本项目代码供个人学习研究使用。SHARP 模型权重及其源码遵循 [Apple 原始许可协议](https://github.com/apple/ml-sharp/blob/main/LICENSE)。
+本项目自有代码以 [MIT License](LICENSE) 发布。
+
+本项目基于 Apple [ml-sharp](https://github.com/apple/ml-sharp) 二次开发：SHARP 模型架构、源码与权重的版权归 Apple Inc. 所有，遵循 [Apple 原始许可协议](https://github.com/apple/ml-sharp/blob/main/LICENSE)——再分发其软件须保留 Apple 版权声明与免责文本，且不得使用 Apple 名称、商标或标识为衍生品背书。第三方声明详见 [LICENSE](LICENSE) 文件末尾。
