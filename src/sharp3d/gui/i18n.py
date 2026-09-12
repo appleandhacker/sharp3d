@@ -293,7 +293,7 @@ _ZH2EN: dict[str, str] = {
     "输入图片": "Input image",
     "语言已切换": "Language changed",
     "界面语言将在下次启动 sharp3d 时生效。": "The UI language will take effect the next time sharp3d starts.",
-    '画质优先：完整 6 面 cubemap 高精度渲染。\n速度优先：降低 cubemap 面分辨率后上采样，提速约 40%。': 'Quality first: full 6-face cubemap rendering at high precision.\nSpeed first: renders cubemap faces at reduced resolution then upscales, ~40% faster.',}
+    "Anaglyph 红青": "Anaglyph red/cyan",    '画质优先：完整 6 面 cubemap 高精度渲染。\n速度优先：降低 cubemap 面分辨率后上采样，提速约 40%。': 'Quality first: full 6-face cubemap rendering at high precision.\nSpeed first: renders cubemap faces at reduced resolution then upscales, ~40% faster.',}
 
 
 def _detect_system_language() -> str:

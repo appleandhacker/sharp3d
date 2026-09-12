@@ -129,7 +129,7 @@ class SbsTab(QWidget):
         fmt_row.addWidget(QLabel(tr("立体格式")))
         self._format = QComboBox()
         for _key, label in FORMATS:
-            self._format.addItem(label)
+            self._format.addItem(tr(label))
         self._format.setToolTip(
             tr("导出文件的立体打包格式。\nAnaglyph 红青 = 用红青 3D 眼镜观看；Cross Eyed = 斗鸡眼观看法。")
         )
