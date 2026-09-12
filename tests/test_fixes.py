@@ -295,7 +295,7 @@ mods = [
     "sharp3d.gui", "sharp3d.gui.widgets", "sharp3d.gui.theme",
     "sharp3d.gui.worker", "sharp3d.gui.main_window",
     "sharp3d.gui.sbs_tab", "sharp3d.gui.vr_tab", "sharp3d.gui.anim_tab",
-    "sharp3d.gui.gaussian_tab",
+    "sharp3d.gui.gaussian_viewer",
 ]
 import_errors = []
 for m in mods:

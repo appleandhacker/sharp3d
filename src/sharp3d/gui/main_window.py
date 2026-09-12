@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
 )
 
 from .anim_tab import AnimTab
-from .gaussian_tab import GaussianViewerWindow
+from .gaussian_viewer import GaussianViewerWindow
 from .sbs_tab import SbsTab, precision_text
 from .vr_tab import VrTab
 from .theme import DISPLAY_FONT, ThemeManager, build_palette, build_qss

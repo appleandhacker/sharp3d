@@ -287,7 +287,7 @@ src/sharp3d/
 ├── options.py         转换参数数据类 (ConvertOptions)
 ├── predict.py         模型加载 + FP16 + compile + 预热 + 加速状态收集
 ├── ort_engine.py      ONNX Runtime TensorRT 加速引擎
-├── pipeline.py        端到端管线（图片模式）
+├── pipeline.py        图片模式端到端管线（供 CLI；视频路径委托 conversion）
 ├── conversion.py      视频转换引擎（时域稳定 + 边缘柔化 + 卡尔曼收敛）
 ├── temporal.py        时域稳定器（全局/自适应/光流 + 属性 EMA）
 ├── projection.py      投影工具（cubemap/半球面提取 + 球面映射 + 角度权重）
@@ -298,18 +298,21 @@ src/sharp3d/
 ├── eigendecompose.py  3×3 对称矩阵特征分解（解析法 + SVD）
 ├── formats.py         6 种立体格式打包
 ├── video.py           视频读写 + 编码器探测 + 音频混流
+├── imgio.py           图片 IO（EXIF 焦距读取 + 解码）
 ├── hdr.py             HDR 检测 + 色调映射 + HDR10 编码
-├── calibrate_int8.py  TensorRT INT8 校准表生成
+├── spn_tail.py        SPN 网络尾部拆分（TensorRT 导出用）
+├── full_export.py     全模型 ONNX 导出
+├── profiling.py       分阶段计时（SHARP3D_PROFILE=1 启用）
 ├── cli.py             命令行入口
 └── gui/
-    ├── main_window.py 主窗口（多进程架构，GPU 崩溃隔离）
-    ├── vr_tab.py      全景转换标签页 (VR180/VR360)
-    ├── sbs_tab.py     SBS 立体转换标签页
-    ├── anim_tab.py    2.5D 视差动画标签页
-    ├── gaussian_tab.py 高斯查看器（独立窗口，连续30fps轨道渲染）
-    ├── worker.py      GPU 工作进程（VR/SBS/动画管线 + PLY导出）
-    ├── widgets.py     自定义控件（进度条/GPU 监控/预览等）
-    └── theme.py       系统主题检测 + 红青配色
+    ├── main_window.py      主窗口（多进程架构，GPU 崩溃隔离）
+    ├── vr_tab.py           全景转换标签页 (VR180/VR360)
+    ├── sbs_tab.py          SBS 立体转换标签页
+    ├── anim_tab.py         2.5D 视差动画标签页
+    ├── gaussian_viewer.py  高斯查看器（独立窗口，连续30fps轨道渲染）
+    ├── worker.py           GPU 工作进程（VR/SBS/动画管线 + PLY导出）
+    ├── widgets.py          自定义控件（进度条/GPU 监控/预览等）
+    └── theme.py            系统主题检测 + 红青配色
 ```
 
 ---
