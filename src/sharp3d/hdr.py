@@ -414,11 +414,16 @@ class Hdr10Writer:
     """
 
     def __init__(self, path: str | Path, width: int, height: int, fps: float,
-                 codec: str = "h265", crf: int = 18):
+                 codec: str = "h265", crf: int = 18,
+                 audio_source: str | Path | None = None):
         self.path = Path(path)
         self.width = width
         self.height = height
         self.fps = fps
+        # Live-audio mode: mux the audio track into the same fragmented
+        # output while frames are written, so mid-conversion playback has
+        # sound (see VideoWriter for the full rationale).
+        self._live_audio = audio_source is not None
         # Clamp both ends: a negative CRF/qp is rejected by every encoder
         # here, and 0 (near-lossless constqp) can explode the file size.
         crf = max(0, min(int(crf), 51))
@@ -460,6 +465,10 @@ class Hdr10Writer:
             "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{width}x{height}", "-r", f"{fps}",
             "-i", "-",
+        ]
+        if audio_source is not None:
+            cmd += ["-i", str(Path(audio_source))]
+        cmd += [
             "-vf", sdr_to_hdr10_filter(),
             "-c:v", v_codec, *enc_params,
             "-pix_fmt", "yuv420p10le",
@@ -467,9 +476,11 @@ class Hdr10Writer:
             "-color_trc", "smpte2084",
             "-colorspace", "bt2020nc",
             "-color_range", "tv",
-            *MOVFLAGS_LIVE,
-            str(self.tmp_path),
         ]
+        if audio_source is not None:
+            cmd += ["-map", "0:v:0", "-map", "1:a:0?", "-c:a", "aac",
+                    "-shortest"]
+        cmd += [*MOVFLAGS_LIVE, str(self.tmp_path)]
         self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                       stderr=subprocess.DEVNULL,
                                       creationflags=_NO_WINDOW)
@@ -489,7 +500,7 @@ class Hdr10Writer:
         if rc != 0:
             raise RuntimeError(f"HDR10 编码器异常退出 (code={rc})")
 
-        if audio_source is not None:
+        if audio_source is not None and not self._live_audio:
             cmd = [
                 FFMPEG, "-y",
                 "-i", str(self.tmp_path),

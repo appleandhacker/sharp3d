@@ -208,7 +208,8 @@ class VideoWriter:
     """Write video frames with encoding options (GPU-first encoder selection)."""
 
     def __init__(self, path: str | Path, fps: float, width: int, height: int,
-                 codec: str = "h264", crf: int = 18, preset: str = "medium"):
+                 codec: str = "h264", crf: int = 18, preset: str = "medium",
+                 audio_source: str | Path | None = None):
         _pin_imageio_ffmpeg()
         self.path = Path(path)
         self.fps = fps
@@ -230,35 +231,116 @@ class VideoWriter:
         # branch, and lands before the output path imageio appends.
         output_params.extend(MOVFLAGS_LIVE)
 
-        # nvenc uses -qp in output_params; passing quality= would add the
-        # deprecated -global_quality flag and trigger ffmpeg warnings/errors.
-        writer_kwargs = dict(
-            fps=fps,
-            codec=codec_lib,
-            pixelformat="yuv420p",
-            output_params=output_params,
-        )
-        if not _is_nvenc(codec_lib):
-            writer_kwargs["quality"] = 8
+        self._proc = None
+        self._stderr_fh = None
+        self._stderr_path = None
+        self._audio_source = Path(audio_source) if audio_source is not None else None
 
-        self.writer = imageio.get_writer(str(self.tmp_path), **writer_kwargs)
+        if self._audio_source is not None:
+            # Live-audio mode: mux the audio track into the SAME fragmented
+            # output while video frames are written, so mid-conversion
+            # playback has sound (the old close-time mux meant the tmp file
+            # stayed silent until the whole conversion finished). imageio's
+            # writer cannot take a second input, so run the ffmpeg pipe
+            # directly — same pattern as Hdr10Writer. When the frame size is
+            # not a multiple of 16, replicate imageio's macro_block_size
+            # scale so output dimensions stay identical to the legacy path.
+            self._stderr_path = self.tmp_path.with_suffix(".stderr")
+            self._stderr_fh = open(self._stderr_path, "wb")
+            cmd = [
+                FFMPEG, "-y",
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "-s", f"{width}x{height}", "-r", f"{fps}",
+                "-i", "-",
+                "-i", str(self._audio_source),
+                "-map", "0:v:0", "-map", "1:a:0?",
+                "-pix_fmt", "yuv420p",
+            ]
+            if width % 16 or height % 16:
+                cmd += ["-vf", f"scale={width + (16 - width % 16) % 16}:"
+                               f"{height + (16 - height % 16) % 16}"]
+            cmd += ["-c:v", codec_lib, *output_params,
+                    "-c:a", "aac", "-shortest",
+                    str(self.tmp_path)]
+            self._proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stderr=self._stderr_fh,
+                creationflags=_NO_WINDOW)
+        else:
+            # nvenc uses -qp in output_params; passing quality= would add the
+            # deprecated -global_quality flag and trigger ffmpeg warnings/errors.
+            writer_kwargs = dict(
+                fps=fps,
+                codec=codec_lib,
+                pixelformat="yuv420p",
+                output_params=output_params,
+            )
+            if not _is_nvenc(codec_lib):
+                writer_kwargs["quality"] = 8
+
+            self.writer = imageio.get_writer(str(self.tmp_path), **writer_kwargs)
 
     def append_frame(self, frame: np.ndarray):
         """Append (H, W, 3) uint8 frame."""
-        self.writer.append_data(frame)
+        if self._proc is not None:
+            if not frame.flags.c_contiguous:
+                frame = np.ascontiguousarray(frame)
+            # memoryview hands the buffer to the pipe without a full-frame
+            # tobytes() copy.
+            self._proc.stdin.write(memoryview(frame))
+        else:
+            self.writer.append_data(frame)
 
     def close(self, source_video: str | Path | None = None):
         """Close writer and optionally mux audio from source.
 
         Args:
             source_video: Path to original video for audio extraction.
+                Ignored in live-audio mode (the audio track was muxed into
+                the stream as frames were written).
         """
+        if self._proc is not None:
+            # Live-audio mode: the audio track is already in the fragmented
+            # stream; just finish the encode and promote tmp → final.
+            self._proc.stdin.close()
+            rc = self._proc.wait()
+            self._close_stderr()
+            if rc != 0:
+                logger.error("实时音频编码器异常退出 (code=%d): %s\n%s",
+                             rc, self.path, self._stderr_tail())
+                raise RuntimeError(f"视频编码器异常退出 (code={rc})")
+            self._unlink_stderr()
+            if source_video is not None:
+                logger.warning("已启用转换中音频，close(source_video=...) 被忽略")
+            self._finalize()
+            return
+
         self.writer.close()
 
         if source_video is not None:
             self._mux_audio(Path(source_video))
         else:
             self._finalize()
+
+    def _close_stderr(self) -> None:
+        if self._stderr_fh is not None:
+            try:
+                self._stderr_fh.close()
+            except Exception:
+                pass
+            self._stderr_fh = None
+
+    def _stderr_tail(self) -> str:
+        try:
+            return self._stderr_path.read_bytes()[-500:].decode(
+                "utf-8", errors="replace").strip()
+        except OSError:
+            return ""
+
+    def _unlink_stderr(self) -> None:
+        try:
+            self._stderr_path.unlink(missing_ok=True)
+        except (OSError, AttributeError):
+            pass
 
     def _finalize(self) -> None:
         """Promote tmp → final path, never leaving the tmp behind on failure."""
@@ -275,20 +357,40 @@ class VideoWriter:
     def abort(self) -> None:
         """Best-effort cleanup after a failed/cancelled run. Never raises.
 
-        Closes the imageio writer (shutting down its ffmpeg child) and removes
-        the tmp file, so an exception between writer creation and close()
-        neither leaks the encoder subprocess nor leaves a partial .tmp.mp4
-        that could be mistaken for a finished output.
+        Closes the encoder (shutting down its ffmpeg child — the imageio
+        writer in legacy mode, the direct pipe in live-audio mode) and
+        removes the tmp file, so an exception between writer creation and
+        close() neither leaks the encoder subprocess nor leaves a partial
+        .tmp.mp4 that could be mistaken for a finished output.
         """
-        try:
-            self.writer.close()
-        except Exception:
-            logger.debug("abort: writer.close() 失败（忽略）", exc_info=True)
+        if self._proc is not None:
+            try:
+                self._proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+            try:
+                self._proc.wait(timeout=3)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._close_stderr()
+        else:
+            try:
+                self.writer.close()
+            except Exception:
+                logger.debug("abort: writer.close() 失败（忽略）", exc_info=True)
         try:
             self.tmp_path.unlink(missing_ok=True)
         except OSError:
             logger.debug("abort: 临时文件删除失败: %s", self.tmp_path,
                          exc_info=True)
+        self._unlink_stderr()
 
     def _mux_audio(self, source: Path):
         """Mux audio from source video into output."""

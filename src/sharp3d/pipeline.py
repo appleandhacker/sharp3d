@@ -308,16 +308,24 @@ class Sharp3DPipeline:
         if want_hdr and codec == "h264":
             codec = "h265"  # H.264 cannot carry HDR10
 
+        # Live-audio: hand the source to the writer up-front so the audio
+        # track is muxed into the fragmented stream WHILE frames are written
+        # (mid-conversion playback then has sound; the old close-time mux
+        # meant the tmp file stayed silent until the very end).
+        source = input_path if reader.has_audio else None
+
         if want_hdr:
             writer = Hdr10Writer(
                 output_path, fps=vid_fps, width=out_w,
                 height=out_h, codec=codec, crf=crf,
+                audio_source=source,
             )
         else:
             writer = VideoWriter(
                 output_path, fps=vid_fps,
                 width=out_w, height=out_h,
                 codec=codec, crf=crf,
+                audio_source=source,
             )
 
         frame_times = []
@@ -469,12 +477,9 @@ class Sharp3DPipeline:
         reader.close()
         torch.cuda.empty_cache()
 
-        # Close and mux audio
-        source = input_path if reader.has_audio else None
-        if want_hdr:
-            writer.close(audio_source=source)
-        else:
-            writer.close(source_video=source)
+        # Close (live-audio mode already carries the audio track; legacy
+        # mode muxes here via close(source_video=...)).
+        writer.close()
 
         total_elapsed = time.time() - total_start
         if not frame_times:
