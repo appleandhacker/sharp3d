@@ -22,6 +22,9 @@ class ConvertOptions:
     ipd_mm: float = 63.0
     convergence: float = 0.0       # 0 = auto
     strength: float = 1.0
+    # Camera: 35mm-equivalent focal length override. None = auto
+    # (EXIF for images, width*1.2 heuristic for videos).
+    focal_35mm: float | None = None
 
     # Encoding
     codec: str = "h264"            # "h264" | "h265" | "av1"
@@ -39,6 +42,7 @@ class ConvertOptions:
     perf_mode: str = "quality"     # "quality" | "speed"
     renderer: str = "standard"     # "standard" | "higs"
     temporal_stabilize: str = "off"  # "off" | "global" | "adaptive" | "flow"
+    keyframe_interval: int = 1     # full predict every Nth frame (1 = off)
 
     # Extra outputs
     depth: bool = False

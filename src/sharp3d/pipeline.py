@@ -39,14 +39,9 @@ class Sharp3DPipeline:
         import os
         if not use_compile:
             os.environ["SHARP3D_NO_COMPILE"] = "1"
-        self.predictor = SharpPredictor(device=device)
-        self._warmed_up = True  # SharpPredictor does warmup in __init__
-
-    def _ensure_warmup(self, img_resized, disparity_factor):
-        """Warmup on first call (triggers torch.compile)."""
-        if not self._warmed_up:
-            self.predictor.warmup(img_resized, disparity_factor)
-            self._warmed_up = True
+        self.predictor = SharpPredictor(device=device, fp16=use_fp16)
+        # SharpPredictor already warms up (predict + gsplat kernel) in
+        # __init__, so there is nothing left to trigger lazily.
 
     def process_image(
         self,
@@ -86,7 +81,6 @@ class Sharp3DPipeline:
             image_np, f_px, self.device
         )
 
-        self._ensure_warmup(img_resized, df)
 
         if progress_callback:
             progress_callback("Predicting 3D Gaussians...")
@@ -130,7 +124,8 @@ class Sharp3DPipeline:
         # Save output
         packed = pack_stereo(format, sbs_img)
         sbs_np = packed.cpu().numpy()
-        Image.fromarray(sbs_np).save(output_path)
+        from sharp3d.imgio import save_rgb
+        save_rgb(output_path, sbs_np)
 
         result = {
             "elapsed": elapsed,
@@ -143,7 +138,8 @@ class Sharp3DPipeline:
         if output_depth:
             depth_path = output_path.with_stem(output_path.stem + "_depth")
             depth_img = render_depth_map(g_world, f_px, orig_w, orig_h)
-            Image.fromarray(depth_img.cpu().numpy()).save(depth_path)
+            from sharp3d.imgio import save_rgb
+            save_rgb(depth_path, depth_img.cpu().numpy())
             result["depth_path"] = str(depth_path)
 
         # Cleanup
@@ -163,6 +159,7 @@ class Sharp3DPipeline:
         crf: int = 26,
         format: str = "full_sbs",
         hdr_output: bool | None = None,
+        keyframe_interval: int = 1,
         progress_callback: Callable[[int, int, float], None] | None = None,
     ) -> dict:
         """Process video → stereoscopic video with audio.
@@ -175,6 +172,9 @@ class Sharp3DPipeline:
             format: Stereo packing format (see sharp3d.formats).
             hdr_output: True = force HDR10 output, False = force SDR,
                         None = auto (HDR10 if the input is HDR).
+            keyframe_interval: Full SHARP prediction every Nth frame;
+                in-between frames reuse keyframe geometry with refreshed
+                colors (see VideoConversionEngine). 1 = every frame.
             progress_callback: (frame_idx, total_frames, fps) callback.
 
         Returns:
@@ -192,7 +192,13 @@ class Sharp3DPipeline:
         vid_fps = reader.fps
         f_px = reader.width * 1.2  # ~60° FOV estimate
 
-        out_w, out_h = output_size(format, reader.width, reader.height)
+        # The writer must be opened at the size the renderer actually emits,
+        # which is the *screen* resolution (halved for sources taller than
+        # 3000px), not the source resolution. Using reader.width/height here
+        # desynchronized the writer from the frames for any 4K+ input.
+        from .render import _get_screen_resolution
+        sw, sh = _get_screen_resolution(reader.width, reader.height)
+        out_w, out_h = output_size(format, sw, sh)
 
         # HDR output: explicit flag, or auto-match the input's HDR status
         is_hdr = info["is_hdr"]
@@ -232,10 +238,19 @@ class Sharp3DPipeline:
         decoder = threading.Thread(target=_decode, daemon=True)
         decoder.start()
 
-        # Temporal stabilization (same as GUI path).
-        from .temporal import TemporalStabilizer, KalmanScalar
-        stab = TemporalStabilizer(mode="adaptive", device=self.device)
-        conv_kf = KalmanScalar(q_pos=0.05, q_vel=0.02, r=0.15)
+        # Temporal stabilization + keyframe reuse via the shared engine
+        # (same code path as the GUI worker).
+        from .conversion import VideoConversionEngine
+        engine = VideoConversionEngine(
+            predict_fn=self.predictor,
+            device=self.device,
+            f_px=f_px,
+            fmt=format,
+            ipd=self.ipd,
+            decompose_method=self.decompose_method,
+            stabilize_mode="adaptive",
+            keyframe_interval=keyframe_interval,
+        )
 
         # Pipeline the host->device transfer: prepare frame N+1 on a side
         # stream while frame N renders on the main stream (copy and compute
@@ -258,7 +273,12 @@ class Sharp3DPipeline:
             return prepared, upload_done
 
         i = 0
-        unproj = None  # lazily built on frame 0 (intrinsics are constant)
+
+        # Optional per-stage profiling (SHARP3D_PROFILE=1). The engine marks
+        # predict/stabilize/render internally; we add the D2H+write wall time.
+        from . import profiling
+        prof = profiling.get_timer() if profiling.ENABLED else None
+
         first = frame_q.get()
         if first is not None:
             prepared, upload_done = _prepare_async(first)
@@ -271,34 +291,15 @@ class Sharp3DPipeline:
                 main_stream.wait_event(upload_done)
                 img_resized, df, intrinsics_resized, (orig_w, orig_h) = prepared
 
-                self._ensure_warmup(img_resized, df)
-
+        
                 t0 = time.time()
 
-                g_ndc = self.predictor.predict(img_resized, df)
-                stab.stabilize(g_ndc, img=img_resized)
-                if unproj is None:
-                    from sharp.utils.gaussians import get_unprojection_matrix
-                    unproj = get_unprojection_matrix(
-                        torch.eye(4, device=self.device),
-                        intrinsics_resized, INTERNAL_SHAPE,
-                    ).detach()
-                # Convergence Kalman smoothing (auto mode). World-space z is
-                # a linear readout of the NDC means (row 2 of U) — cheaper
-                # than unprojecting all gaussians.
-                from .temporal import _mean_view
-                mv = _mean_view(g_ndc).float()
-                z_world = mv @ unproj[2, :3] + unproj[2, 3]
-                z_pos = z_world[z_world > 0]
-                focus = (max(2.0, float(torch.quantile(z_pos, 0.50)))
-                         if z_pos.numel() else 2.0)
-                frame_conv = conv_kf.update(focus)
-                sbs_img, _ = render_sbs(
-                    g_ndc, f_px, orig_w, orig_h, ipd=self.ipd,
-                    convergence=frame_conv, ndc_transform=unproj,
+                packed = engine.process_frame(
+                    img_resized, df, intrinsics_resized, (orig_w, orig_h),
+                    download=False,
                 )
-
-                packed = pack_stereo(format, sbs_img)
+                if prof:
+                    _t_d2h = time.time()
                 # packed.cpu() is a blocking copy — it implicitly waits for
                 # the render stream, so no torch.cuda.synchronize() is needed
                 # (a device-wide sync would also stall on the next frame's
@@ -310,18 +311,23 @@ class Sharp3DPipeline:
                     writer.write_frame(sbs_np)
                 else:
                     writer.append_frame(sbs_np)
+                if prof:
+                    prof.frame_end((time.time() - _t_d2h) * 1000.0)
 
                 if progress_callback:
                     progress_callback(i, n_frames, 1.0 / dt)
                 i += 1
 
-                del g_ndc, sbs_img, img_resized, prepared
+                del packed, img_resized, prepared
                 # No per-frame empty_cache(): constant shapes mean the caching
                 # allocator reuses blocks; empty_cache only adds sync + churn.
 
                 if nxt_prepared is None:
                     break
                 prepared, upload_done = nxt_prepared
+
+        if prof:
+            prof.flush()
 
         while True:
             try:

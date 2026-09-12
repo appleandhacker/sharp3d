@@ -37,6 +37,11 @@ def main():
                         help="Also output depth map (images only)")
     parser.add_argument("--hdr", action="store_true",
                         help="Force HDR10 (10-bit PQ) output. Auto-enabled for HDR input.")
+    parser.add_argument("--keyframe-interval", type=int, default=1,
+                        help="Run full SHARP prediction every Nth frame; "
+                             "in-between frames reuse keyframe geometry with "
+                             "refreshed colors (~Nx faster, slight geometry "
+                             "lag on fast motion). Default: 1 (off)")
 
     args = parser.parse_args()
 
@@ -89,6 +94,7 @@ def main():
             codec=args.codec, crf=args.crf,
             format=args.format,
             hdr_output=True if args.hdr else None,
+            keyframe_interval=args.keyframe_interval,
             progress_callback=on_progress,
         )
         print(f"\nDone! {result['n_frames']} frames in {result['total_elapsed']:.1f}s")

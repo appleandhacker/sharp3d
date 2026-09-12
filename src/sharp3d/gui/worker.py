@@ -97,9 +97,17 @@ class _PipelineWorker:
         except Exception as exc:  # noqa: BLE001
             self._respond("error", (f"预加载失败: {exc}",))
 
-    def _ensure_pipeline(self, perf_mode="quality"):
+    def _ensure_pipeline(self, perf_mode="quality", fp16=None):
+        # Normalize None to the resolved values BEFORE building the mode key.
+        # Otherwise preload ("quality", None) and a GUI convert with
+        # explicit defaults ("quality", True) produce different keys
+        # and trigger a pointless full pipeline rebuild + torch._dynamo.reset()
+        # on the first conversion of every session (~15s stall).
+        if fp16 is None:
+            fp16 = (perf_mode != "fp32")
         # Rebuild if mode changed
-        if self._pipeline is not None and getattr(self, '_perf_mode_active', None) != perf_mode:
+        _mode_key = (perf_mode, fp16)
+        if self._pipeline is not None and getattr(self, '_mode_active', None) != _mode_key:
             self._respond("status", ("性能模式已切换，正在重建管线…",))
             self._pipeline = None
             self._compiled = None
@@ -109,7 +117,7 @@ class _PipelineWorker:
 
         if self._pipeline is not None:
             return
-        self._perf_mode_active = perf_mode
+        self._mode_active = _mode_key
         self._respond("model_loading", ())
 
         import torch
@@ -118,7 +126,12 @@ class _PipelineWorker:
 
         self._device = torch.device("cuda")
         self._torch = torch
-        cache_dir = _P(__file__).resolve().parents[3] / ".cache"
+        # Must match predict.py / ort_engine.py. In frozen builds this has to
+        # be %LOCALAPPDATA%\sharp3d\.cache — deriving it from __file__ points
+        # into the install directory, which is often read-only (Program Files),
+        # making every TRT engine rebuild from scratch on every launch.
+        from sharp3d import resolve_cache_dir
+        cache_dir = resolve_cache_dir()
 
         def _progress(stage, pct):
             self._respond("model_load_progress", (stage, pct))
@@ -127,6 +140,7 @@ class _PipelineWorker:
         sp = SharpPredictor(
             device=self._device,
             perf_mode=perf_mode,
+            fp16=(perf_mode != "fp32") if fp16 is None else bool(fp16),
             cache_dir=cache_dir,
             progress_cb=_progress,
         )
@@ -137,9 +151,9 @@ class _PipelineWorker:
         self._respond("status", ("模型就绪",))
 
     # ---- prepare: predict + unproject -> cache gaussians ----------------
-    def prepare(self, path, frame_idx):
+    def prepare(self, path, frame_idx, perf_mode="quality", focal_35mm=None):
         try:
-            self._ensure_pipeline()
+            self._ensure_pipeline(perf_mode)
             torch = self._torch
             from sharp.utils import io as sharp_io
             from sharp3d.unproject import prepare_input, fast_unproject, INTERNAL_SHAPE
@@ -151,16 +165,24 @@ class _PipelineWorker:
                 reader = FrameReader(p)
                 frame = reader.read_frame(frame_idx)
                 f_px = frame.shape[1] * 1.2
+                if focal_35mm:
+                    fh, fw = frame.shape[:2]
+                    f_px = focal_35mm * (fw**2 + fh**2) ** 0.5 \
+                        / (36**2 + 24**2) ** 0.5
                 image_np = frame
             else:
                 image_np, _, f_px = sharp_io.load_rgb(p)
+                if focal_35mm:
+                    h0, w0 = image_np.shape[:2]
+                    f_px = focal_35mm * (w0**2 + h0**2) ** 0.5 / (36**2 + 24**2) ** 0.5
 
             h, w = image_np.shape[:2]
             self._f_px = f_px
             self._orig_w, self._orig_h = w, h
 
             img_r, df, ir, _ = prepare_input(image_np, f_px, self._device)
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+            ac_dtype = getattr(self._pipeline, "_ac_dtype", torch.float16)
+            with torch.no_grad(), torch.autocast("cuda", dtype=ac_dtype):
                 g_ndc = self._compiled(img_r, df)
             self._gaussians = fast_unproject(
                 g_ndc, torch.eye(4, device=self._device), ir, INTERNAL_SHAPE,
@@ -205,7 +227,8 @@ class _PipelineWorker:
                 self._convert_vr(opts)
                 return
 
-            self._ensure_pipeline(opts.get("perf_mode", "quality"))
+            self._ensure_pipeline(opts.get("perf_mode", "quality"),
+                                  fp16=opts.get("fp16"))
             torch = self._torch
             from sharp.utils import io as sharp_io
             from sharp3d.unproject import prepare_input, fast_unproject, INTERNAL_SHAPE
@@ -476,7 +499,8 @@ class _PipelineWorker:
         )
 
         # Save
-        Image.fromarray(result.cpu().numpy()).save(out)
+        from sharp3d.imgio import save_rgb
+        save_rgb(out, result.cpu().numpy())
 
         # Depth panorama output
         if opts.get("depth"):
@@ -488,7 +512,7 @@ class _PipelineWorker:
             viewmats_d, Ks_d = _gcc(render_face, device)
             # Render depth from left eye (no stereo offset for depth)
             with torch.no_grad():
-                rendered_d, _, meta_d = _rast(
+                rendered_d, alphas_d, meta_d = _rast(
                     means=merged.mean_vectors,
                     quats=merged.quaternions,
                     scales=merged.singular_values,
@@ -499,37 +523,22 @@ class _PipelineWorker:
                     width=render_face, height=render_face,
                     render_mode="RGB+D",
                 )
-            # RGB+D mode: rendered_d shape [6, H, W, 4] (RGB + depth)
+            # RGB+D mode: rendered_d shape [6, H, W, 4] (RGB + depth).
+            # The depth channel is alpha-weighted, so the accumulated alpha
+            # has to be assembled too — otherwise the shared colorizer cannot
+            # tell real geometry from empty background (alpha≈0 → depth/1e-8).
+            from sharp3d.render import colorize_depth
             depths = rendered_d[:, :, :, 3:4].permute(0, 3, 1, 2)  # [6, 1, H, W]
-            depths_3ch = depths.expand(-1, 3, -1, -1)  # [6, 3, H, W] for assembly
-            depth_equirect = depth_map_fn(depths_3ch, eye_w, eye_h)  # [H, W, 3]
-            # Normalize depth with turbo-like pseudo-color (near=warm, far=cool)
-            d_valid = depth_equirect[depth_equirect > 0]
-            if d_valid.numel() > 0:
-                d_min = d_valid.min()
-                d_max = d_valid.max()
-                if d_max > d_min:
-                    depth_log = torch.log(depth_equirect.clamp(min=d_min) / d_min + 1e-6)
-                    log_max = torch.log(d_max / d_min + 1e-6)
-                    depth_norm = (depth_log / log_max).clamp(0, 1)
-                    # Take one channel (all 3 are identical after expand)
-                    dn = depth_norm[..., 0]
-                    r = (1.0 - dn).clamp(0, 1)
-                    g = (1.0 - (dn - 0.5).abs() * 2).clamp(0, 1)
-                    b = dn.clamp(0, 1)
-                    depth_vis = (torch.stack([r, g, b], dim=-1) * 255).to(torch.uint8)
-                else:
-                    depth_vis = torch.full((*depth_equirect.shape[:2], 3),
-                                           128, dtype=torch.uint8,
-                                           device=depth_equirect.device)
-            else:
-                depth_vis = torch.zeros((*depth_equirect.shape[:2], 3),
-                                        dtype=torch.uint8,
-                                        device=depth_equirect.device)
-            # Zero-depth pixels (no coverage) → black
-            depth_vis[depth_equirect[..., 0] <= 0] = 0
+            alphas = alphas_d.permute(0, 3, 1, 2)                  # [6, 1, H, W]
+            depth_equirect = depth_map_fn(depths.expand(-1, 3, -1, -1),
+                                          eye_w, eye_h)             # [H, W, 3]
+            alpha_equirect = depth_map_fn(alphas.expand(-1, 3, -1, -1),
+                                          eye_w, eye_h)             # [H, W, 3]
+            depth_vis = colorize_depth(depth_equirect[..., 0],
+                                       alpha_equirect[..., 0])
             depth_out = out.with_stem(out.stem + "_depth")
-            Image.fromarray(depth_vis.cpu().numpy()).save(depth_out)
+            from sharp3d.imgio import save_rgb
+            save_rgb(depth_out, depth_vis.cpu().numpy())
 
         del merged, faces, result
         torch.cuda.empty_cache()
@@ -698,9 +707,28 @@ class _PipelineWorker:
             # Constant across frames — build once, not per frame.
             viewmats_d, Ks_d = get_cubemap_cameras(render_face, device)
 
+        # ── Keyframe geometry reuse (same idea as VideoConversionEngine) ──
+        # Every Nth frame runs the full per-face SHARP predict; in-between
+        # frames reuse the merged keyframe geometry and only refresh gaussian
+        # colors from the current frame's faces. A scene cut (pooled sRGB
+        # residual) forces a fresh keyframe. Panoramic frames predict 4-6
+        # faces each, so the reuse saves proportionally more than flat video.
+        import torch.nn.functional as _F
+        from sharp.utils.color_space import sRGB2linearRGB, linearRGB2sRGB
+        kf_interval = max(1, int(opts.get("keyframe_interval", 1)))
+        kf_state = None   # {"geo", "masks", "colors_srgb", "pix", "layers"}
+        kf_age = 0
+
+        def _face_pix(face):
+            """(3, 1536, 1536) face → (HW, 3) f16 sRGB on the gaussian grid."""
+            return (_F.avg_pool2d(face, 2).permute(1, 2, 0)
+                    .reshape(-1, 3).half())
+
         # Main conversion loop
         n_done = 0
         t_start = time.time()
+        from sharp3d import profiling as _profiling
+        _t_frame = t_start
 
         while True:
             frm = frame_q.get()
@@ -736,77 +764,125 @@ class _PipelineWorker:
                                                fov_scale=OVERLAP_FOV_SCALE)
             del img_t
 
-            # Predict + unproject each face → merge Gaussians
-            all_means = []
-            all_quats = []
-            all_scales = []
-            all_opacities = []
-            all_colors = []
+            # ── Keyframe reuse fast path ─────────────────────────────
+            merged = None
+            if (kf_interval > 1 and kf_state is not None
+                    and kf_age < kf_interval - 1):
+                pix_cur = [_face_pix(faces[i]) for i in range(n_faces)]
+                diff = torch.stack(
+                    [(p.float() - k.float()).abs().mean()
+                     for p, k in zip(pix_cur, kf_state["pix"])]).mean()
+                if float(diff) <= 0.08:  # no scene cut → reuse geometry
+                    kf_age += 1
+                    geo = kf_state["geo"]
+                    new_cols = []
+                    for i in range(n_faces):
+                        delta = pix_cur[i].float() - kf_state["pix"][i].float()
+                        srgb = (kf_state["colors_srgb"][i].float()
+                                + delta.repeat(kf_state["layers"], 1)
+                                ).clamp_(0.0, 1.0)
+                        new_cols.append(
+                            sRGB2linearRGB(srgb)[kf_state["masks"][i]])
+                    merged = geo._replace(
+                        colors=torch.cat(new_cols, dim=0).to(geo.colors.dtype))
+                    del new_cols, faces
+                del pix_cur
 
-            for i in range(n_faces):
+            if merged is None:
+                # Drop the previous keyframe cache *before* the full predict:
+                # holding ~100MB of stale geometry through the 6-face predict
+                # peak pushes a 12GB GPU into shared-memory paging (observed
+                # 100x slowdown on every refresh keyframe).
+                kf_state = None
+                # Predict + unproject each face → merge Gaussians
+                all_means = []
+                all_quats = []
+                all_scales = []
+                all_opacities = []
+                all_colors = []
+                kf_masks, kf_cols, kf_pix = [], [], []
+                kf_layers = 2
+
+                for i in range(n_faces):
+                    if self._cancel_event.is_set():
+                        break
+                    # GPU-direct (prepare_input accepts GPU tensor)
+                    img_r, df, ir, _ = prepare_input(faces[i], f_px, device)
+
+                    with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
+                        g_ndc = self._compiled(img_r, df)
+
+                    g = fast_unproject(g_ndc, eye4, ir,
+                                       INTERNAL_SHAPE, decompose_method="analytical")
+                    del img_r, g_ndc  # free model output early
+
+                    means = g.mean_vectors.squeeze(0).clone()
+                    quats_local = g.quaternions.squeeze(0).clone()
+                    scales = g.singular_values.squeeze(0).clone()
+                    opacities = (g.opacities.squeeze(0) if g.opacities.dim() == 2
+                                 else g.opacities).clone()
+                    colors = g.colors.squeeze(0).clone()
+                    del g  # free NDC Gaussians
+
+                    R = viewmats[i, :3, :3]
+                    R_inv = R.T
+                    means_world = means @ R_inv.T
+                    q_rot = quat_from_rotmat_gpu(R_inv.unsqueeze(0))[0]
+                    quats_world = _quat_multiply(q_rot.unsqueeze(0), quats_local)
+                    del means, quats_local  # local-space no longer needed
+
+                    # Seam handling: optional angular opacity attenuation
+                    face_fwd = face_forwards[i].to(device)
+                    if opts.get("seam_blend"):
+                        weight = angular_opacity_weight(means_world, face_fwd,
+                                                        inner_deg=seam_deg)
+                        keep = weight > 0.01
+                        w_keep = weight[keep]
+                        opac_keep = opacities[keep]
+                        if opac_keep.dim() > w_keep.dim():
+                            w_keep = w_keep.unsqueeze(-1)
+                        all_means.append(means_world[keep])
+                        all_quats.append(quats_world[keep])
+                        all_scales.append(scales[keep])
+                        all_opacities.append(opac_keep * w_keep)
+                        all_colors.append(colors[keep])
+                    else:
+                        keep = filter_gaussians_by_angle(means_world, face_fwd)
+                        all_means.append(means_world[keep])
+                        all_quats.append(quats_world[keep])
+                        all_scales.append(scales[keep])
+                        all_opacities.append(opacities[keep])
+                        all_colors.append(colors[keep])
+                    if kf_interval > 1:
+                        # Cache color-refresh inputs: full-grid keyframe
+                        # colors (sRGB), pooled face pixels, and keep mask.
+                        pix_i = _face_pix(faces[i])
+                        kf_pix.append(pix_i)
+                        kf_cols.append(linearRGB2sRGB(
+                            colors.float().clamp(0.0, 1.0)).half())
+                        kf_masks.append(keep)
+                        kf_layers = max(1, colors.shape[0] // pix_i.shape[0])
+                    del means_world, quats_world, scales, opacities, colors
+
                 if self._cancel_event.is_set():
+                    del faces
                     break
-                # GPU-direct (prepare_input accepts GPU tensor)
-                img_r, df, ir, _ = prepare_input(faces[i], f_px, device)
 
-                with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
-                    g_ndc = self._compiled(img_r, df)
+                merged = Gaussians3D(
+                    mean_vectors=torch.cat(all_means, dim=0),
+                    singular_values=torch.cat(all_scales, dim=0),
+                    quaternions=torch.cat(all_quats, dim=0),
+                    colors=torch.cat(all_colors, dim=0),
+                    opacities=torch.cat(all_opacities, dim=0),
+                )
+                del faces, all_means, all_quats, all_scales, all_opacities, all_colors
 
-                g = fast_unproject(g_ndc, eye4, ir,
-                                   INTERNAL_SHAPE, decompose_method="analytical")
-                del img_r, g_ndc  # free model output early
-
-                means = g.mean_vectors.squeeze(0).clone()
-                quats_local = g.quaternions.squeeze(0).clone()
-                scales = g.singular_values.squeeze(0).clone()
-                opacities = (g.opacities.squeeze(0) if g.opacities.dim() == 2
-                             else g.opacities).clone()
-                colors = g.colors.squeeze(0).clone()
-                del g  # free NDC Gaussians
-
-                R = viewmats[i, :3, :3]
-                R_inv = R.T
-                means_world = means @ R_inv.T
-                q_rot = quat_from_rotmat_gpu(R_inv.unsqueeze(0))[0]
-                quats_world = _quat_multiply(q_rot.unsqueeze(0), quats_local)
-                del means, quats_local  # local-space no longer needed
-
-                # Seam handling: optional angular opacity attenuation
-                face_fwd = face_forwards[i].to(device)
-                if opts.get("seam_blend"):
-                    weight = angular_opacity_weight(means_world, face_fwd,
-                                                    inner_deg=seam_deg)
-                    keep = weight > 0.01
-                    w_keep = weight[keep]
-                    opac_keep = opacities[keep]
-                    if opac_keep.dim() > w_keep.dim():
-                        w_keep = w_keep.unsqueeze(-1)
-                    all_means.append(means_world[keep])
-                    all_quats.append(quats_world[keep])
-                    all_scales.append(scales[keep])
-                    all_opacities.append(opac_keep * w_keep)
-                    all_colors.append(colors[keep])
-                else:
-                    keep = filter_gaussians_by_angle(means_world, face_fwd)
-                    all_means.append(means_world[keep])
-                    all_quats.append(quats_world[keep])
-                    all_scales.append(scales[keep])
-                    all_opacities.append(opacities[keep])
-                    all_colors.append(colors[keep])
-                del means_world, quats_world, scales, opacities, colors
-
-            if self._cancel_event.is_set():
-                del faces
-                break
-
-            merged = Gaussians3D(
-                mean_vectors=torch.cat(all_means, dim=0),
-                singular_values=torch.cat(all_scales, dim=0),
-                quaternions=torch.cat(all_quats, dim=0),
-                colors=torch.cat(all_colors, dim=0),
-                opacities=torch.cat(all_opacities, dim=0),
-            )
-            del faces, all_means, all_quats, all_scales, all_opacities, all_colors
+                if kf_interval > 1:
+                    # merged stays alive in kf_state across the loop's del.
+                    kf_state = {"geo": merged, "masks": kf_masks,
+                                "colors_srgb": kf_cols, "pix": kf_pix,
+                                "layers": kf_layers}
+                    kf_age = 0
 
             # Render stereo VR frame
             result = render_vr_stereo(
@@ -835,7 +911,7 @@ class _PipelineWorker:
                                 if output_projection == "equirect180"
                                 else cubemap_to_equirect)
                 with torch.no_grad():
-                    rendered_d, _, _ = _rast(
+                    rendered_d, alphas_d, _ = _rast(
                         means=merged.mean_vectors,
                         quats=merged.quaternions,
                         scales=merged.singular_values,
@@ -847,43 +923,37 @@ class _PipelineWorker:
                         render_mode="RGB+D",
                     )
                 depths = rendered_d[:, :, :, 3:4].permute(0, 3, 1, 2)
-                depths_3ch = depths.expand(-1, 3, -1, -1)
-                depth_equirect = depth_map_fn(depths_3ch, eye_w, eye_h)
-                d_valid = depth_equirect[depth_equirect > 0]
-                if d_valid.numel() > 0:
-                    d_min = d_valid.min()
-                    d_max = d_valid.max()
-                    if d_max > d_min:
-                        depth_log = torch.log(
-                            depth_equirect.clamp(min=d_min) / d_min + 1e-6)
-                        log_max = torch.log(d_max / d_min + 1e-6)
-                        depth_norm = (depth_log / log_max).clamp(0, 1)
-                        dn = depth_norm[..., 0]
-                        r = (1.0 - dn).clamp(0, 1)
-                        g = (1.0 - (dn - 0.5).abs() * 2).clamp(0, 1)
-                        b = dn.clamp(0, 1)
-                        depth_vis = (torch.stack([r, g, b], dim=-1) * 255
-                                     ).to(torch.uint8)
-                    else:
-                        depth_vis = torch.full(
-                            (*depth_equirect.shape[:2], 3), 128,
-                            dtype=torch.uint8, device=depth_equirect.device)
-                else:
-                    depth_vis = torch.zeros(
-                        (*depth_equirect.shape[:2], 3),
-                        dtype=torch.uint8, device=depth_equirect.device)
-                depth_vis[depth_equirect[..., 0] <= 0] = 0
+                alphas = alphas_d.permute(0, 3, 1, 2)
+                depth_equirect = depth_map_fn(depths.expand(-1, 3, -1, -1),
+                                              eye_w, eye_h)
+                alpha_equirect = depth_map_fn(alphas.expand(-1, 3, -1, -1),
+                                              eye_w, eye_h)
+                from sharp3d.render import colorize_depth
+                depth_vis = colorize_depth(depth_equirect[..., 0],
+                                           alpha_equirect[..., 0])
                 depth_writer.append_frame(depth_vis.cpu().numpy())
-                del rendered_d, depths, depth_equirect, depth_vis
+                del rendered_d, alphas_d, depths, alphas
+                del depth_equirect, alpha_equirect, depth_vis
 
             del merged
-            # No per-frame empty_cache(): shapes are constant, the caching
-            # allocator reuses blocks; empty_cache only adds sync + churn.
+            # VR must reclaim VRAM every frame: unlike the SBS path (constant
+            # shapes), the merged gaussian count varies per frame (angle
+            # filtering keeps a content-dependent subset), so the caching
+            # allocator fragments and `reserved` grows monotonically. Without
+            # this, a 12GB GPU starts paging into shared memory after a few
+            # frames (observed 100x slowdown from frame ~6).
+            torch.cuda.empty_cache()
 
             n_done += 1
             elapsed = time.time() - t_start
             avg_fps = n_done / elapsed if elapsed > 0 else 0.0
             self._respond("convert_progress", (n_done, n, avg_fps, elapsed))
+            if _profiling.ENABLED:
+                _now = time.time()
+                print(f"[PROF][vr] frame {n_done}: "
+                      f"{(_now - _t_frame) * 1000:.0f}ms  "
+                      f"{_profiling.vram_line()}", flush=True)
+                _t_frame = _now
 
             if n_done % 30 == 0:
                 gc.collect()
@@ -927,6 +997,10 @@ class _PipelineWorker:
         fmt = opts.get("format", "full_sbs")
         image_np, _, f_px = sharp_io.load_rgb(path)
         h, w = image_np.shape[:2]
+        # Focal override beats EXIF/30mm default (same diagonal conversion).
+        focal_mm = opts.get("focal_35mm")
+        if focal_mm:
+            f_px = focal_mm * (w**2 + h**2) ** 0.5 / (36**2 + 24**2) ** 0.5
 
         # Output resolution: custom width or scale fraction of source width.
         custom_w = opts.get("out_width")
@@ -948,7 +1022,8 @@ class _PipelineWorker:
             conv_dist = _compute_focus_depth_gpu(g.mean_vectors, q_focus=q)
             sbs, (sw, sh) = render_sbs(g, f_px, w, h, ipd=ipd_scene,
                                        convergence=conv_dist,
-                                       render_width=render_w)
+                                       render_width=render_w,
+                                       renderer=opts.get("renderer", "standard"))
         else:
             # Fast path: fold the unprojection into the view matrices and
             # render NDC gaussians directly (skips the covariance
@@ -964,18 +1039,20 @@ class _PipelineWorker:
                          if z_pos.numel() else 2.0)
             sbs, (sw, sh) = render_sbs(g_ndc, f_px, w, h, ipd=ipd_scene,
                                        convergence=conv_dist,
-                                       render_width=render_w, ndc_transform=U)
+                                       render_width=render_w, ndc_transform=U,
+                                       renderer=opts.get("renderer", "standard"))
         packed = pack_stereo(fmt, sbs)
         torch.cuda.synchronize()
         elapsed = time.time() - t0
 
-        Image.fromarray(packed.cpu().numpy()).save(out)
+        from sharp3d.imgio import save_rgb
+        save_rgb(out, packed.cpu().numpy())
 
         if opts.get("depth"):
+            from sharp3d.imgio import save_rgb
             from sharp3d.render import render_depth_map
             depth = render_depth_map(g, f_px, w, h)
-            Image.fromarray(depth.cpu().numpy()).save(
-                out.with_stem(out.stem + "_depth"))
+            save_rgb(out.with_stem(out.stem + "_depth"), depth.cpu().numpy())
         if opts.get("ply"):
             from sharp.utils.gaussians import save_ply
             save_ply(g, f_px, (h, w), out.with_suffix(".ply"))
@@ -1002,6 +1079,13 @@ class _PipelineWorker:
         reader = FrameReader(path)
         n = reader.n_frames
         f_px = reader.width * 1.2
+        # Focal override (35mm-equivalent mm, diagonal-based — same
+        # conversion as sharp_io.convert_focallength). Long-lens footage
+        # needs the real focal: the width*1.2 heuristic (~40mm) flattens it.
+        focal_mm = opts.get("focal_35mm")
+        if focal_mm:
+            f_px = focal_mm * (reader.width**2 + reader.height**2) ** 0.5 \
+                / (36**2 + 24**2) ** 0.5
 
         fmt = opts.get("format", "full_sbs")
 
@@ -1133,18 +1217,27 @@ class _PipelineWorker:
             free_bufs.put(torch.empty((out_h, out_w, 3), dtype=torch.uint8,
                                       pin_memory=True))
 
+        # Encode-thread timing: (d2h wait+copy ms, encode ms) per frame.
+        # Written only by the encode thread, read after join — no lock needed
+        # for the end-of-run summary.
+        enc_stats: list[tuple[float, float]] = []
+
         def _encode_loop():
             while True:
                 item = encode_q.get()
                 if item is None:
                     break
                 buf, ev = item
+                _t0 = time.time()
                 ev.synchronize()
                 frame_np = buf.numpy()
+                _t1 = time.time()
                 if hdr_out:
                     writer.write_frame(frame_np)
                 else:
                     writer.append_frame(frame_np)
+                enc_stats.append(((_t1 - _t0) * 1000.0,
+                                  (time.time() - _t1) * 1000.0))
                 free_bufs.put(buf)
 
         encode_thread = threading.Thread(target=_encode_loop, daemon=True)
@@ -1164,6 +1257,8 @@ class _PipelineWorker:
             stabilize_mode=stab_mode,
             render_width=render_w,
             edge_soften=opts.get("edge_soften", False),
+            keyframe_interval=int(opts.get("keyframe_interval", 1)),
+            renderer=opts.get("renderer", "standard"),
         )
 
         # ── Optional depth/PLY export ────────────────────────────────────
@@ -1186,6 +1281,14 @@ class _PipelineWorker:
         # Every frame from the queue is processed (ffmpeg already selected the
         # correct frames via its fps filter). No Python-side skip logic.
         out_written = 0
+
+        # Per-stage profiling (SHARP3D_PROFILE=1). engine.process_frame marks
+        # predict/stabilize/render+pack internally; this loop supplies the
+        # frame_end with the pipeline-side wall time (buffer wait + D2H submit)
+        # so a slow encoder or exhausted download buffer shows up as the
+        # "d2h+write" column instead of being invisible.
+        from sharp3d import profiling as _prof
+        prof = _prof.get_timer() if _prof.ENABLED else None
         t_start = time.time()
         n_done = 0
 
@@ -1197,15 +1300,27 @@ class _PipelineWorker:
 
                 while True:
                     # ── 预取下一帧（与当前帧 GPU 计算重叠）──────────
+                    # SHARP3D_PROFILE=3: CPU-side section timestamps. The CUDA
+                    # event stages measure GPU-busy time; the difference to the
+                    # iteration wall is the CPU glue this trace locates.
+                    _pc = _prof.CPU_TRACE
+                    if _pc:
+                        _m0 = time.perf_counter()
                     nxt_frm = frame_q.get()
+                    if _pc:
+                        _m1 = time.perf_counter()
                     if nxt_frm is not None:
                         nxt_prepared, nxt_ev = _prepare(nxt_frm)
                         del nxt_frm
                     else:
                         nxt_prepared, nxt_ev = None, None
+                    if _pc:
+                        _m2 = time.perf_counter()
 
                     # ── 等待当前帧上传完成，然后 GPU 处理 ──────────
                     upload_ev.synchronize()
+                    if _pc:
+                        _m3 = time.perf_counter()
                     img_r, df, ir, (w, h) = prepared
 
                     result = engine.process_frame(
@@ -1214,6 +1329,8 @@ class _PipelineWorker:
                         return_gaussians=want_ply,
                         download=False,
                     )
+                    if _pc:
+                        _m4 = time.perf_counter()
 
                     # Unpack results
                     if want_ply:
@@ -1233,12 +1350,25 @@ class _PipelineWorker:
                         depth_np = None
 
                     # ── Async D2H into a pinned buffer, then encode ──
-                    buf = free_bufs.get()
+                    _t_pipe = time.time()
+                    buf = free_bufs.get()   # blocks if encode falls behind
                     buf.copy_(packed_gpu, non_blocking=True)
                     ev = torch.cuda.Event()
                     ev.record()
                     encode_q.put((buf, ev))
                     out_written += 1
+                    if prof:
+                        prof.frame_end((time.time() - _t_pipe) * 1000.0)
+                    if _pc:
+                        _m5 = time.perf_counter()
+                        print(f"[CPU-frame {out_written:4d}] "
+                              f"get={( _m1-_m0)*1e3:6.1f} "
+                              f"prep={( _m2-_m1)*1e3:6.1f} "
+                              f"up_wait={( _m3-_m2)*1e3:6.1f} "
+                              f"process={( _m4-_m3)*1e3:6.1f} "
+                              f"d2h={( _m5-_m4)*1e3:6.1f} "
+                              f"tail={( time.perf_counter()-_m5)*1e3:6.1f}",
+                              flush=True)
 
                     # Depth video (synchronous, lightweight)
                     if depth_writer is not None and depth_np is not None:
@@ -1287,6 +1417,18 @@ class _PipelineWorker:
 
         total_elapsed = time.time() - t_start
         avg = n_done / total_elapsed if total_elapsed > 0 else 0.0
+
+        # End-of-run pipeline report (always when profiling, so a single
+        # short run still gets the per-stage breakdown).
+        if prof:
+            prof.flush()
+        if _prof.ENABLED and enc_stats:
+            wait = sum(s[0] for s in enc_stats) / len(enc_stats)
+            enc = sum(s[1] for s in enc_stats) / len(enc_stats)
+            print(f"[PROF][sbs] encode thread: d2h_wait={wait:6.1f}ms  "
+                  f"encode={enc:6.1f}ms  n={len(enc_stats)}  "
+                  f"{_prof.vram_line()}", flush=True)
+
         self._respond("convert_done", ({
             "output": str(out), "elapsed": total_elapsed,
             "fps": avg,
@@ -1315,7 +1457,13 @@ class _PipelineWorker:
                 resolution_px=(self._orig_w, self._orig_h), f_px=self._f_px,
             )
             preview_w = opts.get("preview_width", 960)
-            frames = []
+            if preview_w in (-1, None):
+                preview_w = self._orig_w  # full source width
+            # Frames stay in the worker: shipping full-resolution arrays to
+            # the GUI over IPC (and back again on export) peaked at ~1.5 GB
+            # RAM for 240x1080p. The GUI only tracks progress + a done flag.
+            self._anim_frames = []
+            frames = self._anim_frames
             total = len(trajectory)
             for i, eye_pos in enumerate(trajectory):
                 if self._cancel_event.is_set():
@@ -1324,9 +1472,7 @@ class _PipelineWorker:
                                     self._orig_w, self._orig_h,
                                     eye_pos, render_width=preview_w)
                 torch.cuda.synchronize()
-                arr = img.cpu().numpy()
-                frames.append(arr)
-                self._respond("anim_frame", (arr,))
+                frames.append(img.cpu().numpy())
                 self._respond("anim_progress", (i + 1, total))
             self._respond("anim_done", ({"n_frames": len(frames)},))
         except Exception as exc:  # noqa: BLE001
@@ -1338,10 +1484,13 @@ class _PipelineWorker:
             import imageio
             path = opts["path"]
             codec = opts["codec"]
+            frames = getattr(self, "_anim_frames", None)
+            if not frames:
+                raise RuntimeError("请先生成动画（帧已渲染后才可导出）")
             if codec in ("av1", "libsvtav1"):
                 # Resolve to the best AV1 encoder this machine has (NVENC
                 # first, software fallback), honoring the frame size cap.
-                fh, fw = opts["frames"][0].shape[:2] if opts.get("frames") else (0, 0)
+                fh, fw = frames[0].shape[:2]
                 codec = video.resolve_av1(fw, fh)
                 if codec is None:
                     raise RuntimeError(
@@ -1357,7 +1506,7 @@ class _PipelineWorker:
             writer = imageio.get_writer(path, fps=opts["fps"], codec=codec,
                                        quality=8, pixelformat="yuv420p",
                                        output_params=output_params)
-            for f in opts["frames"]:
+            for f in frames:
                 writer.append_data(f)
             writer.close()
             self._respond("anim_exported", (path,))
@@ -1512,7 +1661,6 @@ class EngineProcess(QObject):
     preview_ready = Signal(object)
     convert_progress = Signal(int, int, float, float)  # done, total, avg_fps, elapsed_s
     convert_done = Signal(dict)
-    anim_frame = Signal(object)
     anim_progress = Signal(int, int)
     anim_done = Signal(dict)
     anim_exported = Signal(str)
@@ -1560,8 +1708,10 @@ class EngineProcess(QObject):
         one-time cost overlaps with app startup instead of the first convert."""
         self._req_q.put(("preload", {}))
 
-    def prepare(self, path, frame_idx):
-        self._req_q.put(("prepare", {"path": path, "frame_idx": frame_idx}))
+    def prepare(self, path, frame_idx, perf_mode="quality", focal_35mm=None):
+        self._req_q.put(("prepare", {"path": path, "frame_idx": frame_idx,
+                                     "perf_mode": perf_mode,
+                                     "focal_35mm": focal_35mm}))
 
     def render_preview(self, ipd_mm, convergence, strength, preview_width):
         self._req_q.put(("render_preview", {

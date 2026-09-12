@@ -7,6 +7,8 @@ Supports two render backends:
 
 from __future__ import annotations
 
+import logging
+
 import torch
 from torch import Tensor
 
@@ -17,11 +19,22 @@ from .projection import (
 )
 from .render import linearRGB2sRGB
 
+logger = logging.getLogger(__name__)
+
 
 # Camera matrices depend only on (face_size, eye offset, device) — cache them
 # across frames so the video loop doesn't rebuild 6 look-at matrices per eye
 # per frame.
 _CAM_CACHE: dict = {}
+
+# Sticky HiGS failure flag. When the gsplat_scene_cuda extension is not
+# importable (e.g. no MSVC for the JIT build), gsplat's lazy backend re-raises
+# ONE cached module-level ImportError on every call. Each re-raise appends the
+# current stack frames to that immortal exception's __traceback__ chain, and
+# those frames pin this module's locals — including the freshly rendered
+# 2×~300MB cubemap faces — leaking ~750MB of VRAM per video frame. Probe once,
+# remember the failure, and never re-enter the raising path.
+_HIGS_BROKEN = False
 
 
 def _cameras_cached(face_size: int, device, eye_offset: Tensor,
@@ -66,6 +79,7 @@ def render_vr_stereo(
     """
     if device is None:
         device = gaussians.mean_vectors.device
+    global _HIGS_BROKEN
 
     # For 180° output, skip back face (-Z, index 5) — never sampled
     skip_back = (output_projection == "equirect180")
@@ -74,7 +88,9 @@ def render_vr_stereo(
     left_offset = torch.tensor([-ipd / 2, 0.0, 0.0], device=device)
     right_offset = torch.tensor([ipd / 2, 0.0, 0.0], device=device)
 
-    if renderer == "higs":
+    left_faces = None
+    right_faces = None
+    if renderer == "higs" and not _HIGS_BROKEN:
         try:
             # Build scene once, reuse for both eyes (avoid redundant fp16 packing)
             from gsplat.scene import GaussianInferenceScene
@@ -108,19 +124,25 @@ def render_vr_stereo(
                                                offset_x=ipd / 2)
             if progress_cb:
                 progress_cb(2, 6)
-        except (ImportError, RuntimeError, OSError):
-            # HiGS unavailable (JIT build failure / missing library) — fallback
-            left_faces = _render_cubemap_standard(gaussians, left_offset, face_size,
-                                                  device, skip_back=skip_back,
-                                                  offset_x=-ipd / 2)
-            if progress_cb:
-                progress_cb(1, 6)
-            right_faces = _render_cubemap_standard(gaussians, right_offset, face_size,
-                                                   device, skip_back=skip_back,
-                                                   offset_x=ipd / 2)
-            if progress_cb:
-                progress_cb(2, 6)
-    else:
+        except Exception as e:  # noqa: BLE001
+            # HiGS unavailable (JIT build failure / missing library) — but
+            # also any shape/arg mismatch from gsplat's *experimental* HiGS
+            # API. It has to be a broad catch: a TypeError or AttributeError
+            # escaping here used to abort the whole conversion instead of
+            # falling back to the standard rasterizer, and the failure is
+            # environment-dependent (which is why tools/build_higs_prebuilt.py
+            # exists at all).
+            _HIGS_BROKEN = True  # don't re-enter the raising path every frame
+            logger.warning("HiGS 渲染不可用，回退标准光栅化: %s: %s",
+                           type(e).__name__, e)
+            # gsplat's lazy backend re-raises a cached module-level exception;
+            # detach its traceback so it stops pinning our stack frames (and
+            # the tensors they reference) forever.
+            e.__traceback__ = None
+            left_faces = None
+            right_faces = None
+
+    if left_faces is None:
         left_faces = _render_cubemap_standard(gaussians, left_offset, face_size,
                                               device, skip_back=skip_back,
                                               offset_x=-ipd / 2)

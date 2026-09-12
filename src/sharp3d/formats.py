@@ -37,13 +37,35 @@ def _even(x: int) -> int:
     return x - (x % 2)
 
 
+def _half(n: int) -> int:
+    """Per-eye size after squeezing a full-size frame in half (kept even).
+
+    Both pack() and output_size() must agree on this: when w//2 is odd
+    (e.g. w=102 -> 51, w=1366 -> 683) the even-rounding loses a pixel per
+    eye, so a Half-SBS frame is 2px narrower than the source. Returning the
+    plain source width from output_size() made the writer open at the wrong
+    size and every frame was rejected (or silently corrupted).
+
+    Floor of 1: for n < 4 the even rounding yields 0, which would make
+    F.interpolate crash on a zero-sized output.
+    """
+    return max(1, _even(n // 2))
+
+
 def output_size(fmt: str, w: int, h: int) -> tuple[int, int]:
-    """Output (width, height) for one eye of w×h packed as `fmt`."""
+    """Output (width, height) of the packed frame for a w×h per-eye render.
+
+    Must stay byte-for-byte consistent with pack().
+    """
     if fmt in ("full_sbs", "cross"):
         return _even(w * 2), _even(h)
     if fmt == "full_tb":
         return _even(w), _even(h * 2)
-    # half_sbs / half_tb / anaglyph
+    if fmt == "half_sbs":
+        return _even(2 * _half(w)), _even(h)
+    if fmt == "half_tb":
+        return _even(w), _even(2 * _half(h))
+    # anaglyph
     return _even(w), _even(h)
 
 
@@ -82,11 +104,11 @@ def pack(fmt: str, sbs: "torch.Tensor") -> "torch.Tensor":
     elif fmt == "anaglyph":
         out = torch.stack([left[..., 0], right[..., 1], right[..., 2]], dim=-1)
     elif fmt == "half_sbs":
-        half_w = _even(w // 2)
+        half_w = _half(w)
         out = torch.cat([_squeeze(left, (h, half_w)),
                          _squeeze(right, (h, half_w))], dim=1)
     elif fmt == "half_tb":
-        half_h = _even(h // 2)
+        half_h = _half(h)
         out = torch.cat([_squeeze(left, (half_h, w)),
                          _squeeze(right, (half_h, w))], dim=0)
     else:

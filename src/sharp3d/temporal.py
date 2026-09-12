@@ -458,10 +458,16 @@ class TemporalStabilizer:
         return warped
 
     def _infer_shape(self, N: int) -> None:
-        """Infer spatial shape (L, H, W) from total element count."""
-        if N == 1536 * 1536 * 2:
-            self._shape = (2, 1536, 1536)
-        elif N == 1536 * 1536:
-            self._shape = (1, 1536, 1536)
-        else:
-            self._shape = (1, 1, N)
+        """Infer spatial shape (L, H, W) from total element count.
+
+        The gaussian grid side is internal_resolution / 2 (768 for the
+        released SHARP model) — the old hardcoded 1536² checks never
+        matched, degrading flow mode to a meaningless (1, 1, N) layout.
+        """
+        for layers in (2, 1):
+            if N % layers == 0:
+                side = math.isqrt(N // layers)
+                if side * side * layers == N:
+                    self._shape = (layers, side, side)
+                    return
+        self._shape = (1, 1, N)

@@ -276,6 +276,7 @@ class VrTab(QWidget):
             "每 4 帧 (~2.8x)",
             "每 5 帧 (~3.1x)",
         ])
+        # 与 SBS 一致保持「每帧预测」默认。
         self._kf_interval.setToolTip(
             "视频关键帧几何复用：每 N 帧对全部 cubemap 面完整运行一次\n"
             "SHARP 预测，中间帧复用关键帧几何、仅用当前画面刷新颜色。\n"
@@ -298,25 +299,12 @@ class VrTab(QWidget):
         renderer_row.addWidget(self._renderer, 1)
         adv_card.add_layout(renderer_row)
 
-        stab_row = QHBoxLayout()
-        stab_row.addWidget(QLabel("深度稳定"))
-        self._stabilize = QComboBox()
-        self._stabilize.addItems([
-            "关闭",
-            "全局平滑 (推荐)",
-            "自适应平滑",
-        ])
-        self._stabilize.setToolTip(
-            "视频帧间深度一致性平滑。\n"
-            "全景视频建议至少开启全局平滑。"
-        )
-        stab_row.addWidget(self._stabilize, 1)
-        adv_card.add_layout(stab_row)
-        # Hide: VR视频管线尚未实现时域稳定
-        for idx in range(stab_row.count()):
-            w = stab_row.itemAt(idx).widget()
-            if w:
-                w.setVisible(False)
+        # NOTE: no per-frame temporal stabilizer exists for the VR pipeline.
+        # Merged gaussians are angle-filtered per frame, so their count and
+        # indexing vary and the SBS per-index EMA in temporal.py does not
+        # apply. The keyframe-reuse option above is the temporal coherence
+        # mechanism here. (A previously hidden-but-live "深度稳定" combo was
+        # removed — it shipped an option that did nothing.)
 
         self._chk_depth = QCheckBox("同时输出深度全景图")
         adv_card.add_widget(self._chk_depth)
@@ -420,9 +408,15 @@ class VrTab(QWidget):
                 and self._in_proj_sub.currentIndex() == 0)
 
     def _auto_resolution(self) -> None:
-        """Auto-switch resolution preset based on output angle."""
+        """Auto-switch resolution preset based on output angle.
+
+        Skipped when the user picked a custom width — otherwise merely
+        touching the input-projection combo silently overwrote it.
+        """
         if not hasattr(self, '_res_preset'):
             return  # not yet constructed
+        if self._res_preset.currentIndex() == len(RES_PRESETS) - 1:
+            return  # custom width selected — leave it alone
         if self._is_output_360():
             self._res_preset.setCurrentIndex(1)  # 4096×2048 (2:1)
         else:
@@ -548,8 +542,6 @@ class VrTab(QWidget):
             "perf_mode": "quality" if self._perf_mode.currentIndex() == 0 else "speed",
             "renderer": "standard" if self._renderer.currentIndex() == 1 else "higs",
             "out_fps": out_fps,
-            "temporal_stabilize": ["off", "global", "adaptive"][
-                self._stabilize.currentIndex()],
             "keyframe_interval": self._kf_interval.currentIndex() + 1,
             "depth": self._chk_depth.isChecked(),
             "ply": self._chk_ply.isChecked(),
@@ -593,6 +585,9 @@ class VrTab(QWidget):
 
     def _on_convert_progress(self, frame: int, total: int, fps: float,
                              elapsed: float) -> None:
+        # All tabs share one EngineProcess — ignore other tabs' conversions.
+        if not self._converting:
+            return
         file_frac = frame / total if total else 0.0
         self._progress.set_value(file_frac)
         self._pct_label.setText(f"{int(file_frac * 100)}%")
@@ -603,6 +598,8 @@ class VrTab(QWidget):
         )
 
     def _on_convert_done(self, result: dict) -> None:
+        if not self._converting:
+            return  # another tab's conversion — ignore
         if result.get("cancelled"):
             self._converting = False
             self._btn_start.setEnabled(True)
@@ -626,6 +623,8 @@ class VrTab(QWidget):
         self.status_message.emit(f"转换完成 → {result['output']}")
 
     def _on_error(self, msg: str) -> None:
+        if not self._converting:
+            return  # another tab's conversion — ignore
         self._converting = False
         self._btn_start.setEnabled(True)
         self._btn_cancel.setEnabled(False)

@@ -20,11 +20,14 @@ Performance: patch_encoder 35 patches: 418ms (PyTorch) → 240ms (TRT FP16) = 1.
 
 import os
 import logging
+import time
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
+
+from . import profiling
 
 logger = logging.getLogger(__name__)
 
@@ -40,24 +43,94 @@ def _log_ort_error(msg: str) -> None:
     except Exception:
         pass
 
-# Default cache directories (relative to project root)
-_CACHE_DIR = Path(__file__).resolve().parent.parent.parent / ".cache"
+# Default cache directories. Must resolve to the same place as predict.py and
+# gui/worker.py — in a frozen build __file__ points inside the (possibly
+# read-only) install dir, which silently defeats the TRT engine cache.
+from . import resolve_cache_dir as _resolve_cache_dir
+
+_CACHE_DIR = _resolve_cache_dir()
 _ONNX_DIR = _CACHE_DIR / "onnx"
 _TRT_CACHE_DIR = _CACHE_DIR / "trt_v3"  # v3: rebuilt with 2GB workspace
 
 
+def _ascii_safe_trt_dir(base: Path) -> Path:
+    """TRT EP creates/reads its engine cache via narrow-char CRT APIs.
+
+    A non-ASCII install path (e.g. ``D:\\桌面\\sharp3d``) becomes mojibake
+    inside ORT and directory creation fails with 'The system cannot find the
+    path specified'. Redirect engine caching to ProgramData (guaranteed
+    ASCII, user-writable) when the install path is not ASCII-safe. Engine
+    filenames carry the SM tag, so 40- and 50-series machines can share this
+    location.
+    """
+    if str(base).isascii():
+        return base
+    fb = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "sharp3d" / "trt_cache"
+    fb.mkdir(parents=True, exist_ok=True)
+    logger.info("TRT 缓存路径含非 ASCII 字符，引擎缓存改用 %s", fb)
+    return fb
+
+
 def _ensure_cudnn_path():
-    """Add torch/lib to PATH so ONNX Runtime can find cuDNN 9 DLLs."""
+    """Make ONNX Runtime's TRT provider DLLs resolvable on clean machines.
+
+    Two directories matter and neither is on a stock machine's search path:
+    - torch/lib for cuDNN/cuBLAS/cudart (nvinfer's runtime dependencies);
+    - site-packages/tensorrt_libs for nvinfer_10.dll itself. On a dev box
+      that also has the CUDA Toolkit installed these come from CUDA's lib
+      dir on PATH, which masks the problem until the app is deployed to a
+      machine without the toolkit (Error 126: nvinfer_10.dll is missing).
+    """
     try:
         import torch
         torch_lib = str(Path(torch.__file__).parent / "lib")
         if torch_lib not in os.environ.get("PATH", ""):
             os.environ["PATH"] = torch_lib + os.pathsep + os.environ.get("PATH", "")
+        try:
+            os.add_dll_directory(torch_lib)
+        except (AttributeError, OSError):
+            pass
+        # TensorRT 10 pip wheel (tensorrt_libs) ships nvinfer_10.dll etc.
+        try:
+            import importlib.util
+            spec = importlib.util.find_spec("tensorrt_libs")
+            if spec and spec.submodule_search_locations:
+                trt_dir = Path(list(spec.submodule_search_locations)[0])
+                if trt_dir.is_dir():
+                    trt_s = str(trt_dir)
+                    if trt_s not in os.environ.get("PATH", ""):
+                        os.environ["PATH"] = trt_s + os.pathsep + os.environ.get("PATH", "")
+                    try:
+                        os.add_dll_directory(trt_dir)
+                    except (AttributeError, OSError):
+                        pass
+        except (ImportError, ValueError):
+            pass
     except Exception:
         pass
 
 
 # ── ONNX export helpers ──────────────────────────────────────────────
+
+def onnx_models_cached() -> bool:
+    """True when both encoder ONNX files are already on disk.
+
+    Mirrors the resolution order used by create_ort_*_encoder (bundled
+    _MEIPASS/models first in frozen builds, .cache/onnx otherwise). When this
+    is True the predictor never needs FP32 weights, so predict.py can build
+    the model directly in FP16 and skip materializing a transient 2.8GB FP32
+    copy (which also halves the weights' H2D transfer).
+    """
+    import sys as _sys
+    for name in ("patch_encoder.onnx", "image_encoder.onnx"):
+        if getattr(_sys, "frozen", False):
+            p = Path(_sys._MEIPASS) / "models" / name
+        else:
+            p = _ONNX_DIR / name
+        if not p.exists():
+            return False
+    return True
+
 
 def _export_onnx_model(module, onnx_path: Path, device: torch.device,
                       dummy_input: torch.Tensor, input_name: str = "patches",
@@ -152,13 +225,14 @@ class ORTEncoder(nn.Module):
     def __init__(self, onnx_path: Path, trt_cache_dir: Path,
                  device: torch.device, label: str = "encoder",
                  grid_size: tuple = None, intermediate_ids: list = None,
-                 int8_enable: bool = False):
+                 qdq: bool = False,
+                 workspace_gb: int = 2):
         super().__init__()
         self.device = device
         self._onnx_path = onnx_path
         self._trt_cache_dir = trt_cache_dir
         self._label = label
-        self._int8_enable = int8_enable
+        self._qdq = qdq   # explicit QDQ graph (FP8 experiment)
 
         _ensure_cudnn_path()
         self._session = self._create_session()
@@ -186,8 +260,9 @@ class ORTEncoder(nn.Module):
         self.intermediate_features_ids = list(
             intermediate_ids or self._INTERMEDIATE_IDS)
 
-        logger.info("ORT %s ready: %d outputs, grid=%s, int8=%s",
-                     label, self._n_outputs, self._grid_size, int8_enable)
+        self.using_trt = "TensorrtExecutionProvider" in             self._session.get_providers()
+        logger.info("ORT %s ready: %d outputs, grid=%s, trt=%s",
+                     label, self._n_outputs, self._grid_size, self.using_trt)
 
     def reshape_feature(self, embeddings: torch.Tensor) -> torch.Tensor:
         """Discard class token and reshape 1D feature map to 2D grid."""
@@ -205,15 +280,8 @@ class ORTEncoder(nn.Module):
         so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
         so.log_severity_level = 2
 
-        self._trt_cache_dir.mkdir(parents=True, exist_ok=True)
-
-        # Check for INT8 calibration table
-        calib_table = self._trt_cache_dir / f"{self._label}_calibration_table"
-        use_int8 = self._int8_enable and calib_table.exists()
-        if self._int8_enable and not calib_table.exists():
-            logger.warning("INT8 requested but no calibration table at %s, "
-                           "using FP16. Run: python -m sharp3d.calibrate_int8",
-                           calib_table)
+        cache_base = _ascii_safe_trt_dir(self._trt_cache_dir)
+        cache_base.mkdir(parents=True, exist_ok=True)
 
         trt_opts = {
             "trt_fp16_enable": True,
@@ -222,13 +290,24 @@ class ORTEncoder(nn.Module):
             # 2GB keeps total VRAM ~9.5GB (safe margin) with fast algorithms.
             "trt_max_workspace_size": 2 * 1024 * 1024 * 1024,
             "trt_engine_cache_enable": True,
-            "trt_engine_cache_path": str(self._trt_cache_dir),
+            "trt_engine_cache_path": str(cache_base),
         }
-        if use_int8:
-            trt_opts["trt_int8_enable"] = True
-            trt_opts["trt_int8_calibration_table_name"] = str(calib_table)
-            logger.info("INT8 enabled for %s (calibration: %s)",
-                         self._label, calib_table)
+        if self._qdq:
+            # 显式 QDQ 图（FP8 实验）：引擎与 FP16 分开缓存。
+            # FP8 QDQ 必须 strongly-typed 构建模式——默认隐式模式只认 int8 QDQ，
+            # 会把 FP8 Q/DQ 整个丢弃（实测输出与 FP16 逐位相同）。
+            qdq_dir = cache_base / "qdq" / self._label
+            qdq_dir.mkdir(parents=True, exist_ok=True)
+            trt_opts["trt_engine_cache_path"] = str(qdq_dir)
+            if os.environ.get("SHARP3D_TRT_STRONG") == "1":
+                trt_opts["trt_building_mode"] = "strongly_typed"
+        # CUDA Graph is opt-in only (SHARP3D_TRT_CUDAGRAPH=1): it needs
+        # persistent fixed I/O buffers (~475MB held outside the caching
+        # allocator's reuse pool), which pushed the 12GB-VRAM VR pipeline
+        # into shared-memory paging, and measured no encoder speedup
+        # (213ms → 223ms). Left as an escape hatch for bigger GPUs.
+        if os.environ.get("SHARP3D_TRT_CUDAGRAPH") == "1":
+            trt_opts["trt_cuda_graph_enable"] = True
 
         providers = [
             ("TensorrtExecutionProvider", trt_opts),
@@ -236,14 +315,24 @@ class ORTEncoder(nn.Module):
             "CPUExecutionProvider",
         ]
 
-        session = ort.InferenceSession(
-            str(self._onnx_path), sess_options=so, providers=providers
-        )
+        try:
+            session = ort.InferenceSession(
+                str(self._onnx_path), sess_options=so, providers=providers
+            )
+        except Exception as e:
+            if not trt_opts.get("trt_cuda_graph_enable"):
+                raise
+            # Older ORT builds reject trt_cuda_graph_enable — retry without.
+            logger.warning("TRT CUDA Graph unsupported (%s), retrying without", e)
+            trt_opts.pop("trt_cuda_graph_enable", None)
+            providers[0] = ("TensorrtExecutionProvider", trt_opts)
+            session = ort.InferenceSession(
+                str(self._onnx_path), sess_options=so, providers=providers
+            )
         active = session.get_providers()
 
         if "TensorrtExecutionProvider" in active:
-            mode = "INT8" if use_int8 else "FP16"
-            logger.info("Using TensorRT %s for %s", mode, self._label)
+            logger.info("Using TensorRT FP16 for %s", self._label)
         elif "CUDAExecutionProvider" in active:
             logger.info("TensorRT unavailable, using CUDA EP for %s", self._label)
         else:
@@ -256,8 +345,15 @@ class ORTEncoder(nn.Module):
         return tuple(batch if d == -1 else d for d in template)
 
     def _forward_iobinding(self, x: torch.Tensor):
-        """Zero-copy IO Binding path: GPU tensor → ORT → GPU tensors."""
+        """Zero-copy IO Binding path: GPU tensor → ORT → GPU tensors.
+
+        Outputs are allocated per call through PyTorch's caching allocator so
+        the blocks stay in the shared reuse pool between calls — holding
+        fixed buffers instead permanently pins ~475MB and starved the VR
+        pipeline into shared-memory paging on 12GB GPUs.
+        """
         batch = x.shape[0]
+        dev_id = self.device.index if self.device.index is not None else 0
         # Ensure FP32: after predictor.half(), patches may arrive as FP16,
         # but the ONNX model and IO Binding expect FP32 input.
         x_contig = x.detach().float().contiguous()
@@ -269,6 +365,15 @@ class ORTEncoder(nn.Module):
             t = torch.empty(shape, dtype=torch.float32, device=self.device)
             out_tensors.append(t)
 
+        # torch.compile launches the patch-producing kernels asynchronously on
+        # PyTorch's stream, but ORT runs inference on its own separate stream.
+        # Without this sync, ORT can read patches that are not yet fully
+        # produced → corrupted ViT features → intermittent blurry frames.
+        # Only the *current* stream needs draining: a device-wide
+        # torch.cuda.synchronize() would also wait for the video pipeline's
+        # side-stream H2D prefetch and defeat the double-buffering.
+        torch.cuda.current_stream().synchronize()
+
         # Create IO binding
         binding = self._session.io_binding()
 
@@ -276,7 +381,7 @@ class ORTEncoder(nn.Module):
         binding.bind_input(
             name=self._input_name,
             device_type='cuda',
-            device_id=0,
+            device_id=dev_id,
             element_type=np.float32,
             shape=tuple(x_contig.shape),
             buffer_ptr=x_contig.data_ptr(),
@@ -287,7 +392,7 @@ class ORTEncoder(nn.Module):
             binding.bind_output(
                 name=name,
                 device_type='cuda',
-                device_id=0,
+                device_id=dev_id,
                 element_type=np.float32,
                 shape=tuple(t.shape),
                 buffer_ptr=t.data_ptr(),
@@ -337,32 +442,274 @@ class ORTEncoder(nn.Module):
                 intermediates: dict {block_id: [batch, 577, 1024]}
                                (empty if ONNX model has 1 output)
         """
-        # torch.compile launches the patch-producing kernels asynchronously on
-        # PyTorch's stream, but ORT runs inference on its own separate stream.
-        # Without this sync, ORT can read patches that are not yet fully
-        # produced → corrupted ViT features → intermittent blurry frames.
-        # Only the *current* stream needs draining: a device-wide
-        # torch.cuda.synchronize() would also wait for the video pipeline's
-        # side-stream H2D prefetch of the next frame, serializing it with
-        # compute and silently defeating the double-buffering.
-        torch.cuda.current_stream().synchronize()
+        # Stream-ordering sync lives inside _forward_iobinding (after the
+        # input staging copy); the numpy fallback path syncs via .cpu().
+        _t0 = time.perf_counter() if profiling.ENABLED else 0.0
         try:
-            return self._forward_iobinding(x)
+            out = self._forward_iobinding(x)
         except Exception as e:
             if not getattr(self, '_iobinding_failed', False):
                 logger.warning("IO Binding failed, falling back to numpy: %s", e)
                 self._iobinding_failed = True
-            return self._forward_numpy(x)
+            out = self._forward_numpy(x)
+        if profiling.ENABLED:
+            profiling.add_ort(self._label, (time.perf_counter() - _t0) * 1000.0)
+        return out
 
 
 # ── Factory functions ────────────────────────────────────────────────
+
+# ── Full-pipeline ORT orchestrator (3 sessions, zero CPU roundtrip) ──
+#
+#   [pyramid+split (torch glue, ~2ms)] → patch ViT session → image ViT
+#   session → SPN-tail session (merge/upsample + decoder + composer, FP16)
+#
+# Why not one big graph: INT8 QDQ calibration of the full graph OOMs a 12GB
+# GPU (24 blocks × ~1.6GB of QDQ transients co-resident with everything
+# else). Calibrating the standalone ViT graphs yields identical scales —
+# the ViT activation ranges depend only on the ViT inputs.
+
+class ORTRestSession:
+    """IO-bound multi-input session. fp32=True → CUDA EP only (no TRT):
+    used for the decoder+composer half whose GroupNorm-family ops degrade
+    under TRT fp16 (autocast keeps them fp32; TRT fp16 cannot)."""
+
+    def __init__(self, onnx_path: Path, trt_cache_dir: Path,
+                 device: torch.device, label: str, workspace_gb: int = 2,
+                 fp32: bool = False):
+        _ensure_cudnn_path()
+        import onnxruntime as ort
+        self.device = device
+        self._label = label
+        self.using_trt = False
+        so = ort.SessionOptions()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.log_severity_level = 2
+        if fp32:
+            providers = [("CUDAExecutionProvider", {"device_id": 0}),
+                         "CPUExecutionProvider"]
+            logger.info("FP32 CUDA 会话就绪: %s", label)
+        else:
+            engine_dir = _ascii_safe_trt_dir(trt_cache_dir) / "tail" / label
+            engine_dir.mkdir(parents=True, exist_ok=True)
+            trt_opts = {
+                "trt_fp16_enable": True,
+                "trt_max_workspace_size": workspace_gb * 1024**3,
+                "trt_engine_cache_enable": True,
+                "trt_engine_cache_path": str(engine_dir),
+                # torch.autocast keeps norm layers in fp32; force the same
+                # here (full-fp16 engines measurably degrade output quality).
+                "trt_layer_norm_fp32_fallback": True,
+            }
+            providers = [("TensorrtExecutionProvider", trt_opts),
+                         ("CUDAExecutionProvider", {"device_id": 0}),
+                         "CPUExecutionProvider"]
+        self._session = ort.InferenceSession(str(onnx_path), sess_options=so,
+                                             providers=providers)
+        self.using_trt = ("TensorrtExecutionProvider"
+                          in self._session.get_providers())
+        self._input_names = [i.name for i in self._session.get_inputs()]
+        self._output_names = [o.name for o in self._session.get_outputs()]
+        self._output_shapes = [tuple(-1 if isinstance(d, str) else int(d)
+                                     for d in o.shape)
+                               for o in self._session.get_outputs()]
+        if self.using_trt:
+            logger.info("TRT FP16 尾部引擎就绪: %s", label)
+        else:
+            logger.warning("TRT EP 不可用，SPN 尾部回退 CUDA EP")
+
+    def run(self, tensors):
+        dev_id = self.device.index if self.device.index is not None else 0
+        feats = [t.detach().float().contiguous() for t in tensors]
+        outs = [torch.empty(s, dtype=torch.float32, device=self.device)
+                for s in self._output_shapes]
+        torch.cuda.current_stream().synchronize()
+        binding = self._session.io_binding()
+        for name, t in zip(self._input_names, feats):
+            binding.bind_input(name=name, device_type="cuda", device_id=dev_id,
+                               element_type=np.float32, shape=tuple(t.shape),
+                               buffer_ptr=t.data_ptr())
+        for name, t in zip(self._output_names, outs):
+            binding.bind_output(name=name, device_type="cuda", device_id=dev_id,
+                                element_type=np.float32, shape=tuple(t.shape),
+                                buffer_ptr=t.data_ptr())
+        self._session.run_with_iobinding(binding)
+        return outs
+
+
+class ORTFullPredictor(nn.Module):
+    """3-session orchestrator replacing the whole RGBGaussianPredictor.
+
+    forward(): pyramid+split in plain torch ops (~2ms), patch/image ViT
+    sessions (INT8 QDQ when available), SPN-tail session (FP16). All hops
+    are IO-bound GPU→GPU; the Gaussians3D NamedTuple is rebuilt from the 5
+    outputs, matching the torch path's output format exactly.
+    """
+
+    _OUT_FIELDS = ("mean_vectors", "singular_values", "quaternions",
+                   "colors", "opacities")
+
+    def __init__(self, patch: "ORTEncoder", image: "ORTEncoder",
+                 front: ORTRestSession, rest: ORTRestSession,
+                 device: torch.device, n_patches: int, normalizer=None,
+                 tail_fp16: bool = False):
+        super().__init__()
+        from sharp.utils.gaussians import Gaussians3D
+        self._Gaussians3D = Gaussians3D
+        self.device = device
+        self._patch = patch
+        self._image = image
+        self._front = front
+        self._rest = rest
+        self._n_patches = n_patches
+        # Production applies AffineRangeNormalizer before the pyramid (the
+        # ViTs see [-1,1] imagery) but passes the RAW image to init_model.
+        self._normalizer = normalizer
+        # 尾部 fp16 TRT 模式（SHARP3D_FULL_TRT_TAILFP16=1）：用整段尾部引擎
+        # （实测 35.1dB），替代 front+fp32-rest 拆分（实测 47.8dB 但 front
+        # 引擎构建尚有 bug）。
+        self._tail_fp16 = tail_fp16
+        # 加速判定只看 ViT（尾部按所选模式各自判定）
+        self.using_trt = bool(patch.using_trt and image.using_trt
+                              and rest.using_trt)
+
+    @torch.compiler.disable(recursive=False)
+    def forward(self, img, disparity_factor):
+        import torch.nn.functional as F
+        from sharp.models.encoders.spn_encoder import split
+
+        _t0 = time.perf_counter() if profiling.ENABLED else 0.0
+        img = img.detach().float()
+        # Normalized imagery for the ViT path (production feeds the
+        # normalizer output into the pyramid); RAW image goes to the tail
+        # (init_model) — same as RGBGaussianPredictor.forward.
+        if self._normalizer is not None:
+            xn = self._normalizer(img)
+        else:
+            xn = img
+        # Pyramid + sliding-window patches — identical math to
+        # SlidingPyramidNetwork._create_pyramid + split. Overlap ratios and
+        # patch counts follow the perf mode (35 = 5×5+3×3+1×1 @ .25/.5,
+        # 21 = 4×4+2×2+1×1 @ 0/0).
+        x1 = F.interpolate(xn, scale_factor=0.5, mode="bilinear",
+                           align_corners=False)
+        x2 = F.interpolate(xn, scale_factor=0.25, mode="bilinear",
+                           align_corners=False)
+        if self._n_patches == 35:
+            patches = torch.cat((
+                split(xn, overlap_ratio=0.25, patch_size=384),
+                split(x1, overlap_ratio=0.5, patch_size=384),
+                x2), dim=0)
+        else:  # speed mode: 21 = 4×4 + 2×2 + 1×1, no overlap
+            patches = torch.cat((
+                split(xn, overlap_ratio=0.0, patch_size=384),
+                split(x1, overlap_ratio=0.0, patch_size=384),
+                x2), dim=0)
+
+        pe_feat, pe_ints = self._patch(patches)
+        ie_feat, _ = self._image(x2)
+        ids = self._patch.intermediate_features_ids
+        if self._tail_fp16:
+            # 单段尾部引擎（TRT fp16）：整段 SPN+解码器+composer
+            outs = self._rest.run([img, disparity_factor.detach().float().reshape(-1),
+                                   pe_feat, pe_ints[ids[0]], pe_ints[ids[1]],
+                                   ie_feat])
+        else:
+            encs = self._front.run([pe_feat, pe_ints[ids[0]], pe_ints[ids[1]],
+                                    ie_feat])
+            outs = self._rest.run([img,
+                                   disparity_factor.detach().float().reshape(-1),
+                                   *encs])
+        if profiling.ENABLED:
+            profiling.add_ort("full_3session",
+                              (time.perf_counter() - _t0) * 1000.0)
+        return self._Gaussians3D(*outs)
+
+
+def create_ort_full_predictor(
+    predictor,
+    device: torch.device,
+    n_patches: int,
+    onnx_dir: Path = _ONNX_DIR,
+    trt_cache_dir: Path = _TRT_CACHE_DIR,
+) -> "ORTFullPredictor | None":
+    """Assemble the 3-session pipeline; None → caller falls back to torch.
+
+    INT8 QDQ support was removed (2026-09-10): the QDQ graph degrades image
+    quality to 25dB and TRT EP never built its engines anyway — see
+    tests/quantize_vit_int8.py for the (dead-end) tooling.
+    """
+    try:
+        import onnxruntime  # noqa: F401
+    except ImportError as e:
+        _log_ort_error(f"onnxruntime import failed: {e}")
+        return None
+
+    rest_onnx = onnx_dir / f"tail_rest_{n_patches}.onnx"
+    front_onnx = onnx_dir / f"spn_front_{n_patches}.onnx"
+    if not rest_onnx.exists() or not front_onnx.exists():
+        # fp16 权重也能导（TRT front 按 fp16 走）；rest2 是 fp32 CUDA 会话。
+        try:
+            if any(p.dtype == torch.float16 for p in predictor.parameters()):
+                predictor.float()   # export in fp32; caller re-halves on fallback
+            from .full_export import export_spn_split
+            export_spn_split(predictor, device, n_patches, onnx_dir)
+        except Exception:
+            import traceback
+            _log_ort_error(f"SPN 拆分导出失败:\n{traceback.format_exc()}")
+            return None
+
+    patch_onnx = onnx_dir / "patch_encoder.onnx"
+    image_onnx = onnx_dir / "image_encoder.onnx"
+    patch_label = "patch_encoder"
+    qdq = False
+    if os.environ.get("SHARP3D_PATCH_FP8") == "1":
+        p8 = onnx_dir / "patch_encoder_fp8.onnx"
+        if p8.exists():
+            patch_onnx, patch_label, qdq = p8, "patch_encoder_fp8", True
+            logger.info("使用 FP8 QDQ patch encoder（实验）")
+        else:
+            logger.info("FP8 patch encoder 不存在，回退 FP16 "
+                        "（生成: python tests/fp8_surgery.py）")
+
+    try:
+        patch = ORTEncoder(patch_onnx, trt_cache_dir, device,
+                           label=patch_label, qdq=qdq)
+        image = ORTEncoder(image_onnx, trt_cache_dir, device,
+                           label="image_encoder")
+        tail_fp16 = os.environ.get("SHARP3D_FULL_TRT_TAILFP16") == "1"
+        if tail_fp16:
+            # 单段尾部（spn_tail）TRT fp16 —— 质量对照样本用配置。
+            # label 必须沿用 "35"：同一 ONNX + 相同构建选项，直接复用已缓存
+            # 的引擎（用新 label 会触发 ~8 分钟的引擎重建）。
+            tail_onnx = onnx_dir / f"spn_tail_{n_patches}.onnx"
+            if not tail_onnx.exists():
+                logger.info("spn_tail ONNX 不存在，无法用 TAILFP16 模式")
+                return None
+            front = ORTRestSession(tail_onnx, trt_cache_dir, device,
+                                   label=str(n_patches))
+            rest = front   # forward 分支会直接用 rest，不经过 front
+        else:
+            front = ORTRestSession(front_onnx, trt_cache_dir, device,
+                                   label=str(n_patches))
+            rest = ORTRestSession(rest_onnx, trt_cache_dir, device,
+                                  label=str(n_patches), fp32=True)
+    except Exception:
+        import traceback
+        _log_ort_error(f"整模型 TRT 会话创建失败:\n{traceback.format_exc()}")
+        return None
+    # normalizer lives on the monodepth predictor (traced nowhere — the ViTs
+    # are graph inputs now), applied in the orchestrator forward.
+    normalizer = predictor.monodepth_model.monodepth_predictor.normalizer
+    return ORTFullPredictor(patch, image, front, rest, device, n_patches,
+                            normalizer=normalizer, tail_fp16=tail_fp16)
+
 
 def create_ort_patch_encoder(
     predictor,
     device: torch.device,
     onnx_dir: Path = _ONNX_DIR,
     trt_cache_dir: Path = _TRT_CACHE_DIR,
-    int8_enable: bool = False,
 ) -> ORTEncoder | None:
     """Create an ORT-accelerated patch_encoder, exporting ONNX if needed."""
     try:
@@ -392,7 +739,7 @@ def create_ort_patch_encoder(
 
     try:
         return ORTEncoder(onnx_path, trt_cache_dir, device,
-                          label="patch_encoder", int8_enable=int8_enable)
+                          label="patch_encoder")
     except Exception as e:
         import traceback
         _log_ort_error(f"ORT session creation failed:\n{traceback.format_exc()}")
@@ -404,7 +751,6 @@ def create_ort_image_encoder(
     device: torch.device,
     onnx_dir: Path = _ONNX_DIR,
     trt_cache_dir: Path = _TRT_CACHE_DIR,
-    int8_enable: bool = False,
 ) -> ORTEncoder | None:
     """Create an ORT-accelerated image_encoder, exporting ONNX if needed."""
     try:
@@ -442,7 +788,7 @@ def create_ort_image_encoder(
 
     try:
         return ORTEncoder(onnx_path, trt_cache_dir, device,
-                          label="image_encoder", int8_enable=int8_enable)
+                          label="image_encoder")
     except Exception as e:
         logger.warning("Image encoder ORT session creation failed: %s", e)
         return None

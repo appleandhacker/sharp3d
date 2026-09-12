@@ -83,16 +83,20 @@ def _is_nvenc(encoder: str) -> bool:
 def encoder_output_params(encoder: str, crf: int, preset: str = "medium") -> list[str]:
     """ffmpeg output params for the given encoder at ~crf quality."""
     if encoder == "av1_nvenc":
-        # NVENC has no CRF; QP mode is the closest analogue.
-        # ffmpeg 2026+ deprecated -cq (global_quality), use -qp instead.
-        return ["-rc", "vbr", "-qp", str(min(crf, 51)),
-                "-b:v", "0", "-preset", "p4"]
+        # NVENC has no CRF; constqp is the closest analogue. Measured
+        # (2026-09-11): -qp under -rc vbr is silently IGNORED (qp 28 and 36
+        # produce byte-identical outputs) — constqp actually honors it.
+        return ["-rc", "constqp", "-qp", str(min(crf, 51)),
+                "-preset", "p4"]
     if encoder in ("h264_nvenc", "hevc_nvenc"):
         # Map preset names to NVENC p1-p7 scale (p4 ≈ medium balance).
         nv_preset = {"ultrafast": "p1", "fast": "p3", "medium": "p4",
                      "slow": "p6", "veryslow": "p7"}.get(preset, "p4")
-        return ["-rc", "vbr", "-qp", str(min(crf, 51)),
-                "-b:v", "0", "-preset", nv_preset]
+        # constqp, NOT vbr+qp: same measurement as above — vbr drops -qp
+        # and falls back to default-rate control, making every CRF value
+        # produce identical bitrate.
+        return ["-rc", "constqp", "-qp", str(min(crf, 51)),
+                "-preset", nv_preset]
     if encoder == "libaom-av1":
         # libaom is very slow; raise encoding speed for near-realtime use.
         return ["-crf", str(crf), "-b:v", "0", "-cpu-used", "8", "-row-mt", "1"]

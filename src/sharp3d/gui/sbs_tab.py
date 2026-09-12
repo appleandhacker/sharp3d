@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -47,10 +48,14 @@ def _fmt_hms(seconds: float) -> str:
 
 
 def precision_text(status: list) -> str:
-    """Derive the active model quantization precision from accel_status."""
+    """Derive the active model precision from accel_status.
+
+    INT8 was removed (2026-09-10): ORT TRT EP never engaged it for this ViT
+    (implicit quantization fell back to FP16 — pixel-identical output) and
+    explicit QDQ quantization degraded quality to 25dB. Reporting "INT8"
+    was a lie.
+    """
     names = {name for name, ok in status if ok}
-    if any("INT8" in n for n in names):
-        return "INT8 (TensorRT 量化)"
     if any("TensorRT" in n for n in names):
         return "FP16 (TensorRT)"
     if any("FP16" in n for n in names):
@@ -142,7 +147,13 @@ class SbsTab(QWidget):
         crf_row = QHBoxLayout()
         crf_row.addWidget(QLabel("质量 CRF"))
         self._crf = QComboBox()
+        self._crf.setEditable(True)  # 任意 0-51 可输入，预设仅作快捷项
         self._crf.addItems(["16", "18", "20", "23", "26", "28"])
+        self._crf.setValidator(QIntValidator(0, 51, self._crf))
+        self._crf.setToolTip(
+            "H.264/H.265 质量系数（越小质量越高、文件越大）。\n"
+            "可直接输入任意 0-51 的值；典型范围 16-28。"
+        )
         self._crf.setCurrentText("26")
         crf_row.addWidget(self._crf, 1)
         enc_card.add_layout(crf_row)
@@ -203,14 +214,34 @@ class SbsTab(QWidget):
         perf_row = QHBoxLayout()
         perf_row.addWidget(QLabel("性能模式"))
         self._perf_mode = QComboBox()
-        self._perf_mode.addItems(["画质优先", "速度优先"])
+        self._perf_mode.addItems(["画质优先", "速度优先", "FP32 高精度"])
         self._perf_mode.setToolTip(
             "画质优先：FP16 TensorRT + 完整 35 patches（几乎无损）\n"
-            "速度优先：FP16 TensorRT + 精简 21 patches（提速 ~35%，边缘细节略降）\n\n"
+            "速度优先：FP16 TensorRT + 精简 21 patches（提速 ~35%，边缘细节略降）\n"
+            "FP32 高精度：纯 torch 单精度管线（无 TensorRT），理论质量上限最高；\n"
+            "  速度最慢，显存约 2.8GB，首次使用需 FP32 权重 sharp_fp32.pt\n\n"
             "切换后需重新开始转换生效。"
         )
         perf_row.addWidget(self._perf_mode, 1)
         adv_card.add_layout(perf_row)
+
+        focal_row = QHBoxLayout()
+        focal_row.addWidget(QLabel("镜头焦距"))
+        self._focal = QComboBox()
+        self._focal.setEditable(True)
+        self._focal.addItems(
+            ["自动 (读取元数据)", "24", "28", "35", "50", "85", "135", "200"])
+        self._focal.setCurrentIndex(0)
+        self._focal.setValidator(QIntValidator(8, 800, self._focal))
+        self._focal.setToolTip(
+            "拍摄镜头的 35mm 等效焦距 (mm)。"
+            "自动：视频按 40mm 等效估算，照片读取 EXIF（无则 30mm）。"
+            "长焦素材请填真实焦距（如 135）——长焦画面被按广角解释，"
+            "会导致场景被拉远、立体感扁平。"
+            "可直接输入任意 8-800 的数值；仅对转换生效，切换后重新开始转换。"
+        )
+        focal_row.addWidget(self._focal, 1)
+        adv_card.add_layout(focal_row)
 
         kf_row = QHBoxLayout()
         kf_row.addWidget(QLabel("预测间隔"))
@@ -222,6 +253,8 @@ class SbsTab(QWidget):
             "每 4 帧 (~2.8x)",
             "每 5 帧 (~3.1x)",
         ])
+        # 保持「每帧预测」为默认：kf 复用带来的 1-2 帧几何滞后需要用户
+        # 自行取舍（基准数据见 tests/bench.py，kf2 实测 +52% 帧率）。
         self._kf_interval.setToolTip(
             "视频关键帧几何复用：每 N 帧完整运行一次 SHARP 预测，\n"
             "中间帧复用关键帧几何、仅用当前画面刷新颜色。\n"
@@ -243,6 +276,8 @@ class SbsTab(QWidget):
         )
         renderer_row.addWidget(self._renderer, 1)
         adv_card.add_layout(renderer_row)
+        # 默认：HiGS（实测 1.42→1.94fps，质量与标准光栅化无差异 42.76/42.77dB）
+        self._renderer.setCurrentIndex(1)
 
         dec_row = QHBoxLayout()
         dec_row.addWidget(QLabel("分解方法"))
@@ -266,11 +301,11 @@ class SbsTab(QWidget):
             "全局对齐：收敛平面EMA平滑 + 深度尺度对齐。\n"
             "  消除自动收敛逐帧跳动引起的全局水平偏移。\n"
             "自适应：同上 + 逐像素置信度加权深度平滑，\n"
-            "  静态区域更强平滑，运动物体自动保护（默认，推荐）。\n"
+            "  静态区域更强平滑，运动物体自动保护。\n"
             "光流：同上 + RAFT光流warp遮挡感知混合，\n"
             "  处理前景/背景独立运动，质量最佳但较慢(+50ms/帧)。"
         )
-        self._stabilize.setCurrentIndex(2)  # 默认：自适应平滑
+        self._stabilize.setCurrentIndex(0)  # 默认：关闭（用户实测时域平滑引入闪烁）
         stab_row.addWidget(self._stabilize, 1)
         adv_card.add_layout(stab_row)
 
@@ -456,6 +491,16 @@ class SbsTab(QWidget):
         self._progress.set_value(0.0)
         self.request_convert.emit(self._build_opts(inp, out))
 
+    def _parse_focal(self) -> float | None:
+        """Focal override: None = auto, else clamped 35mm-equivalent mm."""
+        text = self._focal.currentText().strip()
+        if not text or text.startswith("自动"):
+            return None
+        try:
+            return min(800.0, max(8.0, float(text)))
+        except ValueError:
+            return None
+
     def _build_opts(self, inp: str, out: str) -> dict:
         """Build conversion options for a single file (typed via ConvertOptions)."""
         from sharp3d.options import ConvertOptions
@@ -480,14 +525,15 @@ class SbsTab(QWidget):
             convergence=self._s_conv.value() / 100.0,  # 0=auto, else quantile
             strength=self._s_strength.value(),
             codec=codec_map[self._codec.currentText()],
-            crf=int(self._crf.currentText()),
+            crf=min(51, max(0, int(self._crf.currentText().strip() or 20))),
             audio=self._chk_audio.isChecked(),
             decompose="analytical" if self._decompose.currentIndex() == 0 else "svd",
             depth=self._chk_depth.isChecked(),
             ply=self._chk_ply.isChecked(),
             edge_soften=self._chk_edge.isChecked(),
             hdr_output=self._chk_hdr.isChecked(),
-            perf_mode="quality" if self._perf_mode.currentIndex() == 0 else "speed",
+            perf_mode=("quality", "speed", "fp32")[self._perf_mode.currentIndex()],
+            focal_35mm=self._parse_focal(),
             renderer="higs" if self._renderer.currentIndex() == 1 else "standard",
             out_fps=out_fps,
             out_scale=out_scale,
@@ -532,6 +578,10 @@ class SbsTab(QWidget):
 
     def _on_convert_progress(self, frame: int, total: int, fps: float,
                              elapsed: float) -> None:
+        # All tabs share one EngineProcess, so conversion events broadcast to
+        # every tab. Ignore ones this tab did not start.
+        if not self._converting:
+            return
         self._last_fps = fps
         file_frac = frame / total if total else 0.0
         self._progress.set_value(file_frac)
@@ -555,6 +605,8 @@ class SbsTab(QWidget):
             )
 
     def _on_convert_done(self, result: dict) -> None:
+        if not self._converting and not self._batch_files:
+            return  # another tab's conversion — ignore
         if result.get("cancelled"):
             self._converting = False
             self._btn_start.setEnabled(True)
@@ -597,6 +649,8 @@ class SbsTab(QWidget):
         self.status_message.emit(f"转换完成 → {result['output']}")
 
     def _on_error(self, msg: str) -> None:
+        if not self._converting:
+            return  # another tab's conversion — ignore
         self._converting = False
         self._btn_start.setEnabled(True)
         self._btn_cancel.setEnabled(False)

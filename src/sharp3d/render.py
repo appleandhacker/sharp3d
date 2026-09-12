@@ -14,10 +14,60 @@ Optimization: Replace GSplatRenderer's Python for-loop (renders L/R separately)
 with a single rasterization() call using stacked viewmats [2, 4, 4].
 """
 
+import logging
+
 import torch
 from gsplat.rendering import rasterization
 
 from sharp.utils.gaussians import Gaussians3D
+
+logger = logging.getLogger(__name__)
+
+# Sticky failure flag for the HiGS backend. gsplat loads its experimental
+# HiGS kernels through a lazy backend that re-raises ONE cached module-level
+# exception on every call, and each re-raise pins the caller's stack frames
+# (i.e. the rendered tensors). Probe once, remember, stop retrying.
+_HIGS_BROKEN = False
+
+
+def _rasterize_higs(means, quats, scales, opacities, colors,
+                    viewmats, Ks, width, height):
+    """Render one image per camera with the HiGS inference renderer.
+
+    Returns (C, H, W, 3) linearRGB — same layout as gsplat's rasterization().
+    Self-contained under torch.no_grad(): the HiGS entry point refuses to run
+    outside inference mode, and relying on every caller to wrap it silently
+    tripped the sticky fallback flag instead (observed in testing).
+    """
+    from gsplat.scene import GaussianInferenceScene
+    from gsplat.experimental.render import rasterize_gaussian_inference_scene
+
+    import torch.nn.functional as _F
+
+    if opacities.dim() == 2:
+        opacities = (opacities.squeeze(0) if opacities.shape[0] == 1
+                     else opacities.squeeze(-1))
+
+    scene = GaussianInferenceScene.from_gaussian_tensors(
+        means=means,
+        quats=_F.normalize(quats, dim=-1),
+        scales=scales,
+        opacities=opacities,
+        colors=colors,
+        sh_degree=None,
+        sh_compression="none",
+        id="sbs_render",
+    )
+    frames = []
+    with torch.no_grad():
+        for i in range(viewmats.shape[0]):
+            res = rasterize_gaussian_inference_scene(
+                scene, viewmat=viewmats[i], K=Ks[i],
+                width=width, height=height,
+            )
+            # res.frame: [1, H, W, 3]
+            frames.append(res.frame[0])
+    return torch.stack(frames, dim=0)
 
 
 def linearRGB2sRGB(linearRGB: torch.Tensor) -> torch.Tensor:
@@ -52,7 +102,9 @@ def _compute_focus_depth_gpu(means: torch.Tensor, min_depth_focus: float = 2.0,
     """
     if means.ndim == 3:
         means = means[0]
-    depth_values = means[:, 2]  # z-coordinate = depth (identity extrinsics)
+    # torch.quantile rejects half precision — the render path may hand this
+    # fp16 gaussians once the FP16 pipeline lands.
+    depth_values = means[:, 2].float()  # z-coordinate = depth (identity extr.)
     depth_values = depth_values[depth_values > 0]
     if depth_values.numel() == 0:
         return min_depth_focus
@@ -97,6 +149,25 @@ def _get_screen_resolution(width: int, height: int) -> tuple[int, int]:
     return w, h
 
 
+# Pinhole intrinsics only depend on (focal, size, device) — constant across
+# every frame of a conversion. Without the cache, render_sbs rebuilt and
+# re-uploaded this tensor on every frame.
+_K_CACHE: dict = {}
+
+
+def _pinhole_K(f_px: float, w: int, h: int, device: torch.device) -> torch.Tensor:
+    key = (round(float(f_px), 3), w, h, device.index)
+    K = _K_CACHE.get(key)
+    if K is None:
+        K = torch.tensor([
+            [f_px, 0, (w - 1) / 2.0],
+            [0, f_px, (h - 1) / 2.0],
+            [0, 0, 1],
+        ], dtype=torch.float32, device=device)
+        _K_CACHE[key] = K
+    return K
+
+
 def render_sbs(
     gaussians: Gaussians3D,
     f_px: float,
@@ -106,6 +177,7 @@ def render_sbs(
     convergence: float | None = None,
     render_width: int | None = None,
     ndc_transform: torch.Tensor | None = None,
+    renderer: str = "standard",
 ) -> tuple[torch.Tensor, tuple[int, int]]:
     """Render stereoscopic SBS pair using batched gsplat rasterization.
 
@@ -130,11 +202,16 @@ def render_sbs(
             is associative), but skips the per-frame
             compose-covariance → transform → eigendecompose round-trip over
             1.18M gaussians (tens of ms per frame).
+        renderer: "standard" (gsplat batched rasterization) or "higs"
+            (fp16 packed inference renderer). HiGS is faster but has no
+            alpha/depth channel, so it is skipped for depth output and falls
+            back to standard on any backend failure.
 
     Returns:
         sbs_image: (H, W*2, 3) uint8 tensor (left | right concatenated).
         (single_width, height): Dimensions of each eye's image.
     """
+    global _HIGS_BROKEN
     device = gaussians.mean_vectors.device
 
     # Preview resolution scaling (keeps focal length consistent)
@@ -176,6 +253,8 @@ def render_sbs(
         U_f = ndc_transform.to(device=device, dtype=torch.float32)
         z_world = means @ U_f[2, :3] + U_f[2, 3]
         z_pos = z_world[z_world > 0]
+        if z_pos.numel() > 262_144:
+            z_pos = z_pos[::16]  # quantile sorts everything — sample instead
         depth_focus = (max(2.0, float(torch.quantile(z_pos, 0.50)))
                        if z_pos.numel() else 2.0)
     else:
@@ -200,29 +279,43 @@ def render_sbs(
         viewmats = viewmats @ U_f  # (2, 4, 4)
 
     # Intrinsics for gsplat: (2, 3, 3)
-    K = torch.tensor([
-        [f_px_screen, 0, (screen_w - 1) / 2.0],
-        [0, f_px_screen, (screen_h - 1) / 2.0],
-        [0, 0, 1],
-    ], dtype=torch.float32, device=device)
+    # Cached: identical every frame of a conversion (f_px_screen, screen size
+    # and device are fixed), and rebuilding the tensor costs a host->device
+    # transfer plus allocation churn on every frame.
+    K = _pinhole_K(f_px_screen, screen_w, screen_h, device)
     Ks = K.unsqueeze(0).expand(2, -1, -1)  # (2, 3, 3)
 
-    # Single batched rasterization call for both eyes
-    rendered_colors, rendered_alphas, meta = rasterization(
-        means=means,
-        quats=quats,
-        scales=scales,
-        opacities=opacities,
-        colors=colors,
-        viewmats=viewmats,
-        Ks=Ks,
-        width=screen_w,
-        height=screen_h,
-        render_mode="RGB",
-        rasterize_mode="classic",
-        absgrad=False,
-        packed=False,
-    )
+    # Single batched rasterization call for both eyes (or two HiGS calls).
+    rendered_colors = None
+    if renderer == "higs" and not _HIGS_BROKEN:
+        try:
+            rendered_colors = _rasterize_higs(
+                means, quats, scales, opacities, colors,
+                viewmats, Ks, screen_w, screen_h)
+        except Exception as e:  # noqa: BLE001
+            _HIGS_BROKEN = True
+            logger.warning("HiGS 渲染不可用，回退标准光栅化: %s: %s",
+                           type(e).__name__, e)
+            # Stop the cached gsplat exception from pinning this frame's
+            # stack (and the tensors it references) for the rest of the run.
+            e.__traceback__ = None
+            rendered_colors = None
+    if rendered_colors is None:
+        rendered_colors, rendered_alphas, meta = rasterization(
+            means=means,
+            quats=quats,
+            scales=scales,
+            opacities=opacities,
+            colors=colors,
+            viewmats=viewmats,
+            Ks=Ks,
+            width=screen_w,
+            height=screen_h,
+            render_mode="RGB",
+            rasterize_mode="classic",
+            absgrad=False,
+            packed=False,
+        )
     # rendered_colors: (2, H, W, 3) in linearRGB
     # rendered_alphas: (2, H, W, 1)
 
@@ -390,14 +483,51 @@ def render_depth_map(
     # Depth is in channel 3
     depth = rendered_colors[0, :, :, 3]  # (H, W)
     alpha = rendered_alphas[0, :, :, 0]  # (H, W)
-    depth = depth / alpha.clamp(min=1e-8)
+    return colorize_depth(depth, alpha)
 
-    # Colorize depth (near=warm, far=cool) with log-scale normalization
-    d_min = depth[depth > 0].min() if (depth > 0).any() else depth.min()
-    d_max = depth.max()
+
+def colorize_depth(depth: torch.Tensor, alpha: torch.Tensor | None = None,
+                   hi_q: float = 0.99) -> torch.Tensor:
+    """Colorize a depth map (near=warm, far=cool) with log normalization.
+
+    gsplat's ``RGB+D`` mode returns *alpha-weighted* depth, so it must be
+    divided by alpha to recover real depth — but only where something was
+    actually rasterized. Where alpha≈0 the quotient explodes to ~1e8, and
+    normalizing with a plain ``max()`` then compresses every real depth to the
+    near end of the ramp (the whole map turns red). So: mask by alpha, and
+    take a robust high quantile instead of the max.
+
+    Args:
+        depth: (H, W) raw depth (already divided by alpha if alpha is None).
+        alpha: (H, W) accumulated alpha, or None if depth is already normalized.
+        hi_q: Upper quantile used as the "far" end of the color ramp.
+
+    Returns:
+        (H, W, 3) uint8 tensor; empty background is black.
+    """
+    if alpha is not None:
+        valid = alpha > 0.1
+        depth = torch.where(valid, depth / alpha.clamp(min=1e-6),
+                            torch.zeros_like(depth))
+    else:
+        valid = torch.ones_like(depth, dtype=torch.bool)
+
+    d_pos = depth[valid & (depth > 0)]
+    if d_pos.numel() == 0:
+        return torch.zeros((*depth.shape, 3), dtype=torch.uint8,
+                           device=depth.device)
+
+    d_min = d_pos.min()
+    # Robust upper bound from a subsample — sorting 16M elements every frame
+    # just to pick a color range is not worth it.
+    step = max(1, d_pos.numel() // 200_000)
+    d_max = torch.quantile(d_pos[::step].float(), hi_q)
+    if d_max <= d_min * (1.0 + 1e-6):
+        d_max = d_pos.max()
+
     if d_max > d_min:
-        depth_log = torch.log(depth.clamp(min=d_min) / d_min + 1e-6)
         log_max = torch.log(d_max / d_min + 1e-6)
+        depth_log = torch.log(depth.clamp(min=d_min) / d_min + 1e-6)
         depth_norm = (depth_log / log_max).clamp(0, 1)
     else:
         depth_norm = torch.zeros_like(depth)
@@ -408,4 +538,7 @@ def render_depth_map(
     b = depth_norm.clamp(0, 1)
     depth_rgb = torch.stack([r, g, b], dim=-1)
 
+    # Empty background carries no depth — paint it black instead of letting it
+    # fall to the warm/near end of the ramp.
+    depth_rgb = depth_rgb * valid.unsqueeze(-1)
     return (depth_rgb * 255).to(torch.uint8)

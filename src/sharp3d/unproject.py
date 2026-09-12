@@ -49,13 +49,29 @@ def prepare_input(image_input, f_px: float, device: torch.device,
         img = image_input.contiguous()
         _, h, w = img.shape
     else:
-        # Original numpy path: upload uint8 → convert on GPU
-        t = torch.from_numpy(np.ascontiguousarray(image_input))
+        # Original numpy path: pre-resize on CPU (runs in the decode thread,
+        # overlapped with GPU compute) then upload 1/4 the bytes.
+        #
+        # Downscale filter: cv2 LANCZOS4 — measured on a real 8K frame
+        # (7680→1536, ÷5): sharpness (Laplacian var) 1076 vs 381 for
+        # bilinear+antialias, 1.6/255 MAD from the PIL-Lanczos reference,
+        # 9.9ms (vs 44ms for torch bicubic-AA on GPU). For 1080P sources the
+        # vertical axis is upscaling — LANCZOS4 handles both directions and
+        # still beats bilinear.
+        arr = np.ascontiguousarray(image_input)
+        h, w = arr.shape[:2]
+        if (w, h) != (INTERNAL_SHAPE[1], INTERNAL_SHAPE[0]):
+            try:
+                import cv2
+                arr = cv2.resize(arr, (INTERNAL_SHAPE[1], INTERNAL_SHAPE[0]),
+                                 interpolation=cv2.INTER_LANCZOS4)
+            except ImportError:
+                pass  # fallback: GPU bilinear+antialias below
+        t = torch.from_numpy(arr)
         if async_upload:
             t = t.pin_memory()
         img = t.to(device, non_blocking=async_upload).permute(2, 0, 1)
         img = img.float().div_(255.0)
-        _, h, w = img.shape
 
     # BUG#5 FIX: explicit dtype=float32 (Python float → f64 → FP16 autocast error)
     disparity_factor = torch.tensor([f_px / w], device=device, dtype=torch.float32)
@@ -63,9 +79,19 @@ def prepare_input(image_input, f_px: float, device: torch.device,
     if (h, w) == tuple(INTERNAL_SHAPE):
         # Already at target resolution — ensure contiguous [1, 3, H, W]
         img_resized = img.unsqueeze(0).contiguous()
+    elif tuple(img.shape[-2:]) == tuple(INTERNAL_SHAPE):
+        # CPU pre-resized above — intrinsics below still scale from the
+        # ORIGINAL (w, h), which is what the unprojection expects.
+        img_resized = img.unsqueeze(0).contiguous()
     else:
+        # GPU-direct tensor path (or cv2 unavailable): GPU resize.
+        # antialias=True: downsampling >2x with plain bilinear point-samples
+        # pixels (moiré/shimmer on fine textures — the whole point of feeding
+        # 4K is that 1536² aggregates source pixels). antialias is ignored
+        # for the upscaling axis (1080P sources), so it costs nothing there.
         img_resized = interpolate(
-            img[None], size=INTERNAL_SHAPE, mode="bilinear", align_corners=True
+            img[None], size=INTERNAL_SHAPE, mode="bilinear", align_corners=True,
+            antialias=True
         )
 
     intrinsics = torch.tensor([

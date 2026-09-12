@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Signal
+from PySide6.QtGui import QIntValidator
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -25,7 +26,15 @@ from .widgets import AnimatedProgressBar, FileField, SectionCard, StereoSlider
 from .worker import EngineProcess
 
 IMG_FILTER = "图片 (*.png *.jpg *.jpeg *.bmp *.webp);;所有文件 (*)"
-ANIM_PREVIEW_WIDTH = 960
+ANIM_RESOLUTIONS = [
+    # (label, render width; -1 = source width)
+    ("720p  (1280)", 1280),
+    ("1080p (1920)", 1920),
+    ("1440p (2560)", 2560),
+    ("4K    (3840)", 3840),
+    ("原始分辨率", -1),
+]
+ANIM_DEFAULT_RES = 3  # 4K
 
 TRAJECTORIES = [
     ("swipe", "横扫"),
@@ -96,7 +105,7 @@ class AnimTab(QWidget):
 
     status_message = Signal(str)
 
-    request_prepare = Signal(str, int)
+    request_prepare = Signal(str, int, str, object)
     request_render_anim = Signal(dict)
     request_export_anim = Signal(dict)
 
@@ -106,7 +115,11 @@ class AnimTab(QWidget):
         self._engine = engine
         self._prepared = False
         self._awaiting_prepare = False
-        self._frames: list = []
+        self._has_anim = False
+        self._prep_mode = None
+        self._prep_focal = None
+        self._pending_render = False
+        self._input_path = ""
         self._rendering = False
 
         root = QVBoxLayout(self)
@@ -139,6 +152,51 @@ class AnimTab(QWidget):
         left.addWidget(traj_card)
 
         steps_card = SectionCard(c, "动画设置")
+        res_row = QHBoxLayout()
+        res_row.addWidget(QLabel("分辨率"))
+        self._res = QComboBox()
+        for label, _w in ANIM_RESOLUTIONS:
+            self._res.addItem(label)
+        self._res.setCurrentIndex(ANIM_DEFAULT_RES)
+        self._res.setToolTip(
+            "渲染输出宽度（高度按源图宽高比）。\n"
+            "4K 时 240 帧约需 5.7 GB 内存用于暂存帧，\n"
+            "导出前请留意内存余量。"
+        )
+        res_row.addWidget(self._res, 1)
+        steps_card.add_layout(res_row)
+
+        prec_row = QHBoxLayout()
+        prec_row.addWidget(QLabel("精度"))
+        self._prec = QComboBox()
+        self._prec.addItems(["画质优先 (FP16)", "速度优先 (FP16)", "FP32 高精度"])
+        self._prec.setToolTip(
+            "动画场景重建所用管线的精度：\n"
+            "画质优先：FP16 TensorRT + 35 patches（默认）\n"
+            "速度优先：FP16 TensorRT + 21 patches\n"
+            "FP32 高精度：纯 torch 单精度，理论质量上限最高，\n"
+            "  速度最慢，首次使用需下载 FP32 权重（约 2.4GB）\n"
+            "切换精度后，下次点击「生成动画」会自动重建场景。"
+        )
+        prec_row.addWidget(self._prec, 1)
+        steps_card.add_layout(prec_row)
+
+        focal_row = QHBoxLayout()
+        focal_row.addWidget(QLabel("镜头焦距"))
+        self._focal = QComboBox()
+        self._focal.setEditable(True)
+        self._focal.addItems(
+            ["自动 (读取元数据)", "24", "28", "35", "50", "85", "135", "200"])
+        self._focal.setCurrentIndex(0)
+        self._focal.setValidator(QIntValidator(8, 800, self._focal))
+        self._focal.setToolTip(
+            "拍摄镜头的 35mm 等效焦距 (mm)。"
+            "自动：视频按 40mm 等效估算，照片读取 EXIF（无则 30mm）。"
+            "长焦素材请填真实焦距（如 135），否则场景会被拉远、立体感扁平。"
+            "可直接输入任意 8-800 的数值；切换后下次生成动画自动按新焦距重建场景。"
+        )
+        focal_row.addWidget(self._focal, 1)
+        steps_card.add_layout(focal_row)
         steps_row = QHBoxLayout()
         steps_row.addWidget(QLabel("帧数"))
         self._steps = QSpinBox()
@@ -210,7 +268,6 @@ class AnimTab(QWidget):
         self.request_export_anim.connect(engine.export_anim)
 
         engine.prepared.connect(self._on_prepared)
-        engine.anim_frame.connect(self._on_anim_frame)
         engine.anim_progress.connect(self._on_anim_progress)
         engine.anim_done.connect(self._on_anim_done)
         engine.anim_exported.connect(self._on_exported)
@@ -219,25 +276,52 @@ class AnimTab(QWidget):
     # ------------------------------------------------------------------
     def _on_input(self, path: str) -> None:
         self._prepared = False
-        self._frames = []
+        self._has_anim = False
         self._btn_export.setEnabled(False)
         self._awaiting_prepare = True
+        self._input_path = path
+        self._prep_mode = ("quality", "speed", "fp32")[self._prec.currentIndex()]
+        self._prep_focal = self._parse_focal()
         self._prog_label.setText("正在重建 3D 场景…")
-        self.request_prepare.emit(path, 0)
+        self.request_prepare.emit(path, 0, self._prep_mode, self._prep_focal)
 
     def _on_prepared(self, info: dict) -> None:
         if not self._awaiting_prepare:
             return
         self._awaiting_prepare = False
         self._prepared = True
+        if self._pending_render:
+            self._pending_render = False
+            self.status_message.emit(f"场景重建完成（{self._prec.currentText()}）· 开始渲染动画")
+            self._on_render()
+            return
         self._prog_label.setText("场景就绪 · 点击「生成动画」")
         self.status_message.emit(f"场景重建完成 · {info['n_gaussians']:,} 高斯")
 
     def _on_render(self) -> None:
         if not self._prepared or self._rendering:
             return
+        mode = ("quality", "speed", "fp32")[self._prec.currentIndex()]
+        focal = self._parse_focal()
+        if (mode != self._prep_mode or focal != self._prep_focal) and self._input_path:
+            # Rebuild the scene at the newly selected precision, then render
+            # automatically once preparation finishes. _awaiting_prepare MUST
+            # be set: _on_prepared() gates on it, and without it the callback
+            # returns early — leaving the UI stuck. Do NOT set _rendering
+            # here: _on_render() (called from _on_prepared) guards on it and
+            # would silently refuse to start the actual render.
+            self._pending_render = True
+            self._has_anim = False
+            self._awaiting_prepare = True
+            self._btn_render.setEnabled(False)
+            self._btn_export.setEnabled(False)  # frames are now stale-precision
+            self._prep_mode = mode
+            self._prep_focal = focal
+            self._prog_label.setText("正在按新焦距/精度重建 3D 场景…")
+            self.request_prepare.emit(self._input_path, 0, mode, focal)
+            return
         self._rendering = True
-        self._frames = []
+        self._has_anim = False
         self._btn_export.setEnabled(False)
         self._btn_render.setEnabled(False)
         self._progress.set_value(0.0)
@@ -247,12 +331,9 @@ class AnimTab(QWidget):
             "max_zoom": self._s_zoom.value(),
             "num_steps": self._steps.value(),
             "num_repeats": self._repeats.value(),
-            "preview_width": ANIM_PREVIEW_WIDTH,
+            "preview_width": ANIM_RESOLUTIONS[self._res.currentIndex()][1],
         }
         self.request_render_anim.emit(opts)
-
-    def _on_anim_frame(self, frame: object) -> None:
-        self._frames.append(frame)
 
     def _on_anim_progress(self, i: int, total: int) -> None:
         self._progress.set_value(i / total if total else 0.0)
@@ -266,20 +347,32 @@ class AnimTab(QWidget):
         self._frame_info.setText(f"{n} 帧")
         self._prog_label.setText(f"完成 · {n} 帧")
         if n > 0:
+            self._has_anim = True
             self._btn_export.setEnabled(True)
 
     def _on_error(self, msg: str) -> None:
         self._rendering = False
         self._awaiting_prepare = False
+        self._pending_render = False  # a failed rebuild must not auto-render
         self._btn_render.setEnabled(True)
-        if self._frames:
+        if self._has_anim:
             self._btn_export.setEnabled(True)
         self._prog_label.setText("出错")
         self.status_message.emit(msg)
 
     # ------------------------------------------------------------------
+    def _parse_focal(self) -> float | None:
+        """Focal override: None = auto, else clamped 35mm-equivalent mm."""
+        text = self._focal.currentText().strip()
+        if not text or text.startswith("自动"):
+            return None
+        try:
+            return min(800.0, max(8.0, float(text)))
+        except ValueError:
+            return None
+
     def _on_export(self) -> None:
-        if not self._frames:
+        if not self._has_anim:
             return
         from PySide6.QtWidgets import QFileDialog
 
@@ -295,9 +388,9 @@ class AnimTab(QWidget):
         self.status_message.emit(f"正在导出 {path} …")
         self._prog_label.setText("正在导出视频…")
         self._btn_export.setEnabled(False)
-        self.request_export_anim.emit({
-            "path": path, "codec": codec, "fps": fps, "frames": self._frames,
-        })
+        # Frames stay worker-side (up to GBs at 4K) — only the export
+        # parameters cross the IPC boundary.
+        self.request_export_anim.emit({"path": path, "codec": codec, "fps": fps})
 
     def _on_exported(self, path: str) -> None:
         self._btn_export.setEnabled(True)

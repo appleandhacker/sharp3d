@@ -71,24 +71,35 @@ def analytical_eigen_decompose(cov_matrices: torch.Tensor) -> tuple[torch.Tensor
     eigenvalues = eigenvalues.clamp(min=0.0)  # PSD guarantee
 
     # === Eigenvectors via cross product method ===
-    # For each eigenvalue λ, (A - λI) has rank ≤ 2.
-    # Cross product of two independent rows gives the null vector (eigenvector).
-    eigvecs = torch.zeros(N, 3, 3, device=cov.device, dtype=torch.float32)
-
-    for k in range(3):
-        lam = eigenvalues[:, k]
-        # A - λI
-        m00 = a - lam; m01 = b;     m02 = c
+    # For each eigenvalue λ, (A - λI) has rank ≤ 2, so the cross product of
+    # two independent rows gives the null vector (the eigenvector).
+    #
+    # Only the *outer* eigenvectors (λ_max and λ_min) are extracted this way;
+    # the middle one is then v_mid = v_min × v_max. This is the classic
+    # formulation and it matters: when two eigenvalues are close (flat
+    # gaussians on a surface have λ1 ≈ λ2), A - λI drops to rank 1 and ALL
+    # three cross products degenerate to numerical noise. Extracting three
+    # independent vectors then yields a nearly-parallel, non-orthogonal basis
+    # (measured: orthogonality error 2e-2, covariance reconstruction error up
+    # to 80%). With v_mid built from the cross product the basis is orthogonal
+    # by construction, and the reconstruction only depends on the *span* of
+    # {v_max, v_mid} — which stays exact even when their individual
+    # directions are ill-determined:
+    #     R Λ Rᵀ = λ1(v1v1ᵀ + v2v2ᵀ) + λ3 v3v3ᵀ = λ1 I + (λ3-λ1) v3v3ᵀ
+    # It also makes det(R) = +1 automatically (right-handed by construction).
+    def _cross_eigvec(lam):
+        """Unit eigenvector for λ, from the largest of the three row cross products."""
+        m00 = a - lam; m01 = b;      m02 = c
         m10 = b;       m11 = d - lam; m12 = e
-        m20 = c;       m21 = e;     m22 = f - lam
+        m20 = c;       m21 = e;      m22 = f - lam
 
-        # Cross product of row0 × row1
+        # row0 × row1
         v0 = m01 * m12 - m02 * m11
         v1 = m02 * m10 - m00 * m12
         v2 = m00 * m11 - m01 * m10
         norm_sq = v0 * v0 + v1 * v1 + v2 * v2
 
-        # Fallback: row0 × row2 when row0 ∥ row1
+        # Fallback: row0 × row2
         alt0 = m01 * m22 - m02 * m21
         alt1 = m02 * m20 - m00 * m22
         alt2 = m00 * m21 - m01 * m20
@@ -100,8 +111,8 @@ def analytical_eigen_decompose(cov_matrices: torch.Tensor) -> tuple[torch.Tensor
         alt2_2 = m10 * m21 - m11 * m20
         alt2_norm_sq = alt2_0 * alt2_0 + alt2_1 * alt2_1 + alt2_2 * alt2_2
 
-        # Pick the cross product with largest norm (most numerically stable)
-        use_alt1 = (alt_norm_sq > norm_sq)
+        # Pick the cross product with the largest norm (most numerically stable)
+        use_alt1 = alt_norm_sq > norm_sq
         use_alt2 = (alt2_norm_sq > norm_sq) & (alt2_norm_sq > alt_norm_sq)
 
         v0 = torch.where(use_alt2, alt2_0, torch.where(use_alt1, alt0, v0))
@@ -110,32 +121,51 @@ def analytical_eigen_decompose(cov_matrices: torch.Tensor) -> tuple[torch.Tensor
         norm_sq = torch.where(use_alt2, alt2_norm_sq,
                     torch.where(use_alt1, alt_norm_sq, norm_sq))
 
-        # Normalize (guard against zero norm for degenerate eigenvalues)
         norm = norm_sq.clamp(min=1e-30).sqrt()
         v0 = v0 / norm; v1 = v1 / norm; v2 = v2 / norm
 
-        # BUG#4 FIX Part 1: Sign convention — largest |component| is positive
-        max_comp = torch.stack([v0.abs(), v1.abs(), v2.abs()], dim=-1)
-        max_idx = max_comp.argmax(dim=-1)
+        # Deterministic sign: largest |component| is positive
+        max_idx = torch.stack([v0.abs(), v1.abs(), v2.abs()], dim=-1).argmax(dim=-1)
         sign = torch.where(max_idx == 0, v0.sign(),
                  torch.where(max_idx == 1, v1.sign(), v2.sign()))
         sign = torch.where(sign == 0, torch.ones_like(sign), sign)
-        v0 = v0 * sign; v1 = v1 * sign; v2 = v2 * sign
+        return v0 * sign, v1 * sign, v2 * sign
 
-        eigvecs[:, 0, k] = v0
-        eigvecs[:, 1, k] = v1
-        eigvecs[:, 2, k] = v2
+    v0hi, v1hi, v2hi = _cross_eigvec(eigenvalues[:, 0])   # λ_max
+    v0lo, v1lo, v2lo = _cross_eigvec(eigenvalues[:, 2])   # λ_min
 
-    # BUG#4 FIX Part 2: Ensure proper rotation (det = +1)
-    # det < 0 means reflection → quaternion would be garbage
-    dets = torch.linalg.det(eigvecs)
-    flip_mask = dets < 0
-    if flip_mask.any():
-        eigvecs = eigvecs.clone()
-        # Flip the last column (smallest eigenvalue's eigenvector)
-        eigvecs[flip_mask, :, 2] *= -1
+    # Degenerate guard: if the two extracted vectors are (nearly) parallel,
+    # the middle cross product below would collapse to noise. Rebuild the
+    # upper vector from the coordinate axis least aligned with the lower one.
+    align = (v0hi * v0lo + v1hi * v1lo + v2hi * v2lo).abs()
+    axis = torch.stack([v0lo.abs(), v1lo.abs(), v2lo.abs()], dim=-1).argmin(dim=-1)
+    e0 = torch.where(axis == 0, torch.ones_like(align), torch.zeros_like(align))
+    e1 = torch.where(axis == 1, torch.ones_like(align), torch.zeros_like(align))
+    e2 = torch.where(axis == 2, torch.ones_like(align), torch.zeros_like(align))
+    # e_perp = e - (e·v_lo) v_lo, normalized
+    edot = e0 * v0lo + e1 * v1lo + e2 * v2lo
+    p0 = e0 - edot * v0lo; p1 = e1 - edot * v1lo; p2 = e2 - edot * v2lo
+    pn = (p0 * p0 + p1 * p1 + p2 * p2).clamp(min=1e-30).sqrt()
+    p0 = p0 / pn; p1 = p1 / pn; p2 = p2 / pn
 
-    # Convert rotation matrices to quaternions
+    degenerate = align > 0.999
+    v0hi = torch.where(degenerate, p0, v0hi)
+    v1hi = torch.where(degenerate, p1, v1hi)
+    v2hi = torch.where(degenerate, p2, v2hi)
+
+    # Middle eigenvector: v_mid = v_min × v_max (orthonormal, right-handed)
+    m0 = v1lo * v2hi - v2lo * v1hi
+    m1 = v2lo * v0hi - v0lo * v2hi
+    m2 = v0lo * v1hi - v1lo * v0hi
+    mn = (m0 * m0 + m1 * m1 + m2 * m2).clamp(min=1e-30).sqrt()
+    m0 = m0 / mn; m1 = m1 / mn; m2 = m2 / mn
+
+    eigvecs = torch.zeros(N, 3, 3, device=cov.device, dtype=torch.float32)
+    eigvecs[:, 0, 0] = v0hi; eigvecs[:, 1, 0] = v1hi; eigvecs[:, 2, 0] = v2hi
+    eigvecs[:, 0, 1] = m0;   eigvecs[:, 1, 1] = m1;   eigvecs[:, 2, 1] = m2
+    eigvecs[:, 0, 2] = v0lo; eigvecs[:, 1, 2] = v1lo; eigvecs[:, 2, 2] = v2lo
+
+    # Convert rotation matrices to quaternions (det = +1 by construction)
     quaternions = quat_from_rotmat_gpu(eigvecs)
     singular_values = eigenvalues.sqrt()
 

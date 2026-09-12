@@ -24,7 +24,9 @@ from torch import Tensor
 # Recomputing it per frame costs several ms and hundreds of MB of traffic
 # (plus GPU→CPU syncs in the old cubemap_to_equirect). Cache it instead.
 
-_CACHE_MAX = 4  # a couple of resolutions per session is typical
+_CACHE_MAX = 2  # a single conversion touches at most 1-2 resolutions;
+                # each entry holds tens-to-hundreds of MB of GPU tensors,
+                # so keep the resident footprint tight on 12GB cards
 _input_grid_cache: OrderedDict = OrderedDict()    # image → cubemap faces
 _equirect_plan_cache: OrderedDict = OrderedDict()  # faces → equirect
 
@@ -646,7 +648,9 @@ def _build_equirect_plan(
             continue
         grid_f = torch.stack([flat_u[idx], flat_v[idx]], dim=-1)
         grid_f = grid_f.reshape(1, 1, -1, 2).contiguous()
-        plan.append((fi, idx, grid_f))
+        # int32 halves the resident cache size; output pixel counts are far
+        # below 2^31. Cast back to long at scatter time (transient).
+        plan.append((fi, idx.to(torch.int32), grid_f))
     return plan
 
 
@@ -681,7 +685,7 @@ def cubemap_to_equirect(
             faces[fi:fi + 1], grid_f, mode="bilinear",
             padding_mode="border", align_corners=True,
         )  # [1, 3, 1, M]
-        flat[idx] = sampled[0, :, 0, :].T  # int64-index scatter, no nonzero
+        flat[idx.long()] = sampled[0, :, 0, :].T  # index scatter, no nonzero
 
     return equirect
 

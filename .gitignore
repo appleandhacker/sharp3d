@@ -44,3 +44,4 @@ test_*.mp4
 # Logs
 *.log
 .cache/
+torch_compile_debug/
