@@ -157,11 +157,11 @@ class SbsTab(QWidget):
         crf_row.addWidget(QLabel(tr("质量 CRF")))
         self._crf = QComboBox()
         self._crf.setEditable(True)  # 任意 0-51 可输入，预设仅作快捷项
-        self._crf.addItems(["16", "18", "20", "23", "26", "28"])
+        self._crf.addItems(["16", "18", "20", "23", "26", "28",
+                            "30", "32", "35", "40"])
         self._crf.setValidator(QIntValidator(0, 51, self._crf))
-        self._crf.setToolTip(
-            tr("H.264/H.265 质量系数（越小质量越高、文件越大）。\n可直接输入任意 0-51 的值；典型范围 16-28。")
-        )
+        self._codec.currentTextChanged.connect(self._update_crf_tip)
+        self._update_crf_tip()
         self._crf.setCurrentText("26")
         crf_row.addWidget(self._crf, 1)
         enc_card.add_layout(crf_row)
@@ -483,6 +483,19 @@ class SbsTab(QWidget):
             return min(800.0, max(8.0, float(text)))
         except ValueError:
             return None
+
+    def _update_crf_tip(self):
+        """CRF 说明随编码器联动：AV1 硬编的 qp 走 AV1 原生 0-255 刻度
+        （GUI 输 0-51，内部 ×5 映射），tooltip 需说明以免误解。"""
+        if self._codec.currentText() == "AV1":
+            self._crf.setToolTip(tr(
+                "质量系数（越小质量越高、文件越大）。可直接输入任意 0-51 的值，"
+                "AV1 硬编内部自动映射到 AV1 量化器（如 40→200）。\n"
+                "AV1 压缩率高，同画质体积比 H.264 小；典型范围 26-40。"))
+        else:
+            self._crf.setToolTip(tr(
+                "H.264/H.265 质量系数（越小质量越高、文件越大）。\n"
+                "可直接输入任意 0-51 的值；典型范围 16-28。"))
 
     def _build_opts(self, inp: str, out: str) -> dict:
         """Build conversion options for a single file (typed via ConvertOptions)."""

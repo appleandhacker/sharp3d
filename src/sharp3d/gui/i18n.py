@@ -134,8 +134,10 @@ _ZH2EN: dict[str, str] = {
     "质量 CRF": "Quality (CRF)",
     "H.264/H.265 质量系数（越小质量越高、文件越大）。\n可直接输入任意 0-51 的值；典型范围 16-28。":
         "H.264/H.265 quality factor (lower = better quality, larger file).\nType any value 0-51; typical range is 16-28.",
-    "VR 视频建议 CRF 18~20（更高质量减少纱窗效应）":
-        "CRF 18-20 recommended for VR video (higher quality reduces screen-door effect)",
+    "质量系数（越小质量越高、文件越大）。可直接输入任意 0-51 的值，AV1 硬编内部自动映射到 AV1 量化器（如 40→200）。\nAV1 压缩率高，同画质体积比 H.264 小；典型范围 26-40。":
+        "Quality factor (lower = better quality, larger file). Type any value 0-51; AV1 hardware encoding maps it internally to the AV1 quantizer (e.g. 40→200).\nAV1 is more efficient: smaller files at the same quality; typical range is 26-40.",
+    "VR 视频建议 CRF 18~20（更高质量减少纱窗效应）。可直接输入任意 0-51 的值。\nAV1 硬编内部自动映射到 AV1 量化器（如 20→100）；AV1 压缩率高，同画质体积更小。":
+        "CRF 18-20 recommended for VR video (higher quality reduces screen-door effect). Type any value 0-51.\nAV1 hardware encoding maps it internally to the AV1 quantizer (e.g. 20→100); AV1 is more efficient, smaller files at the same quality.",
     "VR 视频推荐 AV1（压缩率最高，画质最好）。\nH.265 兼容性好；H.264 最广泛但文件较大。":
         "AV1 recommended for VR video (best compression and quality).\nH.265 is broadly compatible; H.264 is the most universal but larger.",
     "AV1 默认走 GPU 硬件编码 (NVENC)，不可用时自动回退 CPU":
