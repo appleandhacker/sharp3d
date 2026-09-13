@@ -1828,6 +1828,13 @@ class EngineProcess(QObject):
     def preload(self):
         """Kick off model load + compile in the child right away, so the
         one-time cost overlaps with app startup instead of the first convert."""
+        # Must participate in job tracking: preload ends with the terminal
+        # "preload_done", and a terminal pops the FRONT of the job deque. An
+        # unregistered preload let its terminal pop the next real job — a
+        # convert queued while the preload was still running (user selects
+        # speed and clicks start during the quality load) lost its identity,
+        # and the GUI froze mid-conversion again.
+        self._accept_job(None)
         self._req_q.put(("preload", {}))
 
     def prepare(self, path, frame_idx, perf_mode="quality", focal_35mm=None,
