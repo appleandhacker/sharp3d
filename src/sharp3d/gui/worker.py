@@ -103,16 +103,11 @@ class _PipelineWorker:
         except Exception as exc:  # noqa: BLE001
             self._respond("error", (tr("预加载失败: {}").format(exc),))
 
-    def _ensure_pipeline(self, perf_mode="quality", fp16=None):
-        # Normalize None to the resolved values BEFORE building the mode key.
-        # Otherwise preload ("quality", None) and a GUI convert with
-        # explicit defaults ("quality", True) produce different keys
-        # and trigger a pointless full pipeline rebuild + torch._dynamo.reset()
-        # on the first conversion of every session (~15s stall).
-        if fp16 is None:
-            fp16 = (perf_mode != "fp32")
-        # Rebuild if mode changed
-        _mode_key = (perf_mode, fp16)
+    def _ensure_pipeline(self, perf_mode="quality"):
+        # Rebuild if mode changed. The key is just the mode now: the FP16/FP32
+        # switch is gone (precision is always FP16), so there is no second
+        # dimension to normalise.
+        _mode_key = perf_mode
         if self._pipeline is not None and getattr(self, '_mode_active', None) != _mode_key:
             self._respond("status", (tr("性能模式已切换，正在重建管线…"),))
             self._pipeline = None
@@ -148,7 +143,6 @@ class _PipelineWorker:
         sp = SharpPredictor(
             device=self._device,
             perf_mode=perf_mode,
-            fp16=(perf_mode != "fp32") if fp16 is None else bool(fp16),
             cache_dir=cache_dir,
             progress_cb=_progress,
         )
@@ -235,8 +229,7 @@ class _PipelineWorker:
                 self._convert_vr(opts)
                 return
 
-            self._ensure_pipeline(opts.get("perf_mode", "quality"),
-                                  fp16=opts.get("fp16"))
+            self._ensure_pipeline(opts.get("perf_mode", "quality"))
             torch = self._torch
             from sharp.utils import io as sharp_io
             from sharp3d.unproject import prepare_input, fast_unproject, INTERNAL_SHAPE

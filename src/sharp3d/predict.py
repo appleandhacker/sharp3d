@@ -118,18 +118,12 @@ class SharpPredictor:
         g_ndc = sp.predict(img_resized, disparity_factor)
     """
 
-    @property
-    def _ac_dtype(self):
-        """Autocast dtype matching the weight precision (FP16 or FP32)."""
-        return torch.float16 if self._fp16 else torch.float32
-
     def __init__(
         self,
         device: torch.device = torch.device("cuda"),
         perf_mode: str = "quality",
         cache_dir: Path | None = None,
         progress_cb: ProgressCB = None,
-        fp16: bool = True,
     ):
         """
         Args:
@@ -138,18 +132,21 @@ class SharpPredictor:
             cache_dir: Directory for FP16 weights + TRT/inductor/triton caches.
                        Defaults to <project_root>/.cache.
             progress_cb: Optional (stage: str, percent: int) callback for UI.
-            fp16: Run the predictor weights and autocast in FP16. False keeps
-                  FP32 end to end (slower, ~2x VRAM, but no FP16 rounding).
 
-                  INT8 was removed (2026-09-10): ORT TRT EP ignores the implicit
-                  calibration table for this ViT (all layers fall back to FP16 —
-                  measured pixel-identical output), and explicit QDQ static
-                  quantization degrades image quality to 25dB. Dead end without
-                  quantization-aware training.
+        精度固定 FP16（TRT FP16 编码器 + 半精度权重 + autocast）。
+        原 FP32 高精度管线已移除（2026-09-13，实测数据见 README）：FP16 与
+        FP32 的高斯深度中位相对差仅 0.16%（深度图 PSNR 45.26dB、彩色 SBS
+        39.43dB），折算到立体视差是亚像素级；而纯 torch FP32 慢到无法用于
+        长视频（60 帧 10 分钟未完，FP16 仅 37s）。
+
+        INT8 was removed (2026-09-10): ORT TRT EP ignores the implicit
+        calibration table for this ViT (all layers fall back to FP16 —
+        measured pixel-identical output), and explicit QDQ static
+        quantization degrades image quality to 25dB. Dead end without
+        quantization-aware training.
         """
         self.device = device
         self.perf_mode = perf_mode
-        self._fp16 = fp16
         # Set on first-forward dynamo/triton failure (see predict()); compile
         # is lazy so __init__'s try/except cannot cover that stage.
         self._eager_fallback = False
@@ -178,20 +175,11 @@ class SharpPredictor:
         # Frozen: check bundled weights first
         import sys as _sys
         fp16_ckpt = cache_dir / "sharp_fp16.pt"
-        fp32_ckpt = cache_dir / "sharp_fp32.pt"
         if getattr(_sys, "frozen", False):
             bundled = Path(_sys._MEIPASS) / "models" / "sharp_fp16.pt"
             if bundled.exists():
                 fp16_ckpt = bundled
-        if not fp16 and fp32_ckpt.exists():
-            # FP32 pipeline: load the original Apple FP32 checkpoint — the
-            # bundled sharp_fp16.pt has already lost precision at save time,
-            # so casting its values up would NOT give a true FP32 model.
-            self._progress("加载本地 FP32 权重 (sharp_fp32.pt)", 10)
-            state_dict = torch.load(str(fp32_ckpt), map_location="cpu",
-                                    mmap=True, weights_only=True)
-            already_fp16 = False
-        elif fp16_ckpt.exists() and fp16:
+        if fp16_ckpt.exists():
             self._progress(f"加载本地权重 ({fp16_ckpt.name})", 10)
             state_dict = torch.load(str(fp16_ckpt), map_location="cpu",
                                     mmap=True, weights_only=True)
@@ -221,7 +209,7 @@ class SharpPredictor:
         import os as _os
         from .ort_engine import onnx_models_cached, _ascii_safe_trt_dir
         direct_fp16 = bool(
-            already_fp16 and fp16 and onnx_models_cached()
+            already_fp16 and onnx_models_cached()
             and _os.environ.get("SHARP3D_NO_DIRECT_FP16") != "1")
         if direct_fp16:
             predictor.half()
@@ -239,7 +227,7 @@ class SharpPredictor:
                            str(fp16_ckpt))
             except Exception:
                 pass
-        self.accel_status.append((f"{'FP16' if fp16 else 'FP32'} 权重", True))
+        self.accel_status.append(("FP16 权重", True))
 
         # ── channels_last (lossless Conv2d speedup) ──────────────────────
         _cl_ok = False
@@ -271,7 +259,7 @@ class SharpPredictor:
         # 47.8dB）。实验路径：set SHARP3D_FULL_TRT=1。
         self._full_trt = None
         _n_patches = 35 if params.monodepth.use_patch_overlap else 21
-        if fp16 and os.environ.get("SHARP3D_FULL_TRT") == "1":
+        if os.environ.get("SHARP3D_FULL_TRT") == "1":
             _have_full_engine = (_trt_dir / "full" / str(_n_patches)).is_dir() \
                 and any((_trt_dir / "full" / str(_n_patches)).glob("*.engine"))
             self._progress(
@@ -295,12 +283,7 @@ class SharpPredictor:
             self._progress("整模型 TRT 就绪（跳过 torch.compile）", 60)
 
         _ort_ok = False
-        if not fp16:
-            # FP32 pipeline: keep everything in torch FP32 — swapping in the
-            # FP16 TRT encoder sessions would defeat the point of the mode.
-            self.accel_status.append(("FP32 全精度 (纯 torch)", True))
-            self._progress("FP32 模式（跳过 TensorRT）", 35)
-        elif self._full_trt is None:
+        if self._full_trt is None:
             _have_engine = _trt_dir.is_dir() and any(_trt_dir.glob("*.engine"))
             self._progress(
                 "TensorRT 引擎（就绪）" if _have_engine
@@ -336,8 +319,8 @@ class SharpPredictor:
             # fed FP16 values into FP32 params they were silently cast up, so
             # skipping half() here kept the model in FP32 (2× VRAM, ~1.4 GB
             # wasted). direct_fp16 already produced FP16 params — halving
-            # again would be a no-op, and it must NOT run for fp16=False.
-            if fp16 and not direct_fp16:
+            # again would be a no-op.
+            if not direct_fp16:
                 predictor.half()
 
         # ── Detect cache state ───────────────────────────────────────────
@@ -420,7 +403,7 @@ class SharpPredictor:
         dummy_img = torch.zeros(1, 3, *INTERNAL_SHAPE, device=device)
         dummy_df = torch.tensor([1.0], device=device, dtype=torch.float32)
         self._progress("预热推理", 75)
-        with torch.no_grad(), torch.autocast("cuda", dtype=self._ac_dtype):
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
             g_ndc = self._compiled(dummy_img, dummy_df)
         torch.cuda.synchronize()
 
@@ -462,7 +445,7 @@ class SharpPredictor:
         Returns:
             Gaussians3D in NDC space.
         """
-        with torch.autocast("cuda", dtype=self._ac_dtype):
+        with torch.autocast("cuda", dtype=torch.float16):
             if self._eager_fallback:
                 return self.predictor(img_resized, disparity_factor)
             try:

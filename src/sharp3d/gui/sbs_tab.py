@@ -63,9 +63,8 @@ def precision_text(status: list) -> str:
     names = {name for name, ok in status if ok}
     if any("TensorRT" in n for n in names):
         return "FP16 (TensorRT)"
-    if any("FP16" in n for n in names):
-        return "FP16 (PyTorch)"
-    return "FP32 (PyTorch)"
+    # 精度恒为 FP16（FP32 管线已移除，2026-09-13），没有第三个分支
+    return "FP16 (PyTorch)"
 
 
 class SbsTab(QWidget):
@@ -217,9 +216,9 @@ class SbsTab(QWidget):
         perf_row = QHBoxLayout()
         perf_row.addWidget(QLabel(tr("性能模式")))
         self._perf_mode = QComboBox()
-        self._perf_mode.addItems([tr("画质优先"), tr("速度优先"), tr("FP32 高精度")])
+        self._perf_mode.addItems([tr("画质优先"), tr("速度优先")])
         self._perf_mode.setToolTip(
-            tr("画质优先：FP16 TensorRT + 完整 35 patches（几乎无损）\n速度优先：FP16 TensorRT + 精简 21 patches（提速 ~35%，边缘细节略降）\nFP32 高精度：纯 torch 单精度管线（无 TensorRT），理论质量上限最高；\n  速度最慢，显存约 2.8GB，首次使用需 FP32 权重 sharp_fp32.pt\n\n切换后需重新开始转换生效。")
+            tr("画质优先：FP16 TensorRT + 完整 35 patches（几乎无损）\n速度优先：FP16 TensorRT + 精简 21 patches（提速 ~35%，边缘细节略降）\n\n切换后需重新开始转换生效。")
         )
         perf_row.addWidget(self._perf_mode, 1)
         adv_card.add_layout(perf_row)
@@ -528,7 +527,7 @@ class SbsTab(QWidget):
             ply=self._chk_ply.isChecked(),
             edge_soften=self._chk_edge.isChecked(),
             hdr_output=self._chk_hdr.isChecked(),
-            perf_mode=("quality", "speed", "fp32")[self._perf_mode.currentIndex()],
+            perf_mode=("quality", "speed")[self._perf_mode.currentIndex()],
             focal_35mm=self._parse_focal(),
             renderer="higs" if self._renderer.currentIndex() == 1 else "standard",
             out_fps=out_fps,

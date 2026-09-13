@@ -179,9 +179,9 @@ class AnimTab(QWidget):
         prec_row = QHBoxLayout()
         prec_row.addWidget(QLabel(tr("精度")))
         self._prec = QComboBox()
-        self._prec.addItems([tr("画质优先 (FP16)"), tr("速度优先 (FP16)"), tr("FP32 高精度")])
+        self._prec.addItems([tr("画质优先 (FP16)"), tr("速度优先 (FP16)")])
         self._prec.setToolTip(
-            tr("动画场景重建所用管线的精度：\n画质优先：FP16 TensorRT + 35 patches（默认）\n速度优先：FP16 TensorRT + 21 patches\nFP32 高精度：纯 torch 单精度，理论质量上限最高，\n  速度最慢，首次使用需下载 FP32 权重（约 2.4GB）\n切换精度后，下次点击「生成动画」会自动重建场景。")
+            tr("动画场景重建所用管线的精度：\n画质优先：FP16 TensorRT + 35 patches（默认）\n速度优先：FP16 TensorRT + 21 patches\n切换精度后，下次点击「生成动画」会自动重建场景。")
         )
         prec_row.addWidget(self._prec, 1)
         steps_card.add_layout(prec_row)
@@ -283,7 +283,7 @@ class AnimTab(QWidget):
         self._btn_export.setEnabled(False)
         self._awaiting_prepare = True
         self._input_path = path
-        self._prep_mode = ("quality", "speed", "fp32")[self._prec.currentIndex()]
+        self._prep_mode = ("quality", "speed")[self._prec.currentIndex()]
         self._prep_focal = self._parse_focal()
         self._prog_label.setText(tr("正在重建 3D 场景…"))
         self._job_id = self._engine.new_job()
@@ -309,7 +309,7 @@ class AnimTab(QWidget):
         # request_prepare, and whichever prepare finished last won.
         if not self._prepared or self._rendering or self._awaiting_prepare:
             return
-        mode = ("quality", "speed", "fp32")[self._prec.currentIndex()]
+        mode = ("quality", "speed")[self._prec.currentIndex()]
         focal = self._parse_focal()
         if (mode != self._prep_mode or focal != self._prep_focal) and self._input_path:
             # Rebuild the scene at the newly selected precision, then render
@@ -400,7 +400,7 @@ class AnimTab(QWidget):
         # scene prepared with _rendered_params. If the precision/focal
         # selection has moved on since, exporting would silently produce a
         # video from the OLD parameters while the UI shows the new ones.
-        current = (("quality", "speed", "fp32")[self._prec.currentIndex()],
+        current = (("quality", "speed")[self._prec.currentIndex()],
                    self._parse_focal())
         if self._rendered_params is not None and current != self._rendered_params:
             self.status_message.emit(

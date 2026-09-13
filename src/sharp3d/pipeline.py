@@ -129,7 +129,6 @@ class Sharp3DPipeline:
         self,
         device: torch.device = torch.device("cuda"),
         use_compile: bool = True,
-        use_fp16: bool = True,
         decompose_method: str = "analytical",
         ipd: float = 0.063,
     ):
@@ -141,7 +140,7 @@ class Sharp3DPipeline:
         import os
         if not use_compile:
             os.environ["SHARP3D_NO_COMPILE"] = "1"
-        self.predictor = SharpPredictor(device=device, fp16=use_fp16)
+        self.predictor = SharpPredictor(device=device)
         # SharpPredictor already warms up (predict + gsplat kernel) in
         # __init__, so there is nothing left to trigger lazily.
 

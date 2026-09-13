@@ -31,8 +31,6 @@ def main():
                         help="Decomposition method (default: analytical)")
     parser.add_argument("--no-compile", action="store_true",
                         help="Disable torch.compile")
-    parser.add_argument("--fp32", action="store_true",
-                        help="Use FP32 instead of FP16")
     parser.add_argument("--depth", action="store_true",
                         help="Also output depth map (images only)")
     parser.add_argument("--hdr", action="store_true",
@@ -85,7 +83,6 @@ def main():
     pipeline = Sharp3DPipeline(
         device=device,
         use_compile=not args.no_compile,
-        use_fp16=not args.fp32,
         decompose_method=args.decompose,
         ipd=args.ipd,
     )

@@ -153,13 +153,12 @@ _ZH2EN: dict[str, str] = {
     "性能模式": "Performance mode",
     "画质优先": "Quality first",
     "速度优先": "Speed first",
-    "FP32 高精度": "FP32 (max precision)",
     "画质优先 (FP16)": "Quality first (FP16)",
     "速度优先 (FP16)": "Speed first (FP16)",
-    "画质优先：FP16 TensorRT + 完整 35 patches（几乎无损）\n速度优先：FP16 TensorRT + 精简 21 patches（提速 ~35%，边缘细节略降）\nFP32 高精度：纯 torch 单精度管线（无 TensorRT），理论质量上限最高；\n  速度最慢，显存约 2.8GB，首次使用需 FP32 权重 sharp_fp32.pt\n\n切换后需重新开始转换生效。":
-        "Quality first: FP16 TensorRT + full 35 patches (nearly lossless)\nSpeed first: FP16 TensorRT + trimmed 21 patches (~35% faster, slightly less edge detail)\nFP32 (max precision): pure torch single-precision pipeline (no TensorRT); highest\n  theoretical quality; slowest, ~2.8GB VRAM, needs FP32 weights sharp_fp32.pt on first use\n\nRestart the conversion after switching for it to take effect.",
-    "动画场景重建所用管线的精度：\n画质优先：FP16 TensorRT + 35 patches（默认）\n速度优先：FP16 TensorRT + 21 patches\nFP32 高精度：纯 torch 单精度，理论质量上限最高，\n  速度最慢，首次使用需下载 FP32 权重（约 2.4GB）\n切换精度后，下次点击「生成动画」会自动重建场景。":
-        "Precision of the pipeline used for animation scene reconstruction:\nQuality first: FP16 TensorRT + 35 patches (default)\nSpeed first: FP16 TensorRT + 21 patches\nFP32 (max precision): pure torch single precision; highest theoretical quality,\n  slowest; downloads FP32 weights on first use (~2.4GB)\nAfter switching, clicking \"Generate Animation\" rebuilds the scene automatically.",
+    "画质优先：FP16 TensorRT + 完整 35 patches（几乎无损）\n速度优先：FP16 TensorRT + 精简 21 patches（提速 ~35%，边缘细节略降）\n\n切换后需重新开始转换生效。":
+        "Quality first: FP16 TensorRT + full 35 patches (nearly lossless)\nSpeed first: FP16 TensorRT + trimmed 21 patches (~35% faster, slightly less edge detail)\n\nRestart the conversion after switching for it to take effect.",
+    "动画场景重建所用管线的精度：\n画质优先：FP16 TensorRT + 35 patches（默认）\n速度优先：FP16 TensorRT + 21 patches\n切换精度后，下次点击「生成动画」会自动重建场景。":
+        "Precision of the pipeline used for animation scene reconstruction:\nQuality first: FP16 TensorRT + 35 patches (default)\nSpeed first: FP16 TensorRT + 21 patches\nAfter switching, clicking \"Generate Animation\" rebuilds the scene automatically.",
     "预测间隔": "Prediction interval",
     "每帧预测 (默认)": "Every frame (default)",
     "每 2 帧 (~1.8x)": "Every 2 frames (~1.8x)",
@@ -294,7 +293,6 @@ _ZH2EN: dict[str, str] = {
     "语言已切换": "Language changed",
     "界面语言将在下次启动 sharp3d 时生效。": "The UI language will take effect the next time sharp3d starts.",
     '加载模型权重': 'Loading model weights',
-    '加载本地 FP32 权重 (sharp_fp32.pt)': 'Loading local FP32 weights (sharp_fp32.pt)',
     '下载模型权重 (首次需联网，约2.4GB)': 'Downloading model weights (first run needs internet, ~2.4GB)',
     '构建网络结构': 'Building network',
     '载入权重': 'Loading weights',
@@ -303,7 +301,6 @@ _ZH2EN: dict[str, str] = {
     'TensorRT 引擎（就绪）': 'TensorRT engines (ready)',
     'TensorRT 引擎（首次构建，需数分钟）': 'TensorRT engines (first build, takes a few minutes)',
     '整模型 TRT 就绪（跳过 torch.compile）': 'Full-model TRT ready (skipping torch.compile)',
-    'FP32 模式（跳过 TensorRT）': 'FP32 mode (skipping TensorRT)',
     'TensorRT 引擎（2/2）': 'TensorRT engines (2/2)',
     'TensorRT 引擎': 'TensorRT engines',
     '预热整模型 TRT 引擎': 'Warming up full-model TRT engine',
