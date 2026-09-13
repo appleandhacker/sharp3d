@@ -614,8 +614,13 @@ class _PipelineWorker:
         self._respond("status", (
             tr("编码器: {} ({}) · 输出 {}×{}").format(enc, label, vid_w, vid_h),))
 
+        # Live-audio: mux the audio track into the fragmented stream while
+        # frames are written (see _convert_video).
+        live_audio_src = path if (opts.get("audio", True) and reader.has_audio) \
+            else None
         writer = VideoWriter(out, fps=out_fps, width=vid_w, height=vid_h,
-                             codec=codec, crf=crf)
+                             codec=codec, crf=crf,
+                             audio_source=live_audio_src)
 
         # Cubemap prediction setup (fixed across frames)
         pred_face_size = 1536  # SHARP internal resolution
@@ -979,9 +984,8 @@ class _PipelineWorker:
                 break
         decoder.join(timeout=5)
 
-        keep_audio = opts.get("audio", True) and reader.has_audio
-        source = path if keep_audio else None
-        writer.close(source_video=source)
+        # Live-audio mode: audio already in the stream — nothing to mux.
+        writer.close()
         if depth_writer is not None:
             depth_writer.close()
 
@@ -1149,14 +1153,21 @@ class _PipelineWorker:
                         out_w, out_h, enc),))
 
         hdr_out = opts.get("hdr_output", False)
+        # Live-audio: mux the audio track into the fragmented stream as
+        # frames are written, so mid-conversion playback has sound (same as
+        # the CLI pipeline; the old close-time mux kept the tmp silent until
+        # the conversion finished).
+        source = path if (opts.get("audio", True) and reader.has_audio) else None
         if hdr_out:
             writer = Hdr10Writer(out, width=out_w, height=out_h,
                                  fps=out_fps, codec=opts.get("codec", "h265"),
-                                 crf=opts.get("crf", 18))
+                                 crf=opts.get("crf", 18),
+                                 audio_source=source)
         else:
             writer = VideoWriter(out, fps=out_fps, width=out_w, height=out_h,
                                  codec=opts.get("codec", "h264"),
-                                 crf=opts.get("crf", 18))
+                                 crf=opts.get("crf", 18),
+                                 audio_source=source)
 
         # ── Decode prefetch thread ──────────────────────────────────────
         # ffmpeg handles fps conversion via its fps filter, so the decode
@@ -1417,12 +1428,10 @@ class _PipelineWorker:
             decoder.join(timeout=5)
             torch.cuda.empty_cache()
 
-        keep_audio = opts.get("audio", True) and reader.has_audio
-        source = path if keep_audio else None
-        if hdr_out:
-            writer.close(audio_source=source)
-        else:
-            writer.close(source_video=source)
+        # Live-audio mode: the audio track was already muxed into the
+        # fragmented stream as frames were written (audio_source was passed
+        # at writer construction) — nothing to mux here anymore.
+        writer.close()
         if depth_writer is not None:
             depth_writer.close()
 

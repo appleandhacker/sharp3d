@@ -265,6 +265,8 @@ class VideoWriter:
             self._proc = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE, stderr=self._stderr_fh,
                 creationflags=_NO_WINDOW)
+            logger.info("实时音轨已启用（音频随视频写入，转换中可听）: %s",
+                        self._audio_source)
         else:
             # nvenc uses -qp in output_params; passing quality= would add the
             # deprecated -global_quality flag and trigger ffmpeg warnings/errors.
