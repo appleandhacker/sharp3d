@@ -601,9 +601,10 @@ def check15_pipeline_cleanup_shape():
     ):
         assert needle in src, f"pipeline.py 缺少: {needle}"
     # finally 块顺序: 排空队列 → abort →（后续）join
+    # （abort 的首次出现可能在 _AsyncFrameSink 的注释里，从 finally 起搜）
     i_finally = src.index("        finally:\n            # Unblock the decoder")
-    i_abort = src.index("writer.abort()")
-    i_join = src.index("decoder.join(timeout=5)")
+    i_abort = src.index("writer.abort()", i_finally)
+    i_join = src.index("decoder.join(timeout=5)", i_abort)
     assert i_finally < i_abort < i_join, "finally(排空+abort) 应在 join 之前"
 
 
