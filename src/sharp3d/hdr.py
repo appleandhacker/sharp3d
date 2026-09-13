@@ -61,6 +61,90 @@ MOVFLAGS_LIVE = ["-movflags", "+frag_keyframe+empty_moov+default_base_moof",
                  "-frag_duration", "1000000",
                  "-flush_packets", "1"]
 
+# Fragmented output is what makes mid-conversion playback possible, but it
+# is a poor *finished* file: the moov carries no sample table, so a player
+# must walk every moof to seek — or give up. Measured on the same 8K SBS
+# production output (2026-09-13):
+#   fragmented    : moov 1,239 B (mvex, nb_frames=N/A) + 2,077 moof/mdat
+#                   → VR headset over SMB could not open or seek it
+#   non-fragmented: moov 2.1 MB with a full co64/stsz sample table,
+#                   nb_frames=57,867 → played and seeked fine
+# So every finished output is remuxed into a plain faststart MP4 (`-c copy`,
+# no re-encode — only the container is rewritten). Set
+# SHARP3D_KEEP_FRAGMENTED=1 to skip that pass: cheaper (no 2x file I/O) but
+# the result stays fragmented and may not play/seek on hardware players.
+KEEP_FRAGMENTED = os.environ.get("SHARP3D_KEEP_FRAGMENTED") == "1"
+
+
+def hvc1_tag_args(codec_lib: str) -> list[str]:
+    """`-tag:v hvc1` for HEVC, nothing otherwise.
+
+    Accepts both the family name ("h265") and the resolved encoder
+    ("hevc_nvenc"/"libx265"); hardware players (and Apple's stack) expect
+    the hvc1 sample entry for HEVC in MP4.
+    """
+    return (["-tag:v", "hvc1"]
+            if ("hevc" in codec_lib or "265" in codec_lib) else [])
+
+
+def finalize_progressive(src: Path, dst: Path,
+                         extra: list[str] | None = None) -> bool:
+    """Promote a finished fragmented MP4 (`src`) to a compatible MP4 at `dst`.
+
+    Remuxes to a non-fragmented, faststart MP4 so ordinary players can open
+    and seek the file. On any failure it falls back to a plain rename, so
+    the encoded video is never lost — it just stays fragmented.
+
+    `extra` carries encoder flags that must survive the remux (currently the
+    hvc1 tag for HEVC, which several hardware players require).
+
+    Returns True when the progressive remux succeeded, False when the
+    fragmented fallback was used. Raises OSError only if the fallback rename
+    also fails (destination locked or on another device).
+    """
+    if not KEEP_FRAGMENTED:
+        cmd = [FFMPEG, "-y", "-i", str(src), "-c", "copy",
+               "-map", "0:v:0", "-map", "0:a:0?",
+               "-movflags", "+faststart"]
+        if extra:
+            cmd += extra
+        cmd.append(str(dst))
+        logger.info("正在封装为兼容 MP4（传统样本索引 + moov 前置）: %s", dst.name)
+        try:
+            result = subprocess.run(cmd, capture_output=True,
+                                    creationflags=_NO_WINDOW)
+        except OSError as e:
+            result = None
+            logger.error("调用 ffmpeg 封装兼容 MP4 失败: %s", e)
+        if result is not None and result.returncode == 0:
+            try:
+                src.unlink(missing_ok=True)
+            except OSError as e:
+                logger.warning("兼容封装成功但临时文件删除失败: %s", e)
+            return True
+        tail = ""
+        if result is not None and result.stderr:
+            tail = result.stderr.decode("utf-8",
+                                        errors="replace").strip()[-500:]
+        logger.error("封装为兼容 MP4 失败（返回码 %s）；已保留分片输出，"
+                     "部分播放器可能无法打开或快进，可设 "
+                     "SHARP3D_KEEP_FRAGMENTED=0 后重试本次转换: %s\n%s",
+                     "n/a" if result is None else result.returncode, dst, tail)
+        try:
+            dst.unlink(missing_ok=True)  # 清掉半成品，避免误认
+        except OSError:
+            logger.debug("兼容封装半成品删除失败: %s", dst, exc_info=True)
+
+    try:
+        src.replace(dst)
+    except OSError as e:
+        logger.error("无法将临时文件移为最终输出（%s → %s）: %s；"
+                     "视频仍保留在 %s", src, dst, e, src)
+        raise
+    if KEEP_FRAGMENTED:
+        logger.info("SHARP3D_KEEP_FRAGMENTED=1：保留分片输出（未封装为兼容 MP4）")
+    return False
+
 
 # --- Encoder capability probing ----------------------------------------------
 
@@ -473,6 +557,10 @@ class Hdr10Writer:
             )
             enc_params = ["-x265-params", xparams]
 
+        # Remember the resolved encoder: the hvc1 tag for the final
+        # compatible remux depends on the codec family.
+        self._v_codec = v_codec
+
         cmd = [
             FFMPEG, "-y",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
@@ -517,6 +605,11 @@ class Hdr10Writer:
             raise RuntimeError(f"HDR10 编码器异常退出 (code={rc})")
 
         if audio_source is not None and not self._live_audio:
+            # The conversion is finished, so compatibility beats
+            # live-playback: emit a plain faststart MP4 instead of
+            # re-fragmenting. A fragmented result has no global sample
+            # index — a VR headset reading one over SMB could neither open
+            # nor seek it (see finalize_progressive for the measurements).
             cmd = [
                 FFMPEG, "-y",
                 "-i", str(self.tmp_path),
@@ -524,11 +617,10 @@ class Hdr10Writer:
                 "-c:v", "copy", "-c:a", "aac",
                 "-map", "0:v:0", "-map", "1:a:0",
                 "-shortest",
-                # Re-fragment: a plain copy remux would rewrite the container
-                # as a standard MP4 and lose the live-playable property.
-                *MOVFLAGS_LIVE,
-                str(self.path),
+                "-movflags", "+faststart",
             ]
+            cmd += hvc1_tag_args(self._v_codec)
+            cmd.append(str(self.path))
             result = subprocess.run(cmd, capture_output=True,
                                     creationflags=_NO_WINDOW)
             if result.returncode == 0:
@@ -545,13 +637,8 @@ class Hdr10Writer:
             logger.error("HDR10 音频复用失败（返回码 %d），已保留无音频视频: %s\n%s",
                          result.returncode, self.path, tail)
 
-        try:
-            self.tmp_path.replace(self.path)
-        except OSError as e:
-            logger.error("无法将临时文件移为最终输出（%s → %s）: %s；"
-                         "视频仍保留在 %s", self.tmp_path, self.path, e,
-                         self.tmp_path)
-            raise
+        finalize_progressive(self.tmp_path, self.path,
+                             hvc1_tag_args(self._v_codec))
 
     def abort(self) -> None:
         """Best-effort cleanup after a failed/cancelled run. Never raises.

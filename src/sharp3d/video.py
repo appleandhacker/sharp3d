@@ -13,7 +13,7 @@ from pathlib import Path
 import imageio
 import numpy as np
 
-from .hdr import FFMPEG
+from .hdr import FFMPEG, finalize_progressive, hvc1_tag_args
 
 logger = logging.getLogger(__name__)
 
@@ -372,16 +372,15 @@ class VideoWriter:
             pass
 
     def _finalize(self) -> None:
-        """Promote tmp → final path, never leaving the tmp behind on failure."""
-        try:
-            self.tmp_path.replace(self.path)
-        except OSError as e:
-            # A locked destination (another process holding self.path open) or a
-            # cross-device rename. Report the tmp path so the work is not lost.
-            logger.error("无法将临时文件移为最终输出（%s → %s）: %s；"
-                         "视频仍保留在 %s", self.tmp_path, self.path, e,
-                         self.tmp_path)
-            raise
+        """Promote tmp → final path as a finished, compatible MP4.
+
+        The encoder wrote a fragmented MP4 (live-playable mid-conversion,
+        see MOVFLAGS_LIVE); finalize_progressive remuxes it into a
+        faststart MP4 so ordinary players can open and seek it, and falls
+        back to a plain rename if that fails — the video is never lost.
+        """
+        finalize_progressive(self.tmp_path, self.path,
+                             hvc1_tag_args(self.codec_name))
 
     def abort(self) -> None:
         """Best-effort cleanup after a failed/cancelled run. Never raises.
@@ -432,13 +431,15 @@ class VideoWriter:
             "-map", "0:v:0",
             "-map", "1:a:0",
             "-shortest",
-            # Re-fragment: a plain copy remux rewrites the container as a
-            # standard MP4 (measured layout ftyp/free/mdat/moov), which would
-            # silently drop the live-playable property for any output that
-            # carries audio.
-            *MOVFLAGS_LIVE,
-            str(self.path),
+            # The conversion is finished, so compatibility beats
+            # live-playback: emit a plain faststart MP4 instead of
+            # re-fragmenting. A fragmented result carries no global sample
+            # index — a VR headset reading one over SMB could neither open
+            # nor seek it (see hdr.finalize_progressive for the measurements).
+            "-movflags", "+faststart",
         ]
+        cmd += hvc1_tag_args(self.codec_name)
+        cmd.append(str(self.path))
         # binary capture: only the return code matters; text decoding of
         # ffmpeg's stderr (which echoes CJK filenames as UTF-8) would crash
         # under the GBK locale.
