@@ -69,11 +69,24 @@ MOVFLAGS_LIVE = ["-movflags", "+frag_keyframe+empty_moov+default_base_moof",
 #                   → VR headset over SMB could not open or seek it
 #   non-fragmented: moov 2.1 MB with a full co64/stsz sample table,
 #                   nb_frames=57,867 → played and seeked fine
-# So every finished output is remuxed into a plain faststart MP4 (`-c copy`,
-# no re-encode — only the container is rewritten). Set
+# So every finished output is remuxed into a plain MP4 (`-c copy`, no
+# re-encode — only the container is rewritten). Set
 # SHARP3D_KEEP_FRAGMENTED=1 to skip that pass: cheaper (no 2x file I/O) but
 # the result stays fragmented and may not play/seek on hardware players.
 KEEP_FRAGMENTED = os.environ.get("SHARP3D_KEEP_FRAGMENTED") == "1"
+
+# `+faststart` moves the moov atom to the front. That is NOT needed for the
+# case this remux exists for, and it costs a whole extra pass over the file:
+# libavformat writes ftyp+mdat+moov and then *shifts the entire mdat* to
+# make room for a leading moov (a full-file data move — 13 GB of read+write
+# on a 32-minute 8K segment). Evidence that the plain layout is sufficient:
+# the user's own reference segment that plays and seeks correctly on a VR
+# headset over SMB has exactly `ftyp + mdat + moov` — moov at the END, with
+# the complete co64/stsz sample table. A seekable index is what those
+# players need; its position in the file is irrelevant for local/SMB access.
+# Set SHARP3D_FASTSTART=1 to restore the moov-first layout (only useful for
+# HTTP progressive streaming, where the player cannot read the tail).
+FASTSTART = os.environ.get("SHARP3D_FASTSTART") == "1"
 
 
 def hvc1_tag_args(codec_lib: str) -> list[str]:
@@ -91,8 +104,11 @@ def finalize_progressive(src: Path, dst: Path,
                          extra: list[str] | None = None) -> bool:
     """Promote a finished fragmented MP4 (`src`) to a compatible MP4 at `dst`.
 
-    Remuxes to a non-fragmented, faststart MP4 so ordinary players can open
-    and seek the file. On any failure it falls back to a plain rename, so
+    Remuxes to a non-fragmented MP4 with a complete sample table, so
+    ordinary players can open and seek the file. moov lands at the end
+    unless SHARP3D_FASTSTART=1 (see the FASTSTART note above — a leading
+    moov costs a full extra pass over the file and buys nothing for
+    local/SMB playback). On any failure it falls back to a plain rename, so
     the encoded video is never lost — it just stays fragmented.
 
     `extra` carries encoder flags that must survive the remux (currently the
@@ -104,12 +120,17 @@ def finalize_progressive(src: Path, dst: Path,
     """
     if not KEEP_FRAGMENTED:
         cmd = [FFMPEG, "-y", "-i", str(src), "-c", "copy",
-               "-map", "0:v:0", "-map", "0:a:0?",
-               "-movflags", "+faststart"]
+               "-map", "0:v:0", "-map", "0:a:0?"]
+        if FASTSTART:
+            cmd += ["-movflags", "+faststart"]
+        # else: 不传 -movflags。moov 置尾即可——播放器需要的是可 seek 的样本表，
+        # 不是 moov 的位置（用户参照段 `ftyp+mdat+moov` 在 VR/SMB 上播放与快进
+        # 均正常）。省掉 ffmpeg 把 mdat 整体位移一遍的开销。
         if extra:
             cmd += extra
         cmd.append(str(dst))
-        logger.info("正在封装为兼容 MP4（传统样本索引 + moov 前置）: %s", dst.name)
+        logger.info("正在封装为兼容 MP4（传统样本索引%s）: %s",
+                    "，moov 前置" if FASTSTART else "", dst.name)
         try:
             result = subprocess.run(cmd, capture_output=True,
                                     creationflags=_NO_WINDOW)
@@ -584,7 +605,9 @@ class Hdr10Writer:
                 "-i", str(Path(audio_source)),
                 "-c:v", "copy", "-c:a", "aac",
                 "-map", "0:v:0", "-map", "1:a:0?",
-                "-shortest",
+                # 不能用 -shortest：源音频哪怕短一点点，本进程就会提前退出 →
+                # 编码进程的管道断裂 → 整个转换被 abort，已转好的帧全部丢弃
+                # （详见 VideoWriter 两段式的同处注释）。让两条流各自结束。
                 # HDR 色彩标记必须挂在容器侧：中间流（mpegts/ivf）不承载
                 # colr 信息，只在编码侧给会让重封装后的 colr box 丢失
                 # （实测 transfer 变成 unknown）。
@@ -647,19 +670,21 @@ class Hdr10Writer:
 
         if audio_source is not None and not self._live_audio:
             # The conversion is finished, so compatibility beats
-            # live-playback: emit a plain faststart MP4 instead of
-            # re-fragmenting. A fragmented result has no global sample
-            # index — a VR headset reading one over SMB could neither open
-            # nor seek it (see finalize_progressive for the measurements).
+            # live-playback: emit a plain MP4 instead of re-fragmenting. A
+            # fragmented result has no global sample index — a VR headset
+            # reading one over SMB could neither open nor seek it (see
+            # finalize_progressive for the measurements).
             cmd = [
                 FFMPEG, "-y",
                 "-i", str(self.tmp_path),
                 "-i", str(audio_source),
                 "-c:v", "copy", "-c:a", "aac",
                 "-map", "0:v:0", "-map", "1:a:0",
-                "-shortest",
-                "-movflags", "+faststart",
+                # 不能用 -shortest：文件输入的语义是"截断到较短流"，源音频略短
+                # 时会静默丢掉视频尾部（详见 VideoWriter._mux_audio 的注释）。
             ]
+            if FASTSTART:
+                cmd += ["-movflags", "+faststart"]
             cmd += hvc1_tag_args(self._v_codec)
             cmd.append(str(self.path))
             result = subprocess.run(cmd, capture_output=True,

@@ -13,7 +13,7 @@ from pathlib import Path
 import imageio
 import numpy as np
 
-from .hdr import FFMPEG, finalize_progressive, hvc1_tag_args
+from .hdr import FFMPEG, FASTSTART, finalize_progressive, hvc1_tag_args
 
 logger = logging.getLogger(__name__)
 
@@ -292,7 +292,11 @@ class VideoWriter:
                 "-i", str(self._audio_source),
                 "-c:v", "copy", "-c:a", "aac",
                 "-map", "0:v:0", "-map", "1:a:0?",
-                "-shortest",
+                # NO -shortest: if the source audio runs even slightly short,
+                # this process exits early, the video pipe breaks, the encoder
+                # dies and the run is aborted — throwing away every frame that
+                # had already been converted. Letting the streams end
+                # independently keeps the video intact.
                 *tag_params,
                 *MOVFLAGS_LIVE,
                 str(self.tmp_path),
@@ -476,14 +480,20 @@ class VideoWriter:
             "-c:a", "aac",
             "-map", "0:v:0",
             "-map", "1:a:0",
-            "-shortest",
+            # NO -shortest: with a file input it silently truncates the output
+            # at the shorter stream. When the source audio is a few frames
+            # shorter than the video, the whole tail of the *video* was
+            # dropped with no message. Letting the tracks end independently
+            # keeps every video frame; a marginally longer audio track just
+            # plays out over the last frame.
             # The conversion is finished, so compatibility beats
-            # live-playback: emit a plain faststart MP4 instead of
-            # re-fragmenting. A fragmented result carries no global sample
-            # index — a VR headset reading one over SMB could neither open
-            # nor seek it (see hdr.finalize_progressive for the measurements).
-            "-movflags", "+faststart",
+            # live-playback: emit a plain MP4 instead of re-fragmenting. A
+            # fragmented result carries no global sample index — a VR headset
+            # reading one over SMB could neither open nor seek it (see
+            # hdr.finalize_progressive for the measurements).
         ]
+        if FASTSTART:
+            cmd += ["-movflags", "+faststart"]
         cmd += hvc1_tag_args(self.codec_name)
         cmd.append(str(self.path))
         # binary capture: only the return code matters; text decoding of

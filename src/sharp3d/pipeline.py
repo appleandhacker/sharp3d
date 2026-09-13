@@ -477,8 +477,19 @@ class Sharp3DPipeline:
         torch.cuda.empty_cache()
 
         # Close (live-audio mode already carries the audio track; legacy
-        # mode muxes here via close(source_video=...)).
-        writer.close()
+        # mode muxes here via close(source_video=...)). This sits outside the
+        # try/finally above, so a raise here (encoder rc != 0, remux failure)
+        # would skip the cleanup and leave .tmp.mp4 / .tmp.stderr behind —
+        # abort() is idempotent and never raises, so guard the failure path.
+        try:
+            writer.close()
+        except BaseException:
+            try:
+                writer.abort()
+            except Exception:
+                logger.debug("close 失败后的 abort() 亦失败（忽略）", exc_info=True)
+            torch.cuda.empty_cache()
+            raise
 
         total_elapsed = time.time() - total_start
         if not frame_times:
