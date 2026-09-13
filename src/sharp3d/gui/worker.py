@@ -77,6 +77,13 @@ def _compute_render_face_size(eye_w: int, output_projection: str) -> int:
 # ===========================================================================
 # Child-process side (no Qt)
 # ===========================================================================
+class _PreloadSuperseded(Exception):
+    """Raised inside _ensure_pipeline when a queued conversion requests a
+    different perf mode: the in-flight load/warmup stops immediately so the
+    conversion can build directly in the requested mode (selecting 速度优先
+    must not first finish a full 35-patch 画质优先 load)."""
+
+
 def _log_gui_error(text: str) -> None:
     """Append an error to <project_root>/error.log — never raises.
 
@@ -98,9 +105,10 @@ def _log_gui_error(text: str) -> None:
 class _PipelineWorker:
     """The heavy pipeline. Lives in the child process."""
 
-    def __init__(self, respond, cancel_event):
+    def __init__(self, respond, cancel_event, req_q=None):
         self._raw_respond = respond      # callable(name, args_tuple)
         self._cancel_event = cancel_event
+        self._req_q = req_q  # child request queue (for preload supersede peek)
         self._pipeline = None
         self._compiled = None
         self._device = None
@@ -124,17 +132,66 @@ class _PipelineWorker:
 
         Same as the lazy path, but kicked off before the user picks a file so
         the one-time model/compile cost overlaps with natural UI idle time.
+
+        Supersede semantics: if the user selects a different perf mode and
+        clicks 开始转换 while this load is still running, the build aborts at
+        the next stage boundary (via abort_check) and the queued conversion
+        builds directly in its own mode — no full 35-patch load+warmup is
+        wasted first.
         """
         try:
-            self._ensure_pipeline()
+            self._ensure_pipeline(
+                abort_check=lambda building: self._pending_convert_mode()
+                not in (None, building))
             # Dedicated terminal: _ensure_pipeline itself emits model_ready on
             # every (re)build — that must not terminate a job (see the
             # _TERMINAL_RESPONSES note about the speed-mode freeze).
             self._respond("preload_done", ())
+        except _PreloadSuperseded:
+            logger.info("预加载已被新模式转换请求取代，已中止；"
+                        "转换将直接按新模式构建管线")
+            self._respond("status", (tr("已切换模式：直接按新模式加载…"),))
+            # 终结弹出预加载自己的 job，排队的转换随后直接开始
+            self._respond("preload_done", ())
+            try:
+                import torch
+                if torch.cuda.is_initialized():
+                    torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001
+                pass
         except Exception as exc:  # noqa: BLE001
             self._respond("error", (tr("预加载失败: {}").format(exc),))
 
-    def _ensure_pipeline(self, perf_mode="quality"):
+    def _pending_convert_mode(self):
+        """Non-destructively peek the request queue for the next queued
+        convert request's perf_mode (None = no convert waiting).
+
+        Used by an in-flight preload to notice "a conversion needs a
+        different mode" and abandon the current build. Draining stops at the
+        first convert (FIFO head decides) and everything is put back in
+        order.
+        """
+        if self._req_q is None:
+            return None
+        drained = []
+        mode = None
+        try:
+            while True:
+                try:
+                    item = self._req_q.get_nowait()
+                except queue.Empty:
+                    break
+                drained.append(item)
+                if item and item[0] == "convert":
+                    mode = (item[1].get("opts") or {}).get(
+                        "perf_mode", "quality")
+                    break
+        finally:
+            for item in reversed(drained):
+                self._req_q.put(item)
+        return mode
+
+    def _ensure_pipeline(self, perf_mode="quality", abort_check=None):
         # Rebuild if mode changed. The key is just the mode now: the FP16/FP32
         # switch is gone (precision is always FP16), so there is no second
         # dimension to normalise.
@@ -166,6 +223,12 @@ class _PipelineWorker:
         cache_dir = resolve_cache_dir()
 
         def _progress(stage, pct):
+            # 阶段边界即中止点：预加载进行中若有不同模式的转换请求排队，
+            # 立即放弃本次构建（用户选速度后点开始，不应先跑完 35-patch
+            # 的加载和预热再重头来）。
+            if abort_check is not None and abort_check(perf_mode):
+                raise _PreloadSuperseded(
+                    f"预加载被 perf_mode={perf_mode!r} 的新转换请求取代")
             # stage text originates from core predict.py — translate here so
             # the core module stays GUI-free while EN users see English
             self._respond("model_load_progress", (tr(stage), pct))
@@ -1669,6 +1732,7 @@ def _child_main_inner(req_q, resp_q, cancel_event):
     worker = _PipelineWorker(
         respond=lambda name, args: resp_q.put((name, args)),
         cancel_event=cancel_event,
+        req_q=req_q,
     )
     while True:
         try:

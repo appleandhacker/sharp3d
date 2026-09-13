@@ -82,7 +82,13 @@ def main():
     done_ok = bool(got["done"]) and got["done"][0].get("job_id") == jid \
         and not got["done"][0].get("cancelled")
     ok = n_my > 0 and done_ok and not got["error"]
-    print(f"model_ready: {got['model_ready']} 次")
+    # 中止语义：被取代的画质构建不得完成（model_ready 只应出现 1 次——
+    # 速度构建；旧行为是 2 次：画质预加载跑完 + 速度重建）
+    print(f"model_ready: {got['model_ready']} 次（中止语义要求 =1）")
+    if got["model_ready"] != 1:
+        print("FAIL: model_ready 次数 != 1 —— 被取代的构建没有被中止，"
+              "或速度构建未完成")
+        ok = False
     print(f"progress: {len(got['progress'])} 条, 归属正确(jid={jid}): {n_my}")
     print(f"done: {bool(got['done'])} 归属正确: {done_ok}")
     print(f"error: {got['error'][:1]}")
