@@ -231,64 +231,94 @@ class VideoWriter:
         # Write to temp file first (audio mux later if needed)
         self.tmp_path = self.path.with_suffix(".tmp" + ext)
 
-        output_params = encoder_output_params(codec_lib, crf, preset)
-        if codec == "h265":
-            output_params.extend(["-tag:v", "hvc1"])
+        # 编码器质量参数与容器参数分开：两段式实时音轨要让编码进程只带前者、
+        # 混流进程只带后者。
+        enc_params = encoder_output_params(codec_lib, crf, preset)
+        tag_params = ["-tag:v", "hvc1"] if codec == "h265" else []
         # Fragmented container: append last so it applies to every encoder
         # branch, and lands before the output path imageio appends.
-        output_params.extend(MOVFLAGS_LIVE)
+        output_params = enc_params + tag_params + list(MOVFLAGS_LIVE)
 
         self._proc = None
+        self._mux_proc = None
         self._stderr_fh = None
         self._stderr_path = None
         self._close_mux_source = None
         self._audio_source = Path(audio_source) if audio_source is not None else None
         if (self._audio_source is not None
-                and os.environ.get("SHARP3D_LIVE_AUDIO") != "1"):
-            # 已知问题（2026-09-13 实测，8K AV1 NVENC / ffmpeg 7.1）：双输入
-            # （视频管道 + 音频文件）下编码器内存随视频帧无界增长——30s 窗口
-            # 2.95GB→10.1GB（+1.2GB/2s ≈ 每输出帧滞留一帧 23.5MB 的视频帧
-            # 缓冲），32 分钟转换实测达 ~9-10GB；无音轨对照组平稳 2.95GB。
-            # 增长与音频数据量无关（5MB 的 wav 同样触发），-re 限速未能确认
-            # 有效。默认回退为"完成后复用"；确要实时音轨可设
-            # SHARP3D_LIVE_AUDIO=1 强制启用（自行承担内存占用）。
-            logger.info("实时音轨已禁用（ffmpeg 双输入下编码器内存无界增长）；"
-                        "音频将在转换完成后复用。可设 SHARP3D_LIVE_AUDIO=1 "
-                        "强制启用")
+                and os.environ.get("SHARP3D_LIVE_AUDIO") == "0"):
+            # 逃生开关：显式关闭实时音轨，音频改在转换完成后复用
+            logger.info("实时音轨已按 SHARP3D_LIVE_AUDIO=0 关闭；"
+                        "音频将在转换完成后复用")
             # 保存源路径，close() 时走完成后复用路径（调用方仍是无参 close()）
             self._close_mux_source = self._audio_source
             self._audio_source = None
 
         if self._audio_source is not None:
-            # Live-audio mode: mux the audio track into the SAME fragmented
-            # output while video frames are written, so mid-conversion
-            # playback has sound (the old close-time mux meant the tmp file
-            # stayed silent until the whole conversion finished). imageio's
-            # writer cannot take a second input, so run the ffmpeg pipe
-            # directly — same pattern as Hdr10Writer. When the frame size is
-            # not a multiple of 16, replicate imageio's macro_block_size
-            # scale so output dimensions stay identical to the legacy path.
+            # Live-audio mode（两段式）：ffmpeg#1 只编码视频（单输入单输出），
+            # ffmpeg#2 读中间裸流 + 音频文件，写出 fragmented MP4。这样转换中
+            # 依然能直接播放（音频已混入分片容器）。
+            #
+            # 为什么拆（2026-09-13 实测，7680x2160@30，写 4000 帧）：同一进程
+            # 里既做视频编码又做音频编码/mux 时，ffmpeg 会稳定占住约 7GB
+            # （工作集 1.85GB → 8.93GB，12 秒内到达平台后恒定）。逐项隔离：
+            # 音频输入存在但不输出（-an 或不 map）时内存仍是基线，问题出在
+            # 输出侧的那组合；三个常规参数解法都无效
+            # （-max_interleave_delta 0/1s、-fflags +nobuffer；音频加
+            # -readrate 1 反而更糟，5GB）。拆开后峰值 1.88GB，输出一致。
+            #
+            # 中间容器：AV1 走 ivf（ffmpeg 不接受 AV1 in mpegts），
+            # H.264/HEVC 走 mpegts（带时间戳；ivf 只认 AV1/VP8/VP9）。
             self._stderr_path = self.tmp_path.with_suffix(".stderr")
             self._stderr_fh = open(self._stderr_path, "wb")
-            cmd = [
+            es_fmt = "ivf" if "av1" in codec_lib else "mpegts"
+
+            mux_cmd = [
+                FFMPEG, "-y",
+                # 不让 ffmpeg#2 做长时间输入探测：默认 probesize 是 5MB，它会
+                # 一直等到管道 EOF 才建立输入流 —— 实测转换中 tmp 文件 8 秒都
+                # 不出现，边转边播直接失效（成品却是好的，所以只在成品上验证
+                # 发现不了）。但窗口也不能给大：低码率内容（h264_nvenc 编
+                # 640x360 只出 21KB）依然填不满 32KB 而继续等。mpegts 的
+                # PAT/PMT 在前 1KB 内，4KB 足以建流。
+                "-probesize", "4096", "-analyzeduration", "0",
+                "-f", es_fmt, "-i", "-",
+                "-i", str(self._audio_source),
+                "-c:v", "copy", "-c:a", "aac",
+                "-map", "0:v:0", "-map", "1:a:0?",
+                "-shortest",
+                *tag_params,
+                *MOVFLAGS_LIVE,
+                str(self.tmp_path),
+            ]
+            enc_cmd = [
                 FFMPEG, "-y",
                 "-f", "rawvideo", "-pix_fmt", "rgb24",
                 "-s", f"{width}x{height}", "-r", f"{fps}",
                 "-i", "-",
-                "-i", str(self._audio_source),
-                "-map", "0:v:0", "-map", "1:a:0?",
                 "-pix_fmt", "yuv420p",
             ]
             if width % 16 or height % 16:
-                cmd += ["-vf", f"scale={width + (16 - width % 16) % 16}:"
-                               f"{height + (16 - height % 16) % 16}"]
-            cmd += ["-c:v", codec_lib, *output_params,
-                    "-c:a", "aac", "-shortest",
-                    str(self.tmp_path)]
-            self._proc = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stderr=self._stderr_fh,
+                # 复刻 imageio 的 macro_block_size 对齐，输出尺寸与旧路径一致
+                enc_cmd += ["-vf", f"scale={width + (16 - width % 16) % 16}:"
+                                   f"{height + (16 - height % 16) % 16}"]
+            # -flush_packets：编码进程的输出也必须逐包刷出。它的 avio 输出
+            # 缓冲会攒够一块才写管道，小数据量时（实测 60 帧 640x360）混流
+            # 进程迟迟收不到内容，tmp 文件整整 8 秒都不出现 —— 边转边播直接
+            # 失效；close() 时缓冲一次性刷出，所以只看成品是发现不了的。
+            enc_cmd += ["-c:v", codec_lib, *enc_params,
+                        "-flush_packets", "1", "-f", es_fmt, "-"]
+
+            self._mux_proc = subprocess.Popen(
+                mux_cmd, stdin=subprocess.PIPE, stderr=self._stderr_fh,
                 creationflags=_NO_WINDOW)
-            logger.info("实时音轨已启用（音频随视频写入，转换中可听）: %s",
+            self._proc = subprocess.Popen(
+                enc_cmd, stdin=subprocess.PIPE, stdout=self._mux_proc.stdin,
+                stderr=self._stderr_fh, creationflags=_NO_WINDOW)
+            # 写端交给编码进程（两端由 OS 直连）；Python 不保留副本，否则编码
+            # 进程退出后混流进程等不到 EOF，永远不收尾。
+            self._mux_proc.stdin.close()
+            logger.info("实时音轨已启用（两段式：编码 | 混流，转换中可听）: %s",
                         self._audio_source)
         else:
             # nvenc uses -qp in output_params; passing quality= would add the
@@ -329,14 +359,17 @@ class VideoWriter:
 
         if self._proc is not None:
             # Live-audio mode: the audio track is already in the fragmented
-            # stream; just finish the encode and promote tmp → final.
+            # stream; finish both stages, then promote tmp → final.
             self._proc.stdin.close()
-            rc = self._proc.wait()
+            rc_enc = self._proc.wait()
+            # 编码进程退出后，混流进程才会收到管道 EOF 并收尾
+            rc_mux = self._mux_proc.wait() if self._mux_proc is not None else 0
             self._close_stderr()
-            if rc != 0:
-                logger.error("实时音频编码器异常退出 (code=%d): %s\n%s",
-                             rc, self.path, self._stderr_tail())
-                raise RuntimeError(f"视频编码器异常退出 (code={rc})")
+            if rc_enc != 0 or rc_mux != 0:
+                logger.error("实时音频编码异常退出 (enc=%d, mux=%d): %s\n%s",
+                             rc_enc, rc_mux, self.path, self._stderr_tail())
+                raise RuntimeError(
+                    f"视频编码器异常退出 (enc={rc_enc}, mux={rc_mux})")
             self._unlink_stderr()
             if source_video is not None:
                 logger.warning("已启用转换中音频，close(source_video=...) 被忽略")
@@ -392,21 +425,28 @@ class VideoWriter:
         .tmp.mp4 that could be mistaken for a finished output.
         """
         if self._proc is not None:
-            try:
-                self._proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                self._proc.terminate()
-            except Exception:
-                pass
-            try:
-                self._proc.wait(timeout=3)
-            except Exception:
+            procs = [self._proc]
+            if self._mux_proc is not None:
+                procs.append(self._mux_proc)
+            # 先关写端让两段各自收尾，再逐个终止（编码进程先，混流进程后）
+            for p in procs:
                 try:
-                    self._proc.kill()
+                    p.stdin.close()
                 except Exception:
                     pass
+            for p in procs:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+            for p in procs:
+                try:
+                    p.wait(timeout=3)
+                except Exception:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
             self._close_stderr()
         else:
             try:

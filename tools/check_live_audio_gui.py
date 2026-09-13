@@ -1,7 +1,7 @@
 """GUI worker 实时音轨验证：走 _PipelineWorker.convert() 全链路。
 
-注意：实时音轨默认已禁用（ffmpeg 7.1 双输入下编码器内存无界增长，8K 实测
-3GB→10GB）。本脚本验证 SHARP3D_LIVE_AUDIO=1 强制启用时的机制仍可用。
+实时音轨现为**默认启用**（两段式：编码 | 混流分离，原理与实测见 VideoWriter）。
+本脚本走真实 `_PipelineWorker.convert()` 全链路，验证转换中的 tmp 就带音频。
 
 验收点:
   1. 转换中 .tmp.mp4 即含 aac 音频流（init 段声明）
@@ -55,7 +55,7 @@ def volume(path):
 
 
 def main():
-    os.environ["SHARP3D_LIVE_AUDIO"] = "1"  # 实时音轨需显式启用（默认禁用）
+    os.environ.pop("SHARP3D_LIVE_AUDIO", None)  # 默认即启用，确保未被 =0 关闭
     make_source()
     if OUT.exists():
         OUT.unlink()

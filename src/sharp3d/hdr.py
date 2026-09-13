@@ -505,19 +505,14 @@ class Hdr10Writer:
         self.width = width
         self.height = height
         self.fps = fps
-        # Live-audio mode: mux the audio track into the same fragmented
-        # output while frames are written, so mid-conversion playback has
-        # sound (see VideoWriter for the full rationale).
-        # 已知问题（2026-09-13 实测）：ffmpeg 7.1 双输入（视频管道 + 音频
-        # 文件）下编码器内存随视频帧无界增长（8K 实测 2.95GB→10.1GB，与音频
-        # 数据量无关）。默认禁用实时音轨、回退为完成后复用；确要启用可设
-        # SHARP3D_LIVE_AUDIO=1。
+        # Live-audio mode（两段式）：音频随视频写进同一个 fragmented 容器，
+        # 转换中就能听到（原理与实测见 VideoWriter 的对应注释）。
+        # SHARP3D_LIVE_AUDIO=0 可显式关闭，退回"转换完成后复用"。
         self._live_audio = audio_source is not None
         self._close_mux_source = None
-        if self._live_audio and os.environ.get("SHARP3D_LIVE_AUDIO") != "1":
-            logger.info("实时音轨已禁用（ffmpeg 双输入下编码器内存无界增长）；"
-                        "音频将在转换完成后复用。可设 SHARP3D_LIVE_AUDIO=1 "
-                        "强制启用")
+        if self._live_audio and os.environ.get("SHARP3D_LIVE_AUDIO") == "0":
+            logger.info("实时音轨已按 SHARP3D_LIVE_AUDIO=0 关闭；"
+                        "音频将在转换完成后复用")
             # 保存源路径，close() 时走完成后复用路径
             self._close_mux_source = Path(audio_source)
             self._live_audio = False
@@ -557,34 +552,76 @@ class Hdr10Writer:
             )
             enc_params = ["-x265-params", xparams]
 
-        # Remember the resolved encoder: the hvc1 tag for the final
-        # compatible remux depends on the codec family.
         self._v_codec = v_codec
+        self._mux_proc = None
 
-        cmd = [
-            FFMPEG, "-y",
-            "-f", "rawvideo", "-pix_fmt", "rgb24",
-            "-s", f"{width}x{height}", "-r", f"{fps}",
-            "-i", "-",
-        ]
-        if audio_source is not None:
-            cmd += ["-i", str(Path(audio_source))]
-        cmd += [
-            "-vf", sdr_to_hdr10_filter(),
-            "-c:v", v_codec, *enc_params,
-            "-pix_fmt", "yuv420p10le",
-            "-color_primaries", "bt2020",
-            "-color_trc", "smpte2084",
-            "-colorspace", "bt2020nc",
-            "-color_range", "tv",
-        ]
-        if audio_source is not None:
-            cmd += ["-map", "0:v:0", "-map", "1:a:0?", "-c:a", "aac",
-                    "-shortest"]
-        cmd += [*MOVFLAGS_LIVE, str(self.tmp_path)]
-        self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
-                                      stderr=subprocess.DEVNULL,
-                                      creationflags=_NO_WINDOW)
+        if self._live_audio:
+            # 两段式（原理与实测见 VideoWriter）：同一进程里做视频编码 +
+            # 音频编码/mux 会让 ffmpeg 稳定占住约 7GB。中间容器 AV1 用 ivf
+            # （mpegts 不接受 AV1），HEVC 用 mpegts（带时间戳）。
+            es_fmt = "ivf" if "av1" in v_codec else "mpegts"
+            enc_cmd = [
+                FFMPEG, "-y",
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "-s", f"{width}x{height}", "-r", f"{fps}",
+                "-i", "-",
+                "-vf", sdr_to_hdr10_filter(),
+                "-c:v", v_codec, *enc_params,
+                "-pix_fmt", "yuv420p10le",
+                # 逐包刷出，否则编码进程的 avio 缓冲会把中间流攒住，
+                # 混流进程收不到内容（边转边播失效，详见 VideoWriter）
+                "-flush_packets", "1",
+                "-f", es_fmt, "-",
+            ]
+            mux_cmd = [
+                FFMPEG, "-y",
+                # 限定输入探测窗口（默认 5MB 会让 ffmpeg#2 等到管道 EOF 才
+                # 建流，转换中完全没有输出；给太大也不行——低码率内容填不满。
+                # 详见 VideoWriter 的说明）
+                "-probesize", "4096", "-analyzeduration", "0",
+                "-f", es_fmt, "-i", "-",
+                "-i", str(Path(audio_source)),
+                "-c:v", "copy", "-c:a", "aac",
+                "-map", "0:v:0", "-map", "1:a:0?",
+                "-shortest",
+                # HDR 色彩标记必须挂在容器侧：中间流（mpegts/ivf）不承载
+                # colr 信息，只在编码侧给会让重封装后的 colr box 丢失
+                # （实测 transfer 变成 unknown）。
+                "-color_primaries", "bt2020",
+                "-color_trc", "smpte2084",
+                "-colorspace", "bt2020nc",
+                "-color_range", "tv",
+                *hvc1_tag_args(v_codec),
+                *MOVFLAGS_LIVE,
+                str(self.tmp_path),
+            ]
+            self._mux_proc = subprocess.Popen(
+                mux_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                creationflags=_NO_WINDOW)
+            self._proc = subprocess.Popen(
+                enc_cmd, stdin=subprocess.PIPE, stdout=self._mux_proc.stdin,
+                stderr=subprocess.DEVNULL, creationflags=_NO_WINDOW)
+            # 写端交给编码进程（OS 直连），Python 不保留副本
+            self._mux_proc.stdin.close()
+        else:
+            # 无实时音轨：单进程编码，音频留给 close() 复用
+            cmd = [
+                FFMPEG, "-y",
+                "-f", "rawvideo", "-pix_fmt", "rgb24",
+                "-s", f"{width}x{height}", "-r", f"{fps}",
+                "-i", "-",
+                "-vf", sdr_to_hdr10_filter(),
+                "-c:v", v_codec, *enc_params,
+                "-pix_fmt", "yuv420p10le",
+                "-color_primaries", "bt2020",
+                "-color_trc", "smpte2084",
+                "-colorspace", "bt2020nc",
+                "-color_range", "tv",
+                *MOVFLAGS_LIVE, str(self.tmp_path),
+            ]
+            self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                          stderr=subprocess.DEVNULL,
+                                          creationflags=_NO_WINDOW)
 
     def write_frame(self, frame: np.ndarray) -> None:
         """Write an (H, W, 3) uint8 SDR frame."""
@@ -600,9 +637,12 @@ class Hdr10Writer:
         if audio_source is None and self._close_mux_source is not None:
             audio_source = self._close_mux_source
         self._proc.stdin.close()
-        rc = self._proc.wait()
-        if rc != 0:
-            raise RuntimeError(f"HDR10 编码器异常退出 (code={rc})")
+        rc_enc = self._proc.wait()
+        # 两段式：编码进程退出后，混流进程才收到管道 EOF
+        rc_mux = self._mux_proc.wait() if self._mux_proc is not None else 0
+        if rc_enc != 0 or rc_mux != 0:
+            raise RuntimeError(
+                f"HDR10 编码器异常退出 (enc={rc_enc}, mux={rc_mux})")
 
         if audio_source is not None and not self._live_audio:
             # The conversion is finished, so compatibility beats
@@ -648,21 +688,28 @@ class Hdr10Writer:
         exception between writer creation and close() leaked a live ffmpeg
         child plus a .tmp.mp4 that looked like a valid output.
         """
-        try:
-            self._proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            self._proc.terminate()
-        except Exception:
-            pass
-        try:
-            self._proc.wait(timeout=3)
-        except Exception:
+        procs = [self._proc]
+        if getattr(self, "_mux_proc", None) is not None:
+            procs.append(self._mux_proc)
+        # 两段式下要收掉两个进程：先关写端，再依次 terminate/kill
+        for p in procs:
             try:
-                self._proc.kill()
+                p.stdin.close()
             except Exception:
                 pass
+        for p in procs:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        for p in procs:
+            try:
+                p.wait(timeout=3)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
         try:
             self.tmp_path.unlink(missing_ok=True)
         except OSError:
