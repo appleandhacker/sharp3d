@@ -13,7 +13,8 @@ from pathlib import Path
 import imageio
 import numpy as np
 
-from .hdr import FFMPEG, FASTSTART, finalize_progressive, hvc1_tag_args
+from .hdr import (FFMPEG, FASTSTART, finalize_progressive, hvc1_tag_args,
+                  duration_cap_args)
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +245,7 @@ class VideoWriter:
         self._stderr_fh = None
         self._stderr_path = None
         self._close_mux_source = None
+        self._frames = 0  # video frames handed to the encoder (for -t capping)
         self._audio_source = Path(audio_source) if audio_source is not None else None
         if (self._audio_source is not None
                 and os.environ.get("SHARP3D_LIVE_AUDIO") == "0"):
@@ -346,6 +348,7 @@ class VideoWriter:
 
     def append_frame(self, frame: np.ndarray):
         """Append (H, W, 3) uint8 frame."""
+        self._frames += 1
         if self._proc is not None:
             if not frame.flags.c_contiguous:
                 frame = np.ascontiguousarray(frame)
@@ -354,6 +357,15 @@ class VideoWriter:
             self._proc.stdin.write(memoryview(frame))
         else:
             self.writer.append_data(frame)
+
+    def _video_duration(self) -> float | None:
+        """Seconds of video actually written — the audio mux cap (see
+        hdr.duration_cap_args). This is what makes a cancelled conversion
+        keep the audio track bounded to the video instead of carrying the
+        full source audio (which rendered the tail of the file blank)."""
+        if self._frames and self.fps:
+            return self._frames / self.fps
+        return None
 
     def close(self, source_video: str | Path | None = None):
         """Close writer and optionally mux audio from source.
@@ -418,12 +430,16 @@ class VideoWriter:
         """Promote tmp → final path as a finished, compatible MP4.
 
         The encoder wrote a fragmented MP4 (live-playable mid-conversion,
-        see MOVFLAGS_LIVE); finalize_progressive remuxes it into a
-        faststart MP4 so ordinary players can open and seek it, and falls
-        back to a plain rename if that fails — the video is never lost.
+        see MOVFLAGS_LIVE); finalize_progressive remuxes it into a plain
+        MP4 so ordinary players can open and seek it, and falls back to a
+        plain rename if that fails — the video is never lost. The output is
+        capped at the video's real length so the audio track (which can
+        outlive a cancelled video) cannot stretch the container duration
+        into blank territory.
         """
         finalize_progressive(self.tmp_path, self.path,
-                             hvc1_tag_args(self.codec_name))
+                             hvc1_tag_args(self.codec_name),
+                             video_duration=self._video_duration())
 
     def abort(self) -> None:
         """Best-effort cleanup after a failed/cancelled run. Never raises.
@@ -494,6 +510,7 @@ class VideoWriter:
         ]
         if FASTSTART:
             cmd += ["-movflags", "+faststart"]
+        cmd += duration_cap_args(self._video_duration())
         cmd += hvc1_tag_args(self.codec_name)
         cmd.append(str(self.path))
         # binary capture: only the return code matters; text decoding of

@@ -89,6 +89,29 @@ KEEP_FRAGMENTED = os.environ.get("SHARP3D_KEEP_FRAGMENTED") == "1"
 FASTSTART = os.environ.get("SHARP3D_FASTSTART") == "1"
 
 
+def duration_cap_args(video_duration: float | None) -> list[str]:
+    """`-t <video duration>` caps the muxed output at the video's real length.
+
+    Why this exists: the audio track can easily outlive the video — a
+    cancelled conversion leaves a short video next to the full-length source
+    audio, and a mux without a cap then produces a file whose container
+    duration is the audio's (players render the tail as blank video).
+    Measured 2026-09-13: cancelled-at-58 s output carried 1929.9 s / 90464
+    AAC frames of audio.
+
+    `-t` is deliberately used instead of `-shortest`: with a file input
+    `-shortest` truncates at the *shorter* stream, silently dropping video
+    when the source audio runs slightly short (measured: 36 frames in, 11
+    out). `-t` only caps the output end — the video is never touched.
+
+    A small pad protects the last video frame from timebase rounding and
+    costs at most half a second of trailing audio.
+    """
+    if not video_duration or video_duration <= 0:
+        return []
+    return ["-t", f"{video_duration + 0.5:.3f}"]
+
+
 def hvc1_tag_args(codec_lib: str) -> list[str]:
     """`-tag:v hvc1` for HEVC, nothing otherwise.
 
@@ -101,7 +124,8 @@ def hvc1_tag_args(codec_lib: str) -> list[str]:
 
 
 def finalize_progressive(src: Path, dst: Path,
-                         extra: list[str] | None = None) -> bool:
+                         extra: list[str] | None = None,
+                         video_duration: float | None = None) -> bool:
     """Promote a finished fragmented MP4 (`src`) to a compatible MP4 at `dst`.
 
     Remuxes to a non-fragmented MP4 with a complete sample table, so
@@ -113,6 +137,10 @@ def finalize_progressive(src: Path, dst: Path,
 
     `extra` carries encoder flags that must survive the remux (currently the
     hvc1 tag for HEVC, which several hardware players require).
+
+    `video_duration` (seconds of video actually written) caps the output
+    with `-t` — see duration_cap_args for why the audio must never be
+    allowed to outlive the video.
 
     Returns True when the progressive remux succeeded, False when the
     fragmented fallback was used. Raises OSError only if the fallback rename
@@ -126,6 +154,7 @@ def finalize_progressive(src: Path, dst: Path,
         # else: 不传 -movflags。moov 置尾即可——播放器需要的是可 seek 的样本表，
         # 不是 moov 的位置（用户参照段 `ftyp+mdat+moov` 在 VR/SMB 上播放与快进
         # 均正常）。省掉 ffmpeg 把 mdat 整体位移一遍的开销。
+        cmd += duration_cap_args(video_duration)
         if extra:
             cmd += extra
         cmd.append(str(dst))
@@ -526,6 +555,7 @@ class Hdr10Writer:
         self.width = width
         self.height = height
         self.fps = fps
+        self._frames = 0  # video frames handed to the encoder (for -t capping)
         # Live-audio mode（两段式）：音频随视频写进同一个 fragmented 容器，
         # 转换中就能听到（原理与实测见 VideoWriter 的对应注释）。
         # SHARP3D_LIVE_AUDIO=0 可显式关闭，退回"转换完成后复用"。
@@ -654,6 +684,14 @@ class Hdr10Writer:
         # memoryview hands the buffer straight to the pipe writer; the old
         # frame.tobytes() made a full-frame copy (~100MB at 8K) every frame.
         self._proc.stdin.write(memoryview(frame))
+        self._frames += 1
+
+    def _video_duration(self) -> float | None:
+        """Seconds of video actually written — the audio mux cap (see
+        duration_cap_args)."""
+        if self._frames and self.fps:
+            return self._frames / self.fps
+        return None
 
     def close(self, audio_source: str | Path | None = None) -> None:
         """Finish encoding and optionally mux audio from a source video."""
@@ -685,6 +723,7 @@ class Hdr10Writer:
             ]
             if FASTSTART:
                 cmd += ["-movflags", "+faststart"]
+            cmd += duration_cap_args(self._video_duration())
             cmd += hvc1_tag_args(self._v_codec)
             cmd.append(str(self.path))
             result = subprocess.run(cmd, capture_output=True,
@@ -704,7 +743,8 @@ class Hdr10Writer:
                          result.returncode, self.path, tail)
 
         finalize_progressive(self.tmp_path, self.path,
-                             hvc1_tag_args(self._v_codec))
+                             hvc1_tag_args(self._v_codec),
+                             video_duration=self._video_duration())
 
     def abort(self) -> None:
         """Best-effort cleanup after a failed/cancelled run. Never raises.

@@ -1,9 +1,9 @@
-"""验证 finished 输出为非分片 faststart MP4（VR/SMB 可打开、可快进）。
+"""验证 finished 输出为非分片 MP4（VR/SMB 可打开、可快进）。
 
 背景：转换中的 .tmp.mp4 是 fragmented MP4（边转边播用）；但 finished 文件
 如果是分片的，就没有全局样本索引 —— VR 头显经 SMB 读取时无法打开/快进
 （实测 moov 仅 1239B + 2077 个 moof，nb_frames=N/A）。close() 现在会把
-成品重封装为传统 faststart MP4。
+成品重封装为传统 MP4（moov 默认置尾，SHARP3D_FASTSTART=1 恢复前置）。
 
 覆盖：
   1. finalize_progressive：分片 → 非分片，且解码数据逐帧一致（framemd5）
@@ -13,6 +13,8 @@
   5. VideoWriter 有音频（legacy mux）：成品非分片 + 带 aac
   6. VideoWriter 实时音轨（opt-in）：成品非分片 + 带 aac
   7. Hdr10Writer：成品非分片 + hvc1 + smpte2084
+  8. 取消场景：音轨远长于视频时，finalize 按已写帧数用 -t 封顶容器时长
+     （否则播放器按音频时长铺时间线，视频结束后全是空画面）
 """
 import importlib
 import os
@@ -117,6 +119,47 @@ def make_fragmented(src, dst):
     r = run(cmd)
     assert r.returncode == 0, r.stderr.decode(errors="replace")[-500:]
     return dst
+
+
+def make_cancelled_tmp(dst, video_s=2, audio_s=30, fps=30, size="320x240"):
+    """模拟取消时的 .tmp：短视频 + 完整长音频的分片 MP4。
+
+    取消后视频停在已转帧数，而实时音轨的第二输入（整条源音频）会被
+    ffmpeg#2 一直混到 EOF —— 复现 2026-09-13 第3段事故的形态。
+    """
+    v = TMP / "cancel_v.ts"
+    a = TMP / "cancel_a.m4a"
+    r = run([FFMPEG, "-y", "-v", "error",
+             "-f", "lavfi", "-i",
+             f"testsrc2=size={size}:rate={fps}:duration={video_s}",
+             "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt",
+             "yuv420p", "-f", "mpegts", str(v)])
+    assert r.returncode == 0, r.stderr.decode(errors="replace")[-300:]
+    r = run([FFMPEG, "-y", "-v", "error",
+             "-f", "lavfi", "-i", f"sine=frequency=440:duration={audio_s}",
+             "-c:a", "aac", str(a)])
+    assert r.returncode == 0, r.stderr.decode(errors="replace")[-300:]
+    r = run([FFMPEG, "-y", "-v", "error",
+             "-probesize", "4096", "-analyzeduration", "0",
+             "-f", "mpegts", "-i", str(v),
+             "-i", str(a),
+             "-c:v", "copy", "-c:a", "aac",
+             "-map", "0:v:0", "-map", "1:a:0?",
+             "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+             "-frag_duration", "1000000", "-flush_packets", "1",
+             str(dst)])
+    assert r.returncode == 0, r.stderr.decode(errors="replace")[-300:]
+    return dst
+
+
+def stream_duration(path, stream):
+    r = run([FFPROBE, "-v", "error", "-select_streams", stream,
+             "-show_entries", "stream=duration", "-of", "csv=p=0",
+             str(path)])
+    try:
+        return float(r.stdout.decode().strip())
+    except ValueError:
+        return None
 
 
 # ---------------------------------------------------------------- checks
@@ -274,6 +317,41 @@ def c07():
     # 字段名是 color_transfer（旧版 ffprobe 的 color_trc 别名在本版本返回空，
     # 实测 colr box 里的 transfer=16/smpte2084 一直是对的）。
     assert "smpte2084" in info, f"HDR10 需 PQ 传输特性: {info}"
+
+
+@check("08 取消场景：finalize 按已写帧数封顶容器时长（音轨不得长于视频）")
+def c08():
+    from sharp3d.hdr import finalize_progressive
+    src = make_cancelled_tmp(TMP / "cancel_tmp.mp4")
+    frag, _ = is_fragmented(src)
+    assert frag, "模拟 tmp 应是分片 MP4"
+    vd = stream_duration(src, "a:0")
+    assert vd and vd > 20, f"模拟 tmp 的音轨应远长于视频: {vd}"
+
+    # A) 无封顶对照：复现事故（容器时长 = 音频时长）
+    a_src = TMP / "cancel_a_src.mp4"
+    a_src.write_bytes(src.read_bytes())
+    out_a = TMP / "cancel_nocap.mp4"
+    out_a.unlink(missing_ok=True)
+    assert finalize_progressive(a_src, out_a) is True
+    da = stream_duration(out_a, "a:0")
+    assert da and da > 20, f"无封顶时应复现长音轨: {da}"
+
+    # B) 封顶：video_duration=2.0 → 容器 ~2.5s，60 帧视频一帧不少
+    b_src = TMP / "cancel_b_src.mp4"
+    b_src.write_bytes(src.read_bytes())
+    out_b = TMP / "cancel_capped.mp4"
+    out_b.unlink(missing_ok=True)
+    assert finalize_progressive(b_src, out_b, video_duration=2.0) is True
+    db = stream_duration(out_b, "a:0")
+    assert db is not None and db <= 2.6, \
+        f"封顶后容器时长应 ≈2.5s: {db}"
+    assert nb_frames(out_b, "v:0") == "60", \
+        f"封顶不得截掉视频帧: {nb_frames(out_b, 'v:0')}"
+    rr = run([FFPROBE, "-v", "error", "-show_entries", "stream=codec_type",
+              "-of", "csv=p=0", str(out_b)])
+    kinds = rr.stdout.decode().strip().split()
+    assert kinds == ["video", "audio"], f"流结构应保持 video+audio: {kinds}"
 
 
 def main():
