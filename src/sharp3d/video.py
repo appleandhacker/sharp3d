@@ -130,9 +130,16 @@ def encoder_output_params(encoder: str, crf: int, preset: str = "medium") -> lis
     crf = max(0, min(int(crf), 51))
     if encoder == "av1_nvenc":
         # NVENC has no CRF; constqp is the closest analogue. Measured
-        # (2026-09-11): -qp under -rc vbr is silently IGNORED (qp 28 and 36
-        # produce byte-identical outputs) — constqp actually honors it.
-        return ["-rc", "constqp", "-qp", str(min(crf, 51)),
+        # (2026-09-11): -qp under -rc vbr is silently IGNORED — constqp
+        # actually honors it.
+        # SCALE WARNING (measured 2026-09-13): av1_nvenc's -qp runs on the
+        # AV1 native quantizer scale 0-255, NOT the H.264-style 0-51 scale
+        # the CRF slider uses (qp 40 ≈ 12.8 Mbps @1080p; the old clamp to 51
+        # made low-bitrate targets unreachable). Map CRF 0-51 → qindex 0-255
+        # linearly (crf 18→90, 26→130, 40→200, 51→255) and clamp the MAPPED
+        # value, not the input.
+        crf = max(0, min(int(crf), 51)) * 5
+        return ["-rc", "constqp", "-qp", str(min(crf, 255)),
                 "-preset", "p4"]
     if encoder in ("h264_nvenc", "hevc_nvenc"):
         # Map preset names to NVENC p1-p7 scale (p4 ≈ medium balance).

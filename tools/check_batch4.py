@@ -149,13 +149,17 @@ def check04_crf_clamp():
     import sharp3d.hdr as H
     from sharp3d.video import encoder_output_params
 
-    # CPU 链与 NVENC 链的输出参数都要夹紧
-    for codec_lib in ("libx264", "h264_nvenc", "hevc_nvenc", "libx265"):
-        for crf_in, want in ((99, 51), (-5, 0), (18, 18)):
+    # CPU 链与 NVENC 链的输出参数都要夹紧（av1_nvenc 的 qp 走 0-255 AV1
+    # 刻度，crf×5 映射；其余编码器 0-51 直传）
+    for codec_lib, scale in (("libx264", 1), ("h264_nvenc", 1),
+                             ("hevc_nvenc", 1), ("libx265", 1),
+                             ("av1_nvenc", 5)):
+        for crf_in, want in ((99, 51), (-5, 0), (18, 18), (40, 40)):
             params = encoder_output_params(codec_lib, crf_in, "medium")
             q = _quality_from_list(params)
             assert q is not None, f"{codec_lib}: 未找到质量参数 in {params}"
-            assert q == want, f"{codec_lib} crf={crf_in} → {q} (期望 {want})"
+            assert q == min(want, 51) * scale, \
+                f"{codec_lib} crf={crf_in} → {q} (期望 {min(want, 51) * scale})"
 
     # Hdr10Writer: 假 Popen 捕获命令行，验证 99 → 51、-5 → 0
     real_popen = H.subprocess.Popen
@@ -593,7 +597,7 @@ def check15_pipeline_cleanup_shape():
         "frame_q.get_nowait()",
         "writer.abort()",
         "decoder.join(timeout=5)",
-        "except _queue.Empty:",
+        "except queue.Empty:",
     ):
         assert needle in src, f"pipeline.py 缺少: {needle}"
     # finally 块顺序: 排空队列 → abort →（后续）join
