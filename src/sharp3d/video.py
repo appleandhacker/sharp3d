@@ -241,7 +241,23 @@ class VideoWriter:
         self._proc = None
         self._stderr_fh = None
         self._stderr_path = None
+        self._close_mux_source = None
         self._audio_source = Path(audio_source) if audio_source is not None else None
+        if (self._audio_source is not None
+                and os.environ.get("SHARP3D_LIVE_AUDIO") != "1"):
+            # 已知问题（2026-09-13 实测，8K AV1 NVENC / ffmpeg 7.1）：双输入
+            # （视频管道 + 音频文件）下编码器内存随视频帧无界增长——30s 窗口
+            # 2.95GB→10.1GB（+1.2GB/2s ≈ 每输出帧滞留一帧 23.5MB 的视频帧
+            # 缓冲），32 分钟转换实测达 ~9-10GB；无音轨对照组平稳 2.95GB。
+            # 增长与音频数据量无关（5MB 的 wav 同样触发），-re 限速未能确认
+            # 有效。默认回退为"完成后复用"；确要实时音轨可设
+            # SHARP3D_LIVE_AUDIO=1 强制启用（自行承担内存占用）。
+            logger.info("实时音轨已禁用（ffmpeg 双输入下编码器内存无界增长）；"
+                        "音频将在转换完成后复用。可设 SHARP3D_LIVE_AUDIO=1 "
+                        "强制启用")
+            # 保存源路径，close() 时走完成后复用路径（调用方仍是无参 close()）
+            self._close_mux_source = self._audio_source
+            self._audio_source = None
 
         if self._audio_source is not None:
             # Live-audio mode: mux the audio track into the SAME fragmented
@@ -307,6 +323,10 @@ class VideoWriter:
                 Ignored in live-audio mode (the audio track was muxed into
                 the stream as frames were written).
         """
+        # 门控关闭的实时音轨：构造时传入的 audio_source 落到 close 时复用
+        if source_video is None and getattr(self, "_close_mux_source", None):
+            source_video = self._close_mux_source
+
         if self._proc is not None:
             # Live-audio mode: the audio track is already in the fragmented
             # stream; just finish the encode and promote tmp → final.

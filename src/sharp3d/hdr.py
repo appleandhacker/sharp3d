@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -423,7 +424,19 @@ class Hdr10Writer:
         # Live-audio mode: mux the audio track into the same fragmented
         # output while frames are written, so mid-conversion playback has
         # sound (see VideoWriter for the full rationale).
+        # 已知问题（2026-09-13 实测）：ffmpeg 7.1 双输入（视频管道 + 音频
+        # 文件）下编码器内存随视频帧无界增长（8K 实测 2.95GB→10.1GB，与音频
+        # 数据量无关）。默认禁用实时音轨、回退为完成后复用；确要启用可设
+        # SHARP3D_LIVE_AUDIO=1。
         self._live_audio = audio_source is not None
+        self._close_mux_source = None
+        if self._live_audio and os.environ.get("SHARP3D_LIVE_AUDIO") != "1":
+            logger.info("实时音轨已禁用（ffmpeg 双输入下编码器内存无界增长）；"
+                        "音频将在转换完成后复用。可设 SHARP3D_LIVE_AUDIO=1 "
+                        "强制启用")
+            # 保存源路径，close() 时走完成后复用路径
+            self._close_mux_source = Path(audio_source)
+            self._live_audio = False
         # Clamp both ends: a negative CRF/qp is rejected by every encoder
         # here, and 0 (near-lossless constqp) can explode the file size.
         crf = max(0, min(int(crf), 51))
@@ -495,6 +508,9 @@ class Hdr10Writer:
 
     def close(self, audio_source: str | Path | None = None) -> None:
         """Finish encoding and optionally mux audio from a source video."""
+        # 门控关闭的实时音轨：构造时传入的 audio_source 落到 close 时复用
+        if audio_source is None and self._close_mux_source is not None:
+            audio_source = self._close_mux_source
         self._proc.stdin.close()
         rc = self._proc.wait()
         if rc != 0:
