@@ -25,6 +25,7 @@ import multiprocessing as mp
 import os
 import queue
 import time
+import traceback
 from collections import deque
 from pathlib import Path
 
@@ -76,11 +77,29 @@ def _compute_render_face_size(eye_w: int, output_projection: str) -> int:
 # ===========================================================================
 # Child-process side (no Qt)
 # ===========================================================================
+def _log_gui_error(text: str) -> None:
+    """Append an error to <project_root>/error.log — never raises.
+
+    The main window renders errors into the status bar, where the next
+    status/progress message overwrites them within seconds (they were
+    effectively unreportable: a user seeing one cannot copy it, and we
+    cannot diagnose from a screenshot). Every GUI-side error gets a
+    timestamped line here so it survives.
+    """
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        path = Path(__file__).resolve().parents[3] / "error.log"
+        with open(path, "a", encoding="utf-8", errors="replace") as fh:
+            fh.write(f"[{ts}] {text}\n")
+    except Exception:  # noqa: BLE001
+        logger.debug("error.log 写入失败（忽略）", exc_info=True)
+
+
 class _PipelineWorker:
     """The heavy pipeline. Lives in the child process."""
 
     def __init__(self, respond, cancel_event):
-        self._respond = respond          # callable(name, args_tuple)
+        self._raw_respond = respond      # callable(name, args_tuple)
         self._cancel_event = cancel_event
         self._pipeline = None
         self._compiled = None
@@ -90,6 +109,14 @@ class _PipelineWorker:
         self._f_px = 1.0
         self._orig_w = 0
         self._orig_h = 0
+
+    def _respond(self, name, args):
+        if name == "error":
+            try:
+                _log_gui_error(str(args[0]))
+            except Exception:  # noqa: BLE001
+                pass
+        self._raw_respond(name, args)
 
     # ---- lazy model loading --------------------------------------------
     def preload(self):
@@ -256,6 +283,7 @@ class _PipelineWorker:
                                     prepare_input, fast_unproject, render_sbs,
                                     INTERNAL_SHAPE, torch, sharp_io)
         except Exception as exc:  # noqa: BLE001
+            _log_gui_error("转换失败: {}\n{}".format(exc, traceback.format_exc()))
             self._respond("error", (tr("转换失败: {}").format(exc),))
 
     def _convert_vr(self, opts):
