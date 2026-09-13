@@ -557,8 +557,9 @@ class Hdr10Writer:
 
         if self._live_audio:
             # 两段式（原理与实测见 VideoWriter）：同一进程里做视频编码 +
-            # 音频编码/mux 会让 ffmpeg 稳定占住约 7GB。中间容器 AV1 用 ivf
-            # （mpegts 不接受 AV1），HEVC 用 mpegts（带时间戳）。
+            # 音频编码/mux 会让 ffmpeg 稳定占住约 7GB。中间容器 AV1 用 ivf、
+            # HEVC 用 mpegts —— AV1 不进 mpegts 的原因见 VideoWriter
+            # （写入成功但读回只认成 bin_data，闭环走不通）。
             es_fmt = "ivf" if "av1" in v_codec else "mpegts"
             enc_cmd = [
                 FFMPEG, "-y",

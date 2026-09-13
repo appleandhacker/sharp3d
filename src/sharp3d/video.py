@@ -267,8 +267,14 @@ class VideoWriter:
             # （-max_interleave_delta 0/1s、-fflags +nobuffer；音频加
             # -readrate 1 反而更糟，5GB）。拆开后峰值 1.88GB，输出一致。
             #
-            # 中间容器：AV1 走 ivf（ffmpeg 不接受 AV1 in mpegts），
-            # H.264/HEVC 走 mpegts（带时间戳；ivf 只认 AV1/VP8/VP9）。
+            # 中间容器：AV1 走 ivf；H.264/HEVC 走 mpegts（带时间戳；ivf 只认
+            # AV1/VP8/VP9）。不用 mpegts 装 AV1 并非"版本老旧"：实测 ffmpeg
+            # 2026-01 build（libavformat 62.8，比 7.x 更新）下 muxer 会把 AV1
+            # 写成 stream_type 0x06 的私有流且不写 AV1 descriptor，自家
+            # demuxer 读回来只识别成 "Data: bin_data ([6][0][0][0])"，随后的
+            # remux 直接报 "Output file does not contain any stream" —— 写入
+            # 能成功、读回闭环走不通，对"写进去再读出来"的中间管道不可用
+            # （H.264/HEVC in mpegts 正常）。
             self._stderr_path = self.tmp_path.with_suffix(".stderr")
             self._stderr_fh = open(self._stderr_path, "wb")
             es_fmt = "ivf" if "av1" in codec_lib else "mpegts"
