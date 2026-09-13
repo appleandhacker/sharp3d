@@ -561,6 +561,9 @@ class VrTab(QWidget):
         self._prog_label.setText(f"{stage}… {pct}%")
 
     def _on_model_ready(self) -> None:
+        # 同 sbs_tab：转换中重建管线也会发 model_ready，不得覆盖进度显示
+        if self._converting:
+            return
         self._progress.set_value(1.0)
         self._progress.set_busy(False)
         self._pct_label.setText("100%")

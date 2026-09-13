@@ -227,6 +227,10 @@ class SharpPredictor:
                            str(fp16_ckpt))
             except Exception:
                 pass
+        # 模式标识放第一位：重建管线的各阶段文案（加载权重/TRT/预热）与
+        # quality 完全相同，没有这一项用户无法确认切换是否生效。
+        _n = 21 if perf_mode == "speed" else 35
+        self.accel_status.append((f"{'速度优先' if perf_mode == 'speed' else '画质优先'} · {_n} patches", True))
         self.accel_status.append(("FP16 权重", True))
 
         # ── channels_last (lossless Conv2d speedup) ──────────────────────

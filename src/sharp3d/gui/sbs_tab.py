@@ -368,6 +368,12 @@ class SbsTab(QWidget):
         self._prog_label.setText(f"{stage}… {pct}%")
 
     def _on_model_ready(self) -> None:
+        # model_ready fires on EVERY pipeline (re)build — including the
+        # speed↔quality switch that happens mid-conversion. Overwriting the
+        # progress bar then froze the display at 100% while the conversion
+        # kept running (reported 2026-09-13). Only reflect the idle state.
+        if self._converting:
+            return
         self._progress.set_value(1.0)
         self._progress.set_busy(False)
         self._pct_label.setText("100%")

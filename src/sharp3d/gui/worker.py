@@ -127,6 +127,10 @@ class _PipelineWorker:
         """
         try:
             self._ensure_pipeline()
+            # Dedicated terminal: _ensure_pipeline itself emits model_ready on
+            # every (re)build — that must not terminate a job (see the
+            # _TERMINAL_RESPONSES note about the speed-mode freeze).
+            self._respond("preload_done", ())
         except Exception as exc:  # noqa: BLE001
             self._respond("error", (tr("预加载失败: {}").format(exc),))
 
@@ -1700,6 +1704,7 @@ class EngineProcess(QObject):
     model_load_progress = Signal(str, int)   # (stage name, percent 0-100)
     model_ready = Signal()
     model_accel = Signal(list)  # [(name, enabled), ...]
+    preload_done = Signal()     # terminal for the startup preload job
     prepared = Signal(dict)
     preview_ready = Signal(object)
     # job_id: which request the progress belongs to (-1 = unattributed).
@@ -1717,9 +1722,19 @@ class EngineProcess(QObject):
     # Responses that end the request they belong to. The child processes
     # requests strictly sequentially, so attribution is a FIFO: everything
     # emitted before the terminal response belongs to the front job.
+    #
+    # model_ready deliberately NOT terminal: it is emitted on EVERY pipeline
+    # (re)build, including a speed↔quality mode switch that happens in the
+    # MIDDLE of a convert job. Treating it as terminal popped the convert
+    # job mid-flight — every later convert_progress was then stamped
+    # job_id=-1 and dropped by the tab's ownership filter, so the GUI froze
+    # on the pre-conversion display while the conversion ran to completion
+    # in the background (reported 2026-09-13: speed-mode conversion, GUI
+    # showed a stuck 100% bar). preload() instead ends with the dedicated
+    # "preload_done" terminal below.
     _TERMINAL_RESPONSES = frozenset({
         "prepared", "preview_ready", "convert_done", "anim_done",
-        "anim_exported", "ply_loaded", "orbit_frame", "model_ready", "error",
+        "anim_exported", "ply_loaded", "orbit_frame", "preload_done", "error",
     })
 
     def __init__(self, parent=None):
