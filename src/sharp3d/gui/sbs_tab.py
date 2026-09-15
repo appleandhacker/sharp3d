@@ -161,7 +161,7 @@ class SbsTab(QWidget):
         self._crf.setValidator(QIntValidator(0, 51, self._crf))
         self._codec.currentTextChanged.connect(self._update_crf_tip)
         self._update_crf_tip()
-        self._crf.setCurrentText("26")
+        self._crf.setCurrentText("16")
         crf_row.addWidget(self._crf, 1)
         enc_card.add_layout(crf_row)
 
@@ -526,7 +526,7 @@ class SbsTab(QWidget):
             convergence=self._s_conv.value() / 100.0,  # 0=auto, else quantile
             strength=self._s_strength.value(),
             codec=codec,
-            crf=min(51, max(0, int(self._crf.currentText().strip() or 20))),
+            crf=min(51, max(0, int(self._crf.currentText().strip() or 16))),
             audio=self._chk_audio.isChecked(),
             decompose="analytical" if self._decompose.currentIndex() == 0 else "svd",
             depth=self._chk_depth.isChecked(),

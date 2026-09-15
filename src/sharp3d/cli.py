@@ -20,7 +20,7 @@ def main():
     parser.add_argument("--codec", type=str, default="h264",
                         choices=["h264", "h265", "av1"],
                         help="Video codec (default: h264)")
-    parser.add_argument("--crf", type=int, default=26,
+    parser.add_argument("--crf", type=int, default=16,
                         help="Video quality CRF (default: 26, lower=better)")
     parser.add_argument("--format", type=str, default="full_sbs",
                         choices=["full_sbs", "half_sbs", "full_tb", "half_tb",

@@ -28,7 +28,7 @@ class ConvertOptions:
 
     # Encoding
     codec: str = "h264"            # "h264" | "h265" | "av1"
-    crf: int = 26
+    crf: int = 16
     audio: bool = True
     hdr_output: bool = False
 
@@ -43,6 +43,7 @@ class ConvertOptions:
     renderer: str = "standard"     # "standard" | "higs"
     temporal_stabilize: str = "off"  # "off" | "global" | "adaptive" | "flow"
     keyframe_interval: int = 1     # full predict every Nth frame (1 = off)
+    resume_frames: int = 0         # 断点续转：已完成帧数（跳过源前 N 帧）
 
     # Extra outputs
     depth: bool = False

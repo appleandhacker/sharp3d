@@ -235,7 +235,7 @@ class VrTab(QWidget):
         self._crf = QComboBox()
         self._crf.addItems(["16", "18", "20", "23", "26", "28",
                             "30", "32", "35", "40"])
-        self._crf.setCurrentText("20")
+        self._crf.setCurrentText("16")
         self._crf.setToolTip(tr(
             "VR 视频建议 CRF 18~20（更高质量减少纱窗效应）。可直接输入任意 0-51 的值。\n"
             "AV1 硬编内部自动映射到 AV1 量化器（如 20→100）；AV1 压缩率高，同画质体积更小。"))
