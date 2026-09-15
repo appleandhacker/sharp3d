@@ -239,6 +239,8 @@ _ZH2EN: dict[str, str] = {
     "完成 · {} 帧 · {:.2f} fps · {}": "Done · {} frames · {:.2f} fps · {}",
     "检测到 HDR 输入，已启用 HDR10 输出": "HDR input detected; HDR10 output enabled",
     "性能模式已切换，正在重建管线…": "Performance mode changed; rebuilding pipeline…",
+    "断点续转：从第 {} 帧（{:.3f}s）开始，剩余 {} 帧":
+        "Resuming from frame {} ({:.3f}s); {} frames remaining",
     "预加载失败: {}": "Preload failed: {}",
     "准备失败: {}": "Preparation failed: {}",
     "预览渲染失败: {}": "Preview render failed: {}",

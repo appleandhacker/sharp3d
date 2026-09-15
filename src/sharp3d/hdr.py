@@ -550,12 +550,15 @@ class Hdr10Writer:
 
     def __init__(self, path: str | Path, width: int, height: int, fps: float,
                  codec: str = "h265", crf: int = 18,
-                 audio_source: str | Path | None = None):
+                 audio_source: str | Path | None = None,
+                 audio_seek: float | None = None):
         self.path = Path(path)
         self.width = width
         self.height = height
         self.fps = fps
         self._frames = 0  # video frames handed to the encoder (for -t capping)
+        # 断点续转：音频输入的起始时间偏移（与视频 -ss 对应，见 VideoWriter）
+        self._audio_seek = float(audio_seek) if audio_seek else None
         # Live-audio mode（两段式）：音频随视频写进同一个 fragmented 容器，
         # 转换中就能听到（原理与实测见 VideoWriter 的对应注释）。
         # SHARP3D_LIVE_AUDIO=0 可显式关闭，退回"转换完成后复用"。
@@ -632,6 +635,9 @@ class Hdr10Writer:
                 # 详见 VideoWriter 的说明）
                 "-probesize", "4096", "-analyzeduration", "0",
                 "-f", es_fmt, "-i", "-",
+                # 断点续转：音频起始偏移（见 VideoWriter 的同处注释）
+                *(["-ss", f"{self._audio_seek:.3f}"]
+                  if self._audio_seek else []),
                 "-i", str(Path(audio_source)),
                 "-c:v", "copy", "-c:a", "aac",
                 "-map", "0:v:0", "-map", "1:a:0?",
@@ -715,6 +721,9 @@ class Hdr10Writer:
             cmd = [
                 FFMPEG, "-y",
                 "-i", str(self.tmp_path),
+                # 断点续转：复用音频时同样带起始偏移
+                *(["-ss", f"{self._audio_seek:.3f}"]
+                  if self._audio_seek else []),
                 "-i", str(audio_source),
                 "-c:v", "copy", "-c:a", "aac",
                 "-map", "0:v:0", "-map", "1:a:0",

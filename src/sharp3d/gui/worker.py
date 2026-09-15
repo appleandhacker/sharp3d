@@ -1181,6 +1181,35 @@ class _PipelineWorker:
 
         reader = FrameReader(path)
         n = reader.n_frames
+
+        # ── 断点续转（resume_frames = 已完成的输出帧数）─────────────────
+        # 转换逐帧一一对应，所以 part1 里已有的 N 帧就对应源的前 N 帧。视频跳过
+        # 它们，音频输入必须用同一时间点，否则续转段音轨会从源文件 0 秒开始、
+        # 与画面完全错位。
+        #
+        # 精确性：源是轻微 VFR（本机实测 time_base=1/16000、帧间隔多为 0.033375s
+        # 但不恒定，avg_frame_rate 是 925360000/30878851），所以按
+        # N/reader.fps 算出的纯时间 seek 会有 ±1~5 帧偏差（实测落在第 50779 帧
+        # 而非 50780）。给出 resume_seek（= 第 N 帧的绝对 PTS）时改用
+        # 「粗 seek 限制解码量 + select=gte(t,绝对PTS) 精确选帧」，实测 7055 帧
+        # 一帧不差；不给则退回近似时间 seek。
+        resume_frames = int(opts.get("resume_frames") or 0)
+        resume_seek = opts.get("resume_seek")  # 第 N 帧的绝对源时间（秒）
+        if resume_frames:
+            resume_frames = max(0, min(resume_frames, max(0, n - 1)))
+        _src_fps = reader.fps or 30.0
+        _v_pts = float(resume_seek) if resume_seek else None
+        if _v_pts is not None:
+            _v_seek = _v_pts
+        elif resume_frames:
+            _v_seek = resume_frames / _src_fps
+        else:
+            _v_seek = None
+        _a_seek = _v_seek
+        if _v_seek is not None:
+            self._respond("status", (
+                tr("断点续转：从第 {} 帧（{:.3f}s）开始，剩余 {} 帧").format(
+                    resume_frames, _v_seek, max(0, n - resume_frames)),))
         f_px = reader.width * 1.2
         # Focal override (35mm-equivalent mm, diagonal-based — same
         # conversion as sharp_io.convert_focallength). Long-lens footage
@@ -1250,12 +1279,12 @@ class _PipelineWorker:
             writer = Hdr10Writer(out, width=out_w, height=out_h,
                                  fps=out_fps, codec=opts.get("codec", "h265"),
                                  crf=opts.get("crf", 18),
-                                 audio_source=source)
+                                 audio_source=source, audio_seek=_a_seek)
         else:
             writer = VideoWriter(out, fps=out_fps, width=out_w, height=out_h,
                                  codec=opts.get("codec", "h264"),
                                  crf=opts.get("crf", 18),
-                                 audio_source=source)
+                                 audio_source=source, audio_seek=_a_seek)
 
         # ── Decode prefetch thread ──────────────────────────────────────
         # ffmpeg handles fps conversion via its fps filter, so the decode
@@ -1278,10 +1307,21 @@ class _PipelineWorker:
                 vf_parts.append(hdr_to_sdr_filter())
             if needs_fps_change:
                 vf_parts.append(f"fps={out_fps}")
+            # 断点续转：按绝对 PTS 精确选帧（配合下面的 -copyts）。放在链首，
+            # 后续 hdr/fps 滤镜只处理真正要用的帧。
+            if _v_pts is not None:
+                vf_parts.insert(0, f"select=gte(t\\,{_v_pts:.6f})")
             vf = ["-vf", ",".join(vf_parts)] if vf_parts else []
-            cmd = [FFMPEG, *reader._hwaccel(),
-                   "-i", reader.path, *vf,
-                   "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+            cmd = [FFMPEG, *reader._hwaccel()]
+            if _v_seek is not None:
+                if _v_pts is not None:
+                    # 粗 seek 只为限制解码量（留 0.8s 余量覆盖前一个关键帧），
+                    # 真正的切点由上面的 select 按原始时间戳决定
+                    cmd += ["-ss", f"{max(0.0, _v_pts - 0.8):.3f}", "-copyts"]
+                else:
+                    cmd += ["-ss", f"{_v_seek:.3f}"]
+            cmd += ["-i", reader.path, *vf,
+                    "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
             proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.DEVNULL,
                              creationflags=0x08000000)
             try:
@@ -1489,8 +1529,12 @@ class _PipelineWorker:
                     n_done += 1
                     elapsed = time.time() - t_start
                     avg_fps = n_done / elapsed if elapsed > 0 else 0.0
+                    # 断点续转：进度按"整片已完成的帧数"汇报（resume_frames
+                    # 是 part1 已完成的量），分母 out_count 仍是全片帧数，
+                    # 于是进度条从续转点继续走到 100%。
                     self._respond("convert_progress",
-                                  (out_written, out_count, avg_fps, elapsed))
+                                  (resume_frames + out_written, out_count,
+                                   avg_fps, elapsed))
 
                     # Periodic CPU GC every 60 frames prevents RAM accumulation.
                     if n_done % 60 == 0:

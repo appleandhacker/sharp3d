@@ -217,7 +217,8 @@ class VideoWriter:
 
     def __init__(self, path: str | Path, fps: float, width: int, height: int,
                  codec: str = "h264", crf: int = 18, preset: str = "medium",
-                 audio_source: str | Path | None = None):
+                 audio_source: str | Path | None = None,
+                 audio_seek: float | None = None):
         _pin_imageio_ffmpeg()
         self.path = Path(path)
         self.fps = fps
@@ -246,6 +247,9 @@ class VideoWriter:
         self._stderr_path = None
         self._close_mux_source = None
         self._frames = 0  # video frames handed to the encoder (for -t capping)
+        # 断点续转：音频输入必须与视频解码用同一个起始时间偏移，否则续转段的
+        # 音轨会从源文件开头开始播放，与画面完全错位（2026-09-15）。
+        self._audio_seek = float(audio_seek) if audio_seek else None
         self._audio_source = Path(audio_source) if audio_source is not None else None
         if (self._audio_source is not None
                 and os.environ.get("SHARP3D_LIVE_AUDIO") == "0"):
@@ -291,6 +295,10 @@ class VideoWriter:
                 # PAT/PMT 在前 1KB 内，4KB 足以建流。
                 "-probesize", "4096", "-analyzeduration", "0",
                 "-f", es_fmt, "-i", "-",
+                # 断点续转：音频从与视频 -ss 对应的时间点起（缺了这行，续转段
+                # 的音轨会从源文件 0 秒开始，与画面完全错位）
+                *(["-ss", f"{self._audio_seek:.3f}"]
+                  if self._audio_seek else []),
                 "-i", str(self._audio_source),
                 "-c:v", "copy", "-c:a", "aac",
                 "-map", "0:v:0", "-map", "1:a:0?",
@@ -491,6 +499,8 @@ class VideoWriter:
         cmd = [
             FFMPEG, "-y",
             "-i", str(self.tmp_path),
+            # 断点续转：复用音频时同样要带上起始偏移
+            *(["-ss", f"{self._audio_seek:.3f}"] if self._audio_seek else []),
             "-i", str(source),
             "-c:v", "copy",
             "-c:a", "aac",
